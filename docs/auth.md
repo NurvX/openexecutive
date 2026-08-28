@@ -82,11 +82,18 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 Then `make dev` and visit http://localhost:3000.
 
+For Docker, use `make docker` (not a bare `docker compose -f
+docker/docker-compose.yml up`): the Makefile passes `--env-file .env`, which
+is what feeds the UI container's `AUTH_*` / `BACKEND_SHARED_SECRET` values.
+If you invoke compose directly, add `--env-file .env` yourself.
+
 A `packages/ui/.env.local` (also gitignored) still works, but note the
 precedence: under `make dev` / `make docker` the root `.env` is exported into
 the process environment before Next.js starts, and Next never overrides an
 already-set variable — so **for any key present in both files, the root `.env`
-wins**. Use `.env.local` only for UI-only keys that aren't in the root file.
+wins — including keys left blank in the root file** (a blank export still
+counts as set). Use `.env.local` only for keys absent from the root `.env`
+entirely.
 Plain `npm run dev` in `packages/ui` (without `make dev`) reads only
 `packages/ui/.env*`, not the root `.env`.
 
