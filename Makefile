@@ -4,12 +4,17 @@ install:
 	cd packages/core && uv sync
 	cd packages/ui && npm install
 
+# Both dev recipe lines source the repo-root .env into the process env:
+# - the UI needs it because Next.js only auto-loads packages/ui/.env*, so
+#   Auth.js never saw AUTH_SECRET etc. (issue #44);
+# - the API needs it because BACKEND_SHARED_SECRET / BACKEND_ALLOWED_ORIGINS
+#   are read from os.environ, not pydantic Settings — dotenv alone doesn't
+#   surface them, silently leaving the API gate open.
+# Note: exported values win over packages/ui/.env.local for duplicate keys.
+# .env values must be shell-safe: quote anything containing spaces or `$`.
 dev:
 	@echo "Starting Open Executive..."
-	@cd packages/core && uv run uvicorn openexecutive.api.main:app --reload --port 8000 &
-	@# Export the repo-root .env into the UI process: Next.js only auto-loads
-	@# packages/ui/.env*, so without this Auth.js never sees AUTH_SECRET etc.
-	@# (issue #44). packages/ui/.env.local still works and takes precedence.
+	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; cd packages/core && uv run uvicorn openexecutive.api.main:app --reload --port 8000 &
 	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; cd packages/ui && npm run dev
 
 stop:
