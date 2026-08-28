@@ -53,26 +53,30 @@ See [`_UNAUTHENTICATED_PATHS`](../packages/core/openexecutive/api/main.py) — a
    - **Authorized redirect URIs**: `http://localhost:3000/api/auth/callback/google`, `https://openexec-ui-dev.fly.dev/api/auth/callback/google`
 4. Copy the Client ID and Client secret immediately — the secret is shown only once.
 
-### Local dev (`packages/ui/.env.local`, gitignored)
+### Local dev (repo-root `.env`, gitignored)
+
+Put everything in the repo-root `.env` (the file the README quickstart has you
+create from `.env.example`). Both `make dev` and `make docker` load it into the
+API **and** the UI:
 
 ```bash
 AUTH_GOOGLE_ID=<from google>
 AUTH_GOOGLE_SECRET=<from google>
 AUTH_SECRET=$(openssl rand -base64 32)
 AUTH_TRUST_HOST=true
+# AUTH_URL stays blank for local dev — set it only on public deployments.
 ALLOWED_EMAILS=you@example.com,teammate@example.com
-BACKEND_BASE_URL=http://localhost:8000
 BACKEND_SHARED_SECRET=$(openssl rand -hex 32)
-```
-
-And in `packages/core/.env` (also gitignored):
-
-```bash
 ANTHROPIC_API_KEY=sk-ant-...
-BACKEND_SHARED_SECRET=<same value as in packages/ui/.env.local>
 ```
 
 Then `make dev` and visit http://localhost:3000.
+
+A `packages/ui/.env.local` (also gitignored) still works and **overrides** the
+root `.env` for the UI — useful if you want UI-only overrides such as
+`BACKEND_BASE_URL=http://localhost:8000`. Note that plain `npm run dev` in
+`packages/ui` (without `make dev`) only reads `packages/ui/.env*`, not the
+root `.env`.
 
 ### Production (Fly secrets)
 
