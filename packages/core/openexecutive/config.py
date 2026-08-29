@@ -22,11 +22,27 @@ if not _FOUND_ENV:
 _ENV_FILE = _ROOT / ".env"
 
 
+def _blank_or_comment(v: Any) -> bool:
+    """True for unset, '', or a dotenv inline-comment captured as the value.
+
+    Optional keys are often left as `KEY=`. `make dev` exports those as
+    empty strings; an inline `# comment` on the same line can instead be
+    parsed as the value. Both must map to "unset".
+    """
+    return v is None or (
+        isinstance(v, str) and (not v.strip() or v.strip().startswith("#"))
+    )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
+        # .env.example (and copies of it) leave optional keys as `KEY=`.
+        # `make dev` exports those as empty strings; without this flag an
+        # optional int like DISCORD_NOTIFY_CHANNEL_ID crashes startup.
+        env_ignore_empty=True,
     )
 
     # Optional: a deployment can run entirely on local / OpenRouter models
@@ -275,6 +291,13 @@ class Settings(BaseSettings):
         True, alias="DISCORD_THREAD_RESPONSE_GATE_ENABLED"
     )
 
+    @field_validator("discord_notify_channel_id", mode="before")
+    @classmethod
+    def _parse_notify_channel_id(cls, v: Any) -> Any:
+        if _blank_or_comment(v):
+            return None
+        return v
+
     # @mention auto-thread router. The default mode promotes nearly every
     # plain-channel @mention into a fresh auto-titled thread (with a
     # one-line pointer left behind in the channel) — except when the
@@ -308,7 +331,9 @@ class Settings(BaseSettings):
             return [int(x) for x in v]
         if isinstance(v, (int, float)):
             return [int(v)]
-        if isinstance(v, str) and v.strip():
+        if _blank_or_comment(v):
+            return []
+        if isinstance(v, str):
             return [int(x.strip()) for x in v.split(",") if x.strip()]
         return []
 
