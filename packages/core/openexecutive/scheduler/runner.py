@@ -535,8 +535,10 @@ async def _execute_action(
         return
 
     # ------------------------------------------------------------------
-    # Notion company-docs sync — incremental ingest of pages shared with
-    # the Notion integration into the COMPANY Chroma collection.
+    # Notion wiki sync — incremental ingest of pages shared with the
+    # Notion integration into the isolated NOTION Chroma collection
+    # (deliberately not COMPANY: synced pages are multi-writer and
+    # unvetted, so the retriever ranks them below curated docs).
     # ------------------------------------------------------------------
     if action.kind == "notion_sync_scan":
         from openexecutive.knowledge.notion_sync import (
