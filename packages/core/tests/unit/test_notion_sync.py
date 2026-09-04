@@ -1,6 +1,7 @@
 """Notion sync: isolated collection, watermark, reconcile, conversion."""
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,16 @@ def _required_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXEC_EMAIL_ADDRESS", "exec@example.com")
     monkeypatch.delenv("NOTION_SYNC_ENABLED", raising=False)
     monkeypatch.delenv("NOTION_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_fixture_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An asyncio.Lock binds to the first event loop that awaits it, and
+    # pytest-asyncio gives each test its own loop — swap in a fresh Lock so
+    # no test ever sees one bound to (or still held from) another test's loop.
+    from openexecutive.cli import fixture_loader
+
+    monkeypatch.setattr(fixture_loader, "_FIXTURE_OP_LOCK", asyncio.Lock())
 
 
 def test_rich_text_and_headings() -> None:
@@ -588,3 +599,226 @@ def test_retriever_labels_notion_below_company(
     assert "Wiki says vendors must email banking details" in out
     assert out.index("From your company documents:") < out.index("Synced Notion wiki")
     assert out.index("Synced Notion wiki") < out.index("Recent research")
+
+
+@pytest.mark.asyncio
+async def test_has_more_without_cursor_marks_truncated() -> None:
+    """An uncontinuable listing must count as truncated, not complete —
+    otherwise reconciliation would purge still-shared pages beyond it."""
+    from openexecutive.knowledge.notion_sync import list_shared_pages
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [_page(PAGE_A, "2026-06-01T00:00:00.000Z", "A")],
+                "has_more": True,
+                "next_cursor": None,
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with patch("openexecutive.knowledge.notion_sync._sleep", new=AsyncMock()):
+        pages, truncated = await list_shared_pages(client, max_pages=100)
+    await client.aclose()
+    assert len(pages) == 1
+    assert truncated is not None
+    assert "next_cursor" in truncated
+
+
+@pytest.mark.asyncio
+async def test_numbered_list_survives_empty_paragraph() -> None:
+    """An invisible block (empty paragraph) between items must not restart
+    the numbering at 1."""
+
+    def _numbered(text: str) -> dict[str, Any]:
+        return {
+            "type": "numbered_list_item",
+            "has_children": False,
+            "numbered_list_item": {"rich_text": [{"plain_text": text}]},
+        }
+
+    blocks = [
+        _numbered("First"),
+        _numbered("Second"),
+        {"type": "paragraph", "has_children": False, "paragraph": {"rich_text": []}},
+        _numbered("Third"),
+        {
+            "type": "paragraph",
+            "has_children": False,
+            "paragraph": {"rich_text": [{"plain_text": "prose"}]},
+        },
+        _numbered("Restarted"),
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": blocks, "has_more": False})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with patch("openexecutive.knowledge.notion_sync._sleep", new=AsyncMock()):
+        lines = await fetch_block_children(client, PAGE_A)
+    await client.aclose()
+    assert lines == ["1. First", "2. Second", "3. Third", "prose", "1. Restarted"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_runs_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_notion_sync must dispatch reconciliation through a worker thread."""
+    import threading
+
+    seen_threads: list[bool] = []
+    main = threading.main_thread()
+
+    def _spy(visible_ids, store, state):  # noqa: ANN001
+        seen_threads.append(threading.current_thread() is not main)
+        return 0
+
+    monkeypatch.setattr(
+        "openexecutive.knowledge.notion_sync.reconcile_missing_pages", _spy
+    )
+    stats, _, _ = await _run_sync(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        pages=[_page(PAGE_A, "2026-06-01T00:00:00.000Z", "A")],
+    )
+    assert seen_threads == [True]
+    assert stats["seen"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_tick_skips_while_fixture_lock_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tick must not interleave with a fixture load / client rotation:
+    it skips immediately (no network traffic, no writes) instead of
+    queueing behind the destructive op and retries on the next interval."""
+    from openexecutive.cli import fixture_loader
+
+    state_file = _sync_env(tmp_path, monkeypatch)
+    state_file.write_text(
+        json.dumps({"watermark": None, "pages": {}}) + "\n", encoding="utf-8"
+    )
+    requests_seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request.url.path)
+        return httpx.Response(200, json={"results": [], "has_more": False})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    docs = tmp_path / "docs"
+    docs.mkdir(exist_ok=True)
+    with (
+        patch("openexecutive.knowledge.notion_sync._state_path", return_value=state_file),
+        patch("openexecutive.knowledge.notion_sync._docs_dir", return_value=docs),
+        patch("openexecutive.knowledge.notion_sync._sleep", new=AsyncMock()),
+    ):
+        await fixture_loader._FIXTURE_OP_LOCK.acquire()
+        try:
+            stats = await run_notion_sync(store=FakeStore(), client=client)  # type: ignore[arg-type]
+        finally:
+            fixture_loader._FIXTURE_OP_LOCK.release()
+    await client.aclose()
+    assert requests_seen == []
+    assert stats == {
+        "seen": 0,
+        "updated": 0,
+        "skipped": 0,
+        "failed": 0,
+        "purged": 0,
+        "capped": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sync_discards_tick_when_active_client_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rotation that swaps the active client between the fetch phase and
+    the write phase must abort the tick: nothing fetched under the old
+    client may be written into the new client's collection or state."""
+    calls = {"n": 0}
+
+    def _generation(settings: Any) -> str:
+        calls["n"] += 1
+        return "alpha" if calls["n"] == 1 else "beta"
+
+    monkeypatch.setattr(
+        "openexecutive.clients.slots.get_active_client", _generation
+    )
+    stats, store, state_file = await _run_sync(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        pages=[_page(PAGE_A, "2026-06-01T00:00:00.000Z", "A")],
+    )
+    assert calls["n"] == 2
+    assert stats["seen"] == 1  # the fetch phase ran...
+    assert stats["updated"] == 0  # ...but nothing was written
+    assert store.collections.get(ChromaDBStore.NOTION_COLLECTION, []) == []
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["pages"] == {}
+
+
+@pytest.mark.asyncio
+async def test_truncated_listing_skips_reconcile_and_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A truncated listing must skip reconciliation (keeping unseen pages)
+    and grow the consecutive-skip counter; a complete listing reconciles
+    and resets it."""
+    state_file = _sync_env(tmp_path, monkeypatch)
+    state_file.write_text(
+        json.dumps(
+            {
+                "watermark": None,
+                "pages": {
+                    PAGE_GONE: {
+                        "last_edited": "2026-01-01T00:00:00.000Z",
+                        "filename": "notion-33333333-gone.md",
+                        "title": "Gone",
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    truncate = {"on": True}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/search"):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [_page(PAGE_A, "2026-06-01T00:00:00.000Z", "A")],
+                    "has_more": truncate["on"],
+                    "next_cursor": None,
+                },
+            )
+        if "/blocks/" in request.url.path:
+            return _children_ok()
+        return httpx.Response(404, json={"message": request.url.path})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    docs = tmp_path / "docs"
+    docs.mkdir(exist_ok=True)
+    store = FakeStore()
+    with (
+        patch("openexecutive.knowledge.notion_sync._state_path", return_value=state_file),
+        patch("openexecutive.knowledge.notion_sync._docs_dir", return_value=docs),
+        patch("openexecutive.knowledge.notion_sync._sleep", new=AsyncMock()),
+    ):
+        stats = await run_notion_sync(store=store, client=client)  # type: ignore[arg-type]
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        assert stats["purged"] == 0
+        assert PAGE_GONE in state["pages"]
+        assert state["reconcile_skips"] == 1
+
+        truncate["on"] = False
+        stats = await run_notion_sync(store=store, client=client)  # type: ignore[arg-type]
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        assert stats["purged"] == 1
+        assert PAGE_GONE not in state["pages"]
+        assert state["reconcile_skips"] == 0
+    await client.aclose()

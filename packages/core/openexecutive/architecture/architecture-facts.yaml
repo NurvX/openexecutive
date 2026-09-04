@@ -2724,7 +2724,13 @@ clients:
       later phase.)
     - Slot ops share the fixture switcher's destructive-op lock
       (_FIXTURE_OP_LOCK) — fixture loads, snapshots, resets, and slot
-      switches serialize against each other.
+      switches serialize against each other. The Notion sync tick
+      coordinates with the same lock without queueing on it — it skips the
+      tick when the lock is held, fetches from Notion unlocked, then takes
+      the lock only for its short local write phase, aborting (no writes)
+      if the active client changed while it was fetching. In-process only —
+      a CLI run is a separate process the lock cannot see (known
+      limitation).
     - A fixture and a client are never active simultaneously - slot ops
       refuse (409) while a fixture is loaded.
     - generated_fixtures is operator-level (the demo library), not client

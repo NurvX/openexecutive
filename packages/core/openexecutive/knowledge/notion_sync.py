@@ -19,13 +19,14 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from openexecutive.config import get_settings
+from openexecutive.config import Settings, get_settings
 from openexecutive.knowledge.loader import DOMAIN_MAP, ingest_text_sync
 from openexecutive.knowledge.store import ChromaDBStore
 from openexecutive.memory.episodic import insert_scheduled_action
@@ -272,11 +273,16 @@ async def list_shared_pages(
     client: httpx.AsyncClient,
     *,
     max_pages: int,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Return (pages, truncated). ``truncated`` means the safety cap hid more."""
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return (pages, truncated).
+
+    ``truncated`` is ``None`` for a complete listing, else a short
+    human-readable cause — callers must treat any non-None value as "more
+    pages exist that this listing did not return".
+    """
     pages: list[dict[str, Any]] = []
     cursor: str | None = None
-    truncated = False
+    truncated: str | None = None
     data: dict[str, Any] = {}
     max_iters = max(2, (max_pages // 100) + 2)
     for _ in range(max_iters):
@@ -291,7 +297,7 @@ async def list_shared_pages(
             safe_cursor = sanitize_cursor(cursor)
             if not safe_cursor:
                 logger.warning("notion_sync: dropping unsafe search cursor")
-                truncated = True
+                truncated = "unsafe pagination cursor dropped"
                 break
             body["start_cursor"] = safe_cursor
         data = await _request(client, "POST", f"{NOTION_API}/search", json_body=body)
@@ -304,16 +310,21 @@ async def list_shared_pages(
             break
         cursor = data.get("next_cursor")
         if not cursor:
+            # has_more with no cursor: the listing is incomplete but cannot
+            # be continued. Mark it truncated so reconciliation is skipped —
+            # otherwise still-shared pages beyond this point would be purged
+            # as "missing".
+            truncated = "Notion returned has_more with no next_cursor"
             break
         if len(pages) >= max_pages:
-            truncated = True
+            truncated = f"listing hit the safety cap of {max_pages} pages"
             break
         await _sleep()
     else:
-        truncated = True
+        truncated = "search pagination hit the iteration cap"
         logger.warning("notion_sync: search pagination hit iteration cap")
-    if data.get("has_more") and len(pages) >= max_pages:
-        truncated = True
+    if data.get("has_more") and len(pages) >= max_pages and truncated is None:
+        truncated = f"listing hit the safety cap of {max_pages} pages"
     return pages, truncated
 
 
@@ -389,7 +400,6 @@ async def fetch_block_children(
             list_index += 1
             line = block_to_markdown(block, list_index=list_index)
         else:
-            list_index = 0
             if btype == "table":
                 child_id = str(block.get("id") or "")
                 row_blocks: list[dict[str, Any]] = []
@@ -403,6 +413,11 @@ async def fetch_block_children(
                     dropped.add("table")
             else:
                 line = block_to_markdown(block)
+            # Only a block that produces visible output ends a numbered list.
+            # An empty paragraph between items (common Notion editing artifact)
+            # must not restart the numbering at 1.
+            if line:
+                list_index = 0
         if line:
             lines.append(line)
         elif btype and btype not in _SILENT_EMPTY_TYPES:
@@ -498,12 +513,37 @@ def _safe_filename(name: str) -> str | None:
     return None
 
 
+def _build_file_index() -> dict[str, list[Path]]:
+    """One directory pass: map each synced page id to its on-disk file(s).
+
+    Reading every file head is the unavoidable cost of orphan detection;
+    building the index once per operation keeps ``purge_page`` /
+    ``reconcile_missing_pages`` from re-scanning the directory per page.
+    """
+    index: dict[str, list[Path]] = {}
+    for path in _docs_dir().glob("notion-*.md"):
+        try:
+            head = path.read_text(encoding="utf-8", errors="replace")[:4000]
+        except OSError:
+            continue
+        found = _PAGE_ID_COMMENT.search(head)
+        file_id = sanitize_notion_id(found.group(1)) if found else None
+        if file_id:
+            index.setdefault(file_id, []).append(path)
+    return index
+
+
 def purge_page(
     page_id: str,
     store: ChromaDBStore,
     state: dict[str, Any] | None = None,
+    file_index: dict[str, list[Path]] | None = None,
 ) -> bool:
-    """Remove one synced page's file, chunks, and state record."""
+    """Remove one synced page's file, chunks, and state record.
+
+    ``file_index`` (from :func:`_build_file_index`) avoids a per-call
+    directory scan; direct callers may omit it and one is built here.
+    """
     pid = sanitize_notion_id(page_id)
     if not pid:
         logger.warning("notion_sync: refuse to purge unsafe page id %r", page_id)
@@ -527,14 +567,9 @@ def purge_page(
     store.delete_documents(ChromaDBStore.COMPANY_COLLECTION, {"notion_page_id": pid})
     if filename:
         (docs / filename).unlink(missing_ok=True)
-    for path in docs.glob("notion-*.md"):
-        try:
-            head = path.read_text(encoding="utf-8", errors="replace")[:4000]
-        except OSError:
-            continue
-        found = _PAGE_ID_COMMENT.search(head)
-        if found and sanitize_notion_id(found.group(1)) == pid:
-            path.unlink(missing_ok=True)
+    index = file_index if file_index is not None else _build_file_index()
+    for path in index.get(pid, []):
+        path.unlink(missing_ok=True)
     if pages is not None:
         pages.pop(pid, None)
         pages.pop(page_id, None)
@@ -547,25 +582,32 @@ def reconcile_missing_pages(
     store: ChromaDBStore,
     state: dict[str, Any],
 ) -> int:
-    """Purge pages (and orphan files) the integration no longer sees."""
+    """Purge pages (and orphan files) the integration no longer sees.
+
+    Blocking file and Chroma I/O throughout — callers on the event loop
+    must run this via ``asyncio.to_thread`` (the sync tick does).
+    """
     pages = state.setdefault("pages", {})
     if not isinstance(pages, dict):
         state["pages"] = {}
         pages = state["pages"]
+    file_index = _build_file_index()
     stale = [pid for pid in list(pages) if sanitize_notion_id(str(pid)) not in visible_ids]
     purged = 0
+    purged_ids: set[str] = set()
     for pid in stale:
-        if purge_page(str(pid), store, state):
+        if purge_page(str(pid), store, state, file_index=file_index):
             purged += 1
-    docs = _docs_dir()
-    for path in docs.glob("notion-*.md"):
-        try:
-            head = path.read_text(encoding="utf-8", errors="replace")[:4000]
-        except OSError:
-            continue
-        found = _PAGE_ID_COMMENT.search(head)
-        file_id = sanitize_notion_id(found.group(1)) if found else None
-        if file_id and file_id not in visible_ids and purge_page(file_id, store, state):
+            safe = sanitize_notion_id(str(pid))
+            if safe:
+                purged_ids.add(safe)
+    # Orphan files: on disk with a page-id comment but absent from state.
+    for file_id in list(file_index):
+        if (
+            file_id not in visible_ids
+            and file_id not in purged_ids
+            and purge_page(file_id, store, state, file_index=file_index)
+        ):
             purged += 1
     return purged
 
@@ -586,6 +628,202 @@ def _remove_stale_page_files(page_id: str, keep: Path) -> None:
 
 def _clear_legacy_company_notion(store: ChromaDBStore) -> None:
     store.delete_documents(ChromaDBStore.COMPANY_COLLECTION, {"type": "notion"})
+
+
+@dataclass
+class _TickFetch:
+    """Everything the network phase of a tick learned, ready to apply locally."""
+
+    visible_ids: set[str] = field(default_factory=set)
+    truncated: str | None = None
+    # (page, page_id, last_edited, markdown) per successfully fetched page.
+    fetched: list[tuple[dict[str, Any], str, str, str]] = field(default_factory=list)
+    # last_edited times of pages left unsynced (fetch failure / cap overflow),
+    # which pin the watermark below them.
+    unresolved_times: list[str] = field(default_factory=list)
+
+
+def _note_reconcile_skip(state: dict[str, Any], cause: str) -> None:
+    """Record and log one more consecutive tick without reconciliation.
+
+    Reconciliation is what purges pages whose sharing was revoked, so a
+    persistent skip streak means revoked content is lingering locally —
+    surface the streak length instead of logging each skip in isolation.
+    """
+    raw = state.get("reconcile_skips")
+    skips = (raw if isinstance(raw, int) else 0) + 1
+    state["reconcile_skips"] = skips
+    logger.warning(
+        "notion_sync: skipping reconciliation — %s "
+        "(%d consecutive skip(s); revoked pages are not purged until "
+        "reconciliation runs)",
+        cause,
+        skips,
+    )
+
+
+async def _fetch_tick(
+    *,
+    client: httpx.AsyncClient,
+    settings: Settings,
+    state: dict[str, Any],
+    reconcile_only: bool,
+    stats: dict[str, int],
+) -> _TickFetch:
+    """Network phase: list visible pages and download dirty page content.
+
+    Reads ``state`` only to decide which pages are already current; all
+    state mutation happens later in :func:`_apply_tick`.
+    """
+    fetch = _TickFetch()
+    pages, fetch.truncated = await list_shared_pages(
+        client, max_pages=_MAX_VISIBLE_PAGES
+    )
+    stats["seen"] = len(pages)
+
+    dirty: list[dict[str, Any]] = []
+    for page in pages:
+        page_id = sanitize_notion_id(str(page.get("id") or ""))
+        if not page_id:
+            logger.warning(
+                "notion_sync: skipping page with unsafe id %r", page.get("id")
+            )
+            stats["failed"] += 1
+            continue
+        fetch.visible_ids.add(page_id)
+        edited = str(page.get("last_edited_time") or "")
+        recorded = _page_record(state, page_id)
+        if recorded.get("last_edited") == edited:
+            stats["skipped"] += 1
+            continue
+        dirty.append(page)
+
+    if reconcile_only:
+        return fetch
+
+    ingest_cap = max(0, settings.notion_max_pages_per_scan)
+    dirty.sort(
+        key=lambda p: str(p.get("last_edited_time") or ""),
+        reverse=True,
+    )
+    overflow = dirty[ingest_cap:]
+    to_ingest = dirty[:ingest_cap]
+    if overflow:
+        stats["capped"] = len(overflow)
+        logger.warning(
+            "notion_sync: %d page(s) need ingest, cap is %d — "
+            "overflow will retry next tick (watermark not advanced past them)",
+            len(dirty),
+            ingest_cap,
+        )
+    fetch.unresolved_times = [
+        str(p.get("last_edited_time") or "")
+        for p in overflow
+        if p.get("last_edited_time")
+    ]
+    for page in to_ingest:
+        page_id = sanitize_notion_id(str(page.get("id") or ""))
+        if not page_id:
+            stats["failed"] += 1
+            continue
+        edited = str(page.get("last_edited_time") or "")
+        try:
+            await _sleep()
+            lines = await fetch_block_children(client, page_id)
+        except Exception:
+            stats["failed"] += 1
+            if edited:
+                fetch.unresolved_times.append(edited)
+            logger.exception("notion_sync: failed to fetch page %s", page_id)
+            continue
+        fetch.fetched.append((page, page_id, edited, "\n\n".join(lines)))
+    return fetch
+
+
+async def _apply_tick(
+    *,
+    store: ChromaDBStore,
+    fetch: _TickFetch,
+    now: datetime | None,
+    reconcile_only: bool,
+    stats: dict[str, int],
+) -> None:
+    """Local write phase — the caller must hold ``_FIXTURE_OP_LOCK``.
+
+    Nothing here touches the network: it is bounded file, state, and
+    Chroma work, so the lock hold stays short even for a large wiki.
+    """
+    # Reload instead of reusing the pre-fetch snapshot: a fixture load or
+    # reset may have replaced the state file while the network phase ran,
+    # and saving a stale snapshot would resurrect purged page records.
+    state = load_state()
+    watermark = state.get("watermark") if isinstance(state.get("watermark"), str) else None
+    await asyncio.to_thread(_clear_legacy_company_notion, store)
+
+    known = state.get("pages") if isinstance(state.get("pages"), dict) else {}
+    if fetch.truncated:
+        _note_reconcile_skip(
+            state,
+            f"page listing incomplete ({fetch.truncated}), "
+            "so unseen pages must not be purged as missing",
+        )
+    elif not fetch.visible_ids and known:
+        _note_reconcile_skip(
+            state,
+            f"search returned 0 pages while {len(known)} are on record "
+            "(refusing a mass purge on a blank listing)",
+        )
+    else:
+        # File-head scanning plus Chroma deletes — keep it off the event
+        # loop so a large or bulk-unshared wiki cannot stall the API.
+        stats["purged"] = await asyncio.to_thread(
+            reconcile_missing_pages, fetch.visible_ids, store, state
+        )
+        state["reconcile_skips"] = 0
+
+    if not reconcile_only:
+        unresolved_times = list(fetch.unresolved_times)
+        for page, page_id, edited, markdown in fetch.fetched:
+            try:
+                chunks = await ingest_page(page, markdown, store)
+                filename = slugify(page_title(page), page_id)
+                state.setdefault("pages", {})[page_id] = {
+                    "last_edited": edited,
+                    "title": page_title(page),
+                    "filename": filename,
+                }
+                stats["updated"] += 1
+                logger.info(
+                    "notion_sync: indexed %s (%d chunks)", page_title(page), chunks
+                )
+            except Exception:
+                stats["failed"] += 1
+                if edited:
+                    unresolved_times.append(edited)
+                logger.exception("notion_sync: failed page %s", page_id)
+
+        if unresolved_times:
+            # Leave watermark strictly below the earliest unresolved edit
+            # so those pages stay eligible. Successfully recorded pages
+            # are skipped via the pages dict, not the watermark.
+            logger.info(
+                "notion_sync: watermark held at %s (%d unresolved page(s))",
+                watermark,
+                len(unresolved_times),
+            )
+        else:
+            recorded_times = [
+                str(rec.get("last_edited") or "")
+                for rec in (state.get("pages") or {}).values()
+                if isinstance(rec, dict) and rec.get("last_edited")
+            ]
+            if recorded_times:
+                candidate = max(recorded_times)
+                if watermark is None or candidate > watermark:
+                    state["watermark"] = candidate
+
+    state["last_run"] = (now or datetime.now(UTC)).isoformat()
+    save_state(state)
 
 
 async def run_notion_sync(
@@ -612,127 +850,56 @@ async def run_notion_sync(
         logger.warning("notion_sync: enabled but NOTION_API_KEY is empty — skipping")
         return stats
 
+    # A sync tick writes the active client's docs, vector collections, and
+    # sync-state file, so its writes must not interleave with an in-process
+    # fixture load / client rotation — those swap that state wholesale and a
+    # mid-rotation tick would write one client's wiki into another's
+    # collection. Holding the destructive-op lock across the whole tick
+    # would let slow Notion I/O block /fixtures/* and /clients/* (and, via
+    # the rotation pause marker, the entire scheduler), so instead: skip
+    # the tick when a destructive op is already running, fetch from Notion
+    # unlocked, and take the lock only for the local write phase. A CLI
+    # invocation is a separate process this lock cannot see — that
+    # cross-process race is a known, accepted limitation.
+    from openexecutive.cli.fixture_loader import _FIXTURE_OP_LOCK
+    from openexecutive.clients.slots import get_active_client
+
+    if _FIXTURE_OP_LOCK.locked():
+        logger.info(
+            "notion_sync: fixture/rotation operation in progress — "
+            "skipping this tick, will retry on the next interval"
+        )
+        return stats
+
     if store is None:
         store = ChromaDBStore(persist_directory=settings.vector_store_path)
 
-    state = load_state()
-    watermark = state.get("watermark") if isinstance(state.get("watermark"), str) else None
+    generation = get_active_client(settings)
     own_client = client is None
     if client is None:
         client = httpx.AsyncClient(headers=_headers(api_key), timeout=60.0)
-
     try:
-        await asyncio.to_thread(_clear_legacy_company_notion, store)
-        pages, truncated = await list_shared_pages(
-            client, max_pages=_MAX_VISIBLE_PAGES
+        fetch = await _fetch_tick(
+            client=client,
+            settings=settings,
+            state=load_state(),
+            reconcile_only=reconcile_only,
+            stats=stats,
         )
-        stats["seen"] = len(pages)
-        if truncated:
-            logger.warning(
-                "notion_sync: visible page list hit safety cap %d — "
-                "skipping reconciliation this tick so unseen pages are not purged",
-                _MAX_VISIBLE_PAGES,
-            )
-
-        visible_ids: set[str] = set()
-        dirty: list[dict[str, Any]] = []
-        for page in pages:
-            page_id = sanitize_notion_id(str(page.get("id") or ""))
-            if not page_id:
+        async with _FIXTURE_OP_LOCK:
+            if get_active_client(settings) != generation:
                 logger.warning(
-                    "notion_sync: skipping page with unsafe id %r", page.get("id")
+                    "notion_sync: active client changed while fetching — "
+                    "discarding this tick's results"
                 )
-                stats["failed"] += 1
-                continue
-            visible_ids.add(page_id)
-            edited = str(page.get("last_edited_time") or "")
-            recorded = _page_record(state, page_id)
-            if recorded.get("last_edited") == edited:
-                stats["skipped"] += 1
-                continue
-            dirty.append(page)
-
-        known = state.get("pages") if isinstance(state.get("pages"), dict) else {}
-        if truncated:
-            pass
-        elif not visible_ids and known:
-            logger.warning(
-                "notion_sync: search returned 0 pages while %d are on record — "
-                "skipping reconciliation to avoid a mass purge on a blank listing",
-                len(known),
+                return stats
+            await _apply_tick(
+                store=store,
+                fetch=fetch,
+                now=now,
+                reconcile_only=reconcile_only,
+                stats=stats,
             )
-        else:
-            stats["purged"] = reconcile_missing_pages(visible_ids, store, state)
-
-        if not reconcile_only:
-            ingest_cap = max(0, settings.notion_max_pages_per_scan)
-            dirty.sort(
-                key=lambda p: str(p.get("last_edited_time") or ""),
-                reverse=True,
-            )
-            overflow = dirty[ingest_cap:]
-            to_ingest = dirty[:ingest_cap]
-            if overflow:
-                stats["capped"] = len(overflow)
-                logger.warning(
-                    "notion_sync: %d page(s) need ingest, cap is %d — "
-                    "overflow will retry next tick (watermark not advanced past them)",
-                    len(dirty),
-                    ingest_cap,
-                )
-            unresolved_times = [
-                str(p.get("last_edited_time") or "")
-                for p in overflow
-                if p.get("last_edited_time")
-            ]
-            for page in to_ingest:
-                page_id = sanitize_notion_id(str(page.get("id") or ""))
-                if not page_id:
-                    stats["failed"] += 1
-                    continue
-                edited = str(page.get("last_edited_time") or "")
-                try:
-                    await _sleep()
-                    lines = await fetch_block_children(client, page_id)
-                    chunks = await ingest_page(page, "\n\n".join(lines), store)
-                    filename = slugify(page_title(page), page_id)
-                    state.setdefault("pages", {})[page_id] = {
-                        "last_edited": edited,
-                        "title": page_title(page),
-                        "filename": filename,
-                    }
-                    stats["updated"] += 1
-                    logger.info(
-                        "notion_sync: indexed %s (%d chunks)", page_title(page), chunks
-                    )
-                except Exception:
-                    stats["failed"] += 1
-                    if edited:
-                        unresolved_times.append(edited)
-                    logger.exception("notion_sync: failed page %s", page_id)
-
-            if unresolved_times:
-                # Leave watermark strictly below the earliest unresolved edit
-                # so those pages stay eligible. Successfully recorded pages
-                # are skipped via the pages dict, not the watermark.
-                logger.info(
-                    "notion_sync: watermark held at %s (%d unresolved page(s))",
-                    watermark,
-                    len(unresolved_times),
-                )
-            else:
-                recorded_times = [
-                    str(rec.get("last_edited") or "")
-                    for rec in (state.get("pages") or {}).values()
-                    if isinstance(rec, dict) and rec.get("last_edited")
-                ]
-                if recorded_times:
-                    candidate = max(recorded_times)
-                    if watermark is None or candidate > watermark:
-                        state["watermark"] = candidate
-
-        state["last_run"] = (now or datetime.now(UTC)).isoformat()
-        save_state(state)
     finally:
         if own_client:
             await client.aclose()
@@ -747,22 +914,24 @@ def purge_all_synced(store: ChromaDBStore, state: dict[str, Any] | None = None) 
     raw_pages = current.get("pages")
     pages = raw_pages if isinstance(raw_pages, dict) else {}
     ids = list(pages)
+    file_index = _build_file_index()
     purged = 0
+    purged_ids: set[str] = set()
     for pid in ids:
-        if purge_page(str(pid), store, current):
+        if purge_page(str(pid), store, current, file_index=file_index):
             purged += 1
-    docs = _docs_dir()
-    for path in docs.glob("notion-*.md"):
-        try:
-            head = path.read_text(encoding="utf-8", errors="replace")[:4000]
-        except OSError:
-            continue
-        found = _PAGE_ID_COMMENT.search(head)
-        file_id = sanitize_notion_id(found.group(1)) if found else None
-        if file_id:
-            if purge_page(file_id, store, current):
-                purged += 1
-        else:
+            safe = sanitize_notion_id(str(pid))
+            if safe:
+                purged_ids.add(safe)
+    for file_id in file_index:
+        if file_id not in purged_ids and purge_page(
+            file_id, store, current, file_index=file_index
+        ):
+            purged += 1
+    indexed_paths = {p for paths in file_index.values() for p in paths}
+    for path in _docs_dir().glob("notion-*.md"):
+        # Files with no readable page-id comment are junk — remove them.
+        if path not in indexed_paths:
             path.unlink(missing_ok=True)
             purged += 1
     store.delete_notion_docs()
