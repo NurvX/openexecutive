@@ -1,3 +1,6 @@
+// Mirror the backend's `_MAX_FILES_PER_TURN` / `_MAX_BYTES_PER_FILE`. Kept
+// in sync manually; a mismatch only costs an extra round-trip + the user
+// sees the server's 413 message, so no correctness risk.
 export const MAX_FILES_PER_TURN = 5;
 export const MAX_BYTES_PER_FILE = 20 * 1024 * 1024;
 

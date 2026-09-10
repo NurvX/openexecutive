@@ -78,6 +78,11 @@ jobs:
       - name: Type check
         run: cd packages/ui && npx tsc --noEmit
 
+      # node:test suites added in #100. Runs on the same Node 22 the job
+      # already uses (--experimental-strip-types needs 22.6+).
+      - name: Run UI unit tests
+        run: cd packages/ui && npm test
+
       - name: Build
         run: cd packages/ui && npm run build
         env:
