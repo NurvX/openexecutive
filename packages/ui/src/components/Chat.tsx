@@ -8,6 +8,10 @@ import CommitteePhaseIndicator from "./CommitteePhaseIndicator";
 import Icon from "./Icon";
 import InfoTip from "./InfoTip";
 import {
+  MAX_FILES_PER_TURN,
+  mergePickedFiles,
+} from "@/lib/file-attachments";
+import {
   ActionTaken,
   ChatMessage,
   CommitteePhase,
@@ -68,16 +72,11 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   const [subtitle, setSubtitle] = useState<string>(FALLBACK_SUBTITLE);
   const [isLoadingPrompts, setIsLoadingPrompts] = useState(true);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [fileError, setFileError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const adoptedSessionIdRef = useRef<string | undefined>(initialSessionId);
-
-  // Mirror the backend's `_MAX_FILES_PER_TURN` / `_MAX_BYTES_PER_FILE`. Kept
-  // in sync manually; a mismatch only costs an extra round-trip + the user
-  // sees the server's 413 message, so no correctness risk.
-  const MAX_FILES_PER_TURN = 5;
-  const MAX_BYTES_PER_FILE = 20 * 1024 * 1024;
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -141,6 +140,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
 
     setInput("");
     setPendingFiles([]);
+    setFileError(null);
     setMessages((prev) => [...prev, { role: "user", content: userBubbleContent }]);
     setIsLoading(true);
     setStreamingContent("");
@@ -238,16 +238,9 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     // Reset the input so re-picking the same file re-fires onChange.
     e.target.value = "";
     if (picked.length === 0) return;
-    setPendingFiles((prev) => {
-      const merged = [...prev];
-      for (const f of picked) {
-        if (merged.length >= MAX_FILES_PER_TURN) break;
-        if (f.size > MAX_BYTES_PER_FILE) continue;
-        if (merged.some((m) => m.name === f.name && m.size === f.size)) continue;
-        merged.push(f);
-      }
-      return merged;
-    });
+    const result = mergePickedFiles(pendingFiles, picked);
+    setPendingFiles(result.files);
+    setFileError(result.rejected.length > 0 ? result.rejected.join(" ") : null);
   }
 
   function removePendingFile(index: number) {
@@ -384,6 +377,11 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                 </div>
               ))}
             </div>
+          )}
+          {fileError && (
+            <p className="text-sm text-red-400 mb-2" role="alert">
+              {fileError}
+            </p>
           )}
           <div className="relative flex items-end gap-2 sm:gap-3 bg-surface-overlay/50 border border-line-strong rounded-2xl px-3 sm:px-4 py-3 focus-within:border-fg-muted transition-colors">
             <input
