@@ -9,6 +9,12 @@ import pytest
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-not-used")
 os.environ.setdefault("EXEC_EMAIL_ADDRESS", "ceo.test@example.com")
 
+# Tests run as a local, non-public process. If this leaks in from the developer's
+# shell, create_app() fails closed on the missing BACKEND_SHARED_SECRET and every
+# full-app test errors at construction — the same trap BACKEND_SHARED_SECRET sets
+# (see CLAUDE.md → Testing). Clear it so the suite matches CI either way.
+os.environ.pop("OE_PUBLIC_DEPLOYMENT", None)
+
 
 @pytest.fixture(autouse=True)
 def reset_active_gateway():

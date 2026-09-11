@@ -43,7 +43,7 @@ RUN uv export --locked --no-dev --no-emit-project -q -o requirements.txt \
 # Bake the embedding model the MCP gateway loads at startup
 # (sentence-transformers/all-MiniLM-L6-v2). Without this the ~90 MB model is
 # fetched from Hugging Face on every cold start, which dominates boot time —
-# see the health-check grace period note in fly.api.toml. extensible-mcp is
+# see the health-check grace period note in docs/deployment.md. extensible-mcp is
 # launched via `uvx` and inherits this process's environment, so pointing
 # HF_HOME at an image path lets that subprocess load the model from disk
 # instead of the network. Runs right after the dependency install so the
@@ -96,7 +96,7 @@ COPY fixtures/ ./fixtures/
 
 # Register the `openexecutive` console script (defined in
 # [project.scripts] in pyproject.toml) so admin commands like
-# `openexecutive ingest-oer` are runnable via `flyctl ssh console`.
+# `openexecutive ingest-oer` are runnable via a shell on the container.
 # Dependencies were already installed in the earlier layer, so --no-deps
 # keeps this fast and cache-friendly.
 RUN uv pip install --system --no-deps .
@@ -116,8 +116,8 @@ ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
 
 # Defaults for the co-located workspace-mcp child. The credentials dir lives on
-# the /data volume so an OAuth token survives restarts; fly.api.toml [env] sets
-# the same values (and the per-install GWORKSPACE_AUTH_MODE / Google secrets).
+# the /data volume so an OAuth token survives restarts; a deployment sets the
+# same values (and the per-install GWORKSPACE_AUTH_MODE / Google secrets).
 ENV WORKSPACE_MCP_CREDENTIALS_DIR=/data/google_credentials
 ENV WORKSPACE_MCP_TOOL_TIER=complete
 

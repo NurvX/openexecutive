@@ -23,7 +23,7 @@ What you expected to happen instead.
 
 ## Environment
 
-- How you're running it: [ `make dev` / Docker / Fly deployment ]
+- How you're running it: [ `make dev` / Docker / self-hosted deployment ]
 - OS:
 - Python version (`python --version`):
 - Relevant config (model overrides, enabled integrations) — **do not paste secrets**:

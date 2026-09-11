@@ -271,7 +271,7 @@ A background polling loop that wakes the Executive when a `scheduled_actions` ro
 
 **Startup sweep:** `requeue_orphaned_running()` resets any `running` rows left by a previous crash back to `pending`, so no action is permanently lost.
 
-**Single-instance constraint:** Do not run the scheduler in more than one process against the same database. The Fly.io API app is pinned to `max_machines_running = 1` for exactly this reason.
+**Single-instance constraint:** Do not run the scheduler in more than one process against the same database. Any deployment must pin the API to a single instance for exactly this reason.
 
 ```
 SQLite scheduled_actions (status=pending, scheduled_for ≤ now)
@@ -601,4 +601,4 @@ Everything in `company/` is gitignored. This includes:
 - `chroma_db/` — the vector store (contains embeddings of company documents)
 - `episodic_memory.db` — decisions, initiatives, advice, alerts, audit log
 
-None of this leaves the local machine (or your own Fly volume in cloud deployments) except as part of prompts sent to the Anthropic API. Anthropic does not train on API data.
+None of this leaves the local machine (or your own volume in cloud deployments) except as part of prompts sent to the Anthropic API. Anthropic does not train on API data.

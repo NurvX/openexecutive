@@ -56,7 +56,7 @@ async function proxy(req: NextRequest, params: { path: string[] }): Promise<Resp
   });
 
   // Stamp the proxy's own identity on every upstream request. The API enforces
-  // this header; direct hits to the public Fly URL without it get 401.
+  // this header; direct hits to the public API URL without it get 401.
   if (BACKEND_SHARED_SECRET) {
     headers.set("x-api-key", BACKEND_SHARED_SECRET);
   }

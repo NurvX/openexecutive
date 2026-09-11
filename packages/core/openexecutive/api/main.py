@@ -137,7 +137,8 @@ def _configure_logging() -> None:
 _configure_logging()
 
 
-# Paths that bypass the shared-secret gate. /health is hit by Fly's checker;
+# Paths that bypass the shared-secret gate. /health is hit by the platform's
+# health checker;
 # the /webhook/* routes are called by external services (Google, Telegram) and
 # carry their own verification.
 _UNAUTHENTICATED_PATHS: frozenset[str] = frozenset(
@@ -177,7 +178,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     initialize_db()
     initialize_alerts_db()
 
-    # User-generated company fixtures (DB-backed; persists on the Fly volume).
+    # User-generated company fixtures (DB-backed; persists on the data volume).
     from openexecutive.fixtures.store import initialize_db as initialize_fixtures_db
     initialize_fixtures_db()
 
@@ -347,9 +348,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from openexecutive.workflows.resumer import run_resumer
     resumer_task = asyncio.create_task(run_resumer())
 
-    # Discord gateway bot. Embedded in the lifespan (rather than a sibling Fly
-    # app) because the bot needs direct access to the same SQLite + ChromaDB
-    # under /data, and Fly volumes attach to a single machine. Same pattern as
+    # Discord gateway bot. Embedded in the lifespan (rather than a sibling
+    # service) because the bot needs direct access to the same SQLite + ChromaDB
+    # under /data, and that volume attaches to a single instance. Same pattern as
     # email_poller above. Skipped when no token is configured.
     if settings.discord_bot_token:
         _discord_log = logging.getLogger("openexecutive")
@@ -397,7 +398,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Shut Discord down FIRST so the gateway stops accepting new events before
     # we tear down email_poller/scheduler/resumer that handlers might call into.
     # Bounded timeout: discord.py's close handshake can stall during a reconnect,
-    # and a hung shutdown blocks the FastAPI lifespan and risks SIGKILL on Fly.
+    # and a hung shutdown blocks the FastAPI lifespan and risks SIGKILL.
     if discord_bot is not None or discord_bot_task is not None:
         async def _shutdown_discord() -> None:
             if discord_bot is not None:
@@ -450,6 +451,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Cleanup if needed (ChromaDB handles persistence)
 
 
+# Values that explicitly mean "not a public deployment". Anything else
+# non-empty arms the guard: for a fail-closed check, an unrecognised value
+# must err toward requiring the secret, never toward skipping it.
+_FALSEY_ENV = frozenset({"", "0", "false", "no", "off"})
+
+
+def _is_public_deployment() -> bool:
+    """Whether this process is serving an internet-reachable deployment.
+
+    Driven by the explicit ``OE_PUBLIC_DEPLOYMENT`` env var rather than any
+    hosting provider's injected variables, so the check works identically on
+    every platform (and in plain Docker). See docs/deployment.md.
+    """
+    return os.environ.get("OE_PUBLIC_DEPLOYMENT", "").strip().lower() not in _FALSEY_ENV
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Open Executive API",
@@ -460,7 +477,7 @@ def create_app() -> FastAPI:
 
     # Allowed UI origins: localhost for `make dev`, plus any production
     # origins listed in BACKEND_ALLOWED_ORIGINS (comma-separated, e.g.
-    # "https://openexec-ui-dev.fly.dev,https://exec.mycompany.com").
+    # "https://exec.example.com,https://exec.mycompany.com").
     extra_origins = [
         o.strip()
         for o in os.environ.get("BACKEND_ALLOWED_ORIGINS", "").split(",")
@@ -477,14 +494,13 @@ def create_app() -> FastAPI:
     # Shared-secret gate. If BACKEND_SHARED_SECRET is set, every non-exempt
     # request must include a matching x-api-key header. If unset, the gate is
     # off (intended for local dev only — production deploys MUST set it).
-    # Fail closed when running under Fly (FLY_APP_NAME is set on every machine):
-    # no secret on a publicly reachable instance is never acceptable.
+    # Fail closed on any internet-reachable instance: set OE_PUBLIC_DEPLOYMENT=1
+    # there, and a missing secret becomes a boot failure rather than a warning.
     shared_secret = os.environ.get("BACKEND_SHARED_SECRET", "").strip()
-    if not shared_secret and os.environ.get("FLY_APP_NAME"):
+    if not shared_secret and _is_public_deployment():
         raise RuntimeError(
-            "BACKEND_SHARED_SECRET is required when running on Fly. "
-            "Set it with: flyctl secrets set -a $FLY_APP_NAME "
-            "BACKEND_SHARED_SECRET=$(openssl rand -hex 32)"
+            "BACKEND_SHARED_SECRET is required when OE_PUBLIC_DEPLOYMENT is set. "
+            "Generate one with: openssl rand -hex 32"
         )
     if shared_secret:
         @app.middleware("http")

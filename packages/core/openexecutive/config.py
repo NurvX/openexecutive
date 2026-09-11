@@ -283,7 +283,7 @@ class Settings(BaseSettings):
         # accepts ``base_url=None`` and falls back to its built-in
         # production endpoint, which is the right behavior for the
         # hosted-Honcho setup. Earlier we required it explicitly here,
-        # but that crashed the openexec-api-dev deploy on 2026-05-25
+        # but that crashed the dev deploy on 2026-05-25
         # because hosted Honcho doesn't need an operator-set URL.
         return self
 

@@ -1,20 +1,20 @@
 ---
 name: openexec-api
-description: Interact with the Open Executive FastAPI backend via curl. Use this skill when the user asks to hit /chat, /today, /people, /scheduled_actions, /architecture/*, /health/*, /fixtures/*, /audit/*, or any HTTP endpoint on openexec-api-dev.fly.dev (dev) or localhost:8000 (local). Authenticates via $BACKEND_SHARED_SECRET in the x-api-key header. Tiered safety: GET runs freely, mutating POSTs need explicit confirmation.
+description: Interact with the Open Executive FastAPI backend via curl. Use this skill when the user asks to hit /chat, /today, /people, /scheduled_actions, /architecture/*, /health/*, /fixtures/*, /audit/*, or any HTTP endpoint on the Open Executive API, local or deployed. Authenticates via $BACKEND_SHARED_SECRET in the x-api-key header. Tiered safety: GET runs freely, mutating POSTs need explicit confirmation.
 ---
 
 # openexec-api
 
-Curl recipes against the FastAPI backend. Pair skill: `flyctl` (infra ops). When the user wants an SQLite row or to tail logs, that's flyctl. When they want to hit an HTTP route, that's this skill.
+Curl recipes against the FastAPI backend — for hitting HTTP routes, not for inspecting SQLite or tailing logs on a host.
 
 ## Base URLs
 
 ```bash
-export OE_API=https://openexec-api-dev.fly.dev   # dev (default in this skill)
-export OE_API=http://localhost:8000               # local (`make dev` must be running)
+export OE_API=http://localhost:8000   # local (`make dev` must be running) — the default
+export OE_API=https://<your-host>     # a deployed environment
 ```
 
-All recipes below use `$OE_API`. If the user doesn't specify, assume dev.
+All recipes below use `$OE_API`. If it is unset and the user doesn't specify, assume `http://localhost:8000`.
 
 ## Auth
 

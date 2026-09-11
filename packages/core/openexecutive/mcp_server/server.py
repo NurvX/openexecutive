@@ -18,7 +18,8 @@ Design notes
 * **DNS-rebinding protection** (FastMCP's Host-header check) is disabled: the
   endpoint authenticates with a header secret (not a cookie), so a browser
   rebinding attack cannot supply credentials, and the server runs behind the
-  Fly TLS proxy. The shared-secret gate is the real access control.
+  deployment's TLS terminator. The shared-secret gate is the real access
+  control.
 
 * **No prompt-caching impact.** This path is parallel to chat. Resources are
   pure reads; ``consult_specialist`` delegates to ``BaseAgent.analyze`` which

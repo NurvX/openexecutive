@@ -399,7 +399,7 @@ def test_mcp_endpoint_is_gated_by_shared_secret(
     from openexecutive.api.main import create_app
 
     monkeypatch.setenv("BACKEND_SHARED_SECRET", "testsecret")
-    monkeypatch.delenv("FLY_APP_NAME", raising=False)
+    monkeypatch.delenv("OE_PUBLIC_DEPLOYMENT", raising=False)
     app = create_app()
     client = TestClient(app)  # not a context manager → lifespan does not run
 

@@ -645,8 +645,8 @@ peer_memory:
 
     The peer-keyed surfaces sit on top of Honcho (https://honcho.dev)
     as the underlying provider. Production runs against hosted Honcho;
-    the repo also carries a self-hosted Fly deployment
-    (``fly.honcho.toml``, ``docker/honcho/``) as a fallback. The
+    the repo also carries a self-hosted image (``docker/honcho/``)
+    as a fallback. The
     integration is provider-agnostic at the wrapper boundary
     (``openexecutive.memory.honcho_client``) — swapping providers
     would touch that one module without rippling through the
@@ -2486,15 +2486,15 @@ integrations:
     with modern pydantic) and launched by
     docker/workspace-mcp-launch.sh, referenced as the `command` of the
     google_workspace entry in /data/company/mcp_servers.json. The launcher selects
-    the auth mode from GWORKSPACE_AUTH_MODE (env/Fly secret, no rebuild to switch):
+    the auth mode from GWORKSPACE_AUTH_MODE (an env var, no rebuild to switch):
     `oauth` = single-user, refresh token persisted at /data/google_credentials on
     the API volume — seed it by copying a locally-obtained token onto the volume
     (the API serves NO Google OAuth callback); `service_account` = domain-wide
     delegation via GOOGLE_SERVICE_ACCOUNT_KEY_JSON/_KEY_FILE + USER_GOOGLE_EMAIL,
     no browser callback. INVARIANT: the Google secrets must be added to
     _FORWARDED_ENV_VARS so extensible-mcp can interpolate the $VAR placeholders in
-    the child's env block from its own environment. No separate Fly app / deploy
-    token / deploy job. See docs/deployment.md.
+    the child's env block from its own environment. No separate service, deploy
+    credential, or deploy job. See docs/deployment.md.
 
     Cold-start embedding cache: extensible-mcp runs as a uvx subprocess and
     builds a tool-search vector index with fastembed, which loads
@@ -2600,7 +2600,7 @@ integrations:
     check is disabled (TransportSecuritySettings(enable_dns_rebinding_protection
     =False)): the endpoint authenticates with a header secret, not a cookie, so
     a browser rebinding attack cannot supply the key, and traffic arrives behind
-    the Fly TLS proxy. The shared secret is the real access control.
+    the deployment's TLS terminator. The shared secret is the real access control.
 
     Surface — what's valuable beyond chat (OE already has six chat channels, so
     a chat-only server adds nothing): company-grounded context as READ-ONLY
@@ -2728,8 +2728,8 @@ fixtures:
     HYBRID. The four curated fixtures stay as git-tracked YAML under repo-root
     fixtures/companies/<name>/. User-generated fixtures live in the
     generated_fixtures SQLite table (module openexecutive.fixtures.store) in the
-    same episodic_memory.db on the Fly volume, so they persist across redeploys
-    (disk on Fly is ephemeral). GET /fixtures merges both sources; every list
+    same episodic_memory.db on the persistent data volume, so they survive
+    redeploys (container disk is ephemeral). GET /fixtures merges both sources; every list
     item carries source: "curated" | "generated".
   generation: |
     POST /fixtures/generate {description} runs the Council-configurable

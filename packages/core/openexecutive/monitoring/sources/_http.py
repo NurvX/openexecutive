@@ -41,7 +41,7 @@ def validate_target_url(url: str) -> tuple[bool, str]:
     Rejects non-http(s) schemes and any host that resolves to a
     loopback / link-local / private / reserved IP — the classic SSRF
     pivots into IMDS (169.254.169.254), local services (127.*), or
-    private cloud meshes (RFC1918, Fly fdaa::/64). Returns
+    private cloud meshes (RFC1918, IPv6 ULA). Returns
     ``(False, reason)`` to be logged at the call site.
 
     First-resolution check only — full DNS-rebind defence would need

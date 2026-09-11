@@ -4,14 +4,14 @@
 # uv 0.9.24) but pins the Honcho source to a specific release tag, bakes
 # in OE's config.toml (OpenRouter routes every LLM call, dreaming on,
 # AUTH_USE_AUTH=true), and bundles an embeddings sidecar
-# (`docker/honcho/embed_server.py`) that runs as the `embed` Fly process
-# group serving `BAAI/bge-small-en-v1.5` locally via fastembed/ONNX so
-# embeddings never leave Fly's private network.
+# (`docker/honcho/embed_server.py`) that runs as the `embed` process
+# serving `BAAI/bge-small-en-v1.5` locally via fastembed/ONNX so
+# embeddings never leave the deployment's private network.
 #
 # Build context is the repo root (so this file references
 # docker/honcho/config.toml + embed_server.py from cwd). See
-# fly.honcho.toml for how Fly invokes the build + which process runs
-# which command.
+# README.md for the three process roles and which command
+# each one runs.
 # Honcho's uv.lock pins Python 3.11 even though their own Dockerfile says
 # 3.13 — they bake the missing interpreter from uv's managed-Python cache.
 # We can't do that cleanly under our non-root `app` user (uv's cache lands
@@ -19,7 +19,7 @@
 FROM python:3.11-slim-bookworm
 
 # Bump deliberately — Honcho ships database migrations between minors and
-# the SDK's wire format can shift. The runbook (docs/honcho-hosting.md)
+# the SDK's wire format can shift. The runbook (README.md)
 # covers the upgrade procedure.
 ARG HONCHO_VERSION=v3.0.7
 
@@ -57,7 +57,7 @@ RUN uv sync --frozen --no-dev
 # Embeddings sidecar deps: fastembed wraps ONNX-runtime models with no
 # torch dependency, so the marginal image size is small (~130MB for
 # bge-small-en-v1.5 weights + onnxruntime). Installed into Honcho's venv
-# so the same `embed` Fly process can `import fastembed` directly.
+# so the same `embed` process can `import fastembed` directly.
 RUN uv pip install --python /app/.venv/bin/python "fastembed>=0.6.0,<1"
 
 # Overlay OE's Honcho config and the embeddings sidecar source.
@@ -78,13 +78,13 @@ RUN useradd --create-home --shell /bin/bash app \
     && chown -R app:app /app
 USER app
 
-# Put the uv-managed venv on PATH so Fly's `[processes]` commands can
+# Put the uv-managed venv on PATH so each process's command can
 # invoke `fastapi` / `python` directly without an `uv run` prefix
 # (matches Honcho's upstream CMD).
 ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000 8001
 
-# Default command is the API. Fly's [processes] block in fly.honcho.toml
-# overrides this per process (api / deriver / embed).
+# Default command is the API. Override it per process (api / deriver / embed)
+# — see README.md.
 CMD ["fastapi", "run", "--host", "0.0.0.0", "src/main.py"]
