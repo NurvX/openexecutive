@@ -170,17 +170,23 @@ def propose_via_alert(
     summary: str,
     body: str,
     suggested_action: str = "",
+    extra_tags: list[str] | None = None,
 ) -> int | None:
     """Persist a proposal as an alert routed to a specific Person.
 
     Returns the alert id, or None if a duplicate was suppressed.
 
     topic_tags carries both department and person identifiers so the UI
-    and future resolvers can filter/match without parsing the body.
+    and future resolvers can filter/match without parsing the body;
+    ``extra_tags`` lets a caller carry the originating alert's tags (e.g.
+    a ``comp`` / ``legal`` marker) onto the proposal.
     """
     from openexecutive.alerts.store import insert_alert
 
     topic_tags = [f"department:{department_slug}", f"person:{person_id}"]
+    for tag in extra_tags or []:
+        if tag not in topic_tags:
+            topic_tags.append(tag)
     dedup_key = f"proposal:{department_slug}:{person_id}:{summary[:60]}"
 
     try:

@@ -16,7 +16,10 @@ Executive's voice while letting each use the right structure.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import Any
+
+from openexecutive.alerts.lifecycle import parse_aware
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +36,26 @@ STANDALONE_BRIEF_SYSTEM = (
     "You are the user's Executive. You are writing the daily brief — a short "
     "message the principal reads on its own (delivered as a DM; there is no "
     "other list beside it, so this message must stand alone). Write "
-    "peer-to-peer, not as a corporate broadcast.\n\n"
+    "peer-to-peer, not as a corporate broadcast. The context is a DELTA since "
+    "the last brief you sent, so never re-tell yesterday's news.\n\n"
     "Output ≤200 words of Markdown with these sections, in this order, each "
     "only included when there is real content for it:\n"
-    "  1. **What changed** — anything you acted on, anyone you DM'd, any goal "
-    "that flipped. One bullet per item, terse.\n"
-    "  2. **Needs you** — proposals or decisions waiting on the principal. "
-    "Lead with the most time-sensitive.\n"
-    "  3. **At risk** — departments / goals trending off-track the principal "
-    "hasn't already been briefed on.\n"
-    "  4. **Top call** — the single decision you'd recommend the principal "
-    "focus on, with your suggested move.\n\n"
+    "  1. **Top call** — the single decision you'd recommend the principal "
+    "focus on today, with your suggested move. One or two sentences.\n"
+    "  2. **What changed** — anything NEW since the last brief: a goal that "
+    "flipped, a reply that landed, an external signal that moved. One bullet "
+    "per item, terse.\n"
+    "  3. **Handled overnight** — what you already did on your own from the "
+    "HANDLED block (routed, nudged, drafted, closed with evidence). One "
+    "bullet each, past tense, naming the person or item.\n"
+    "  4. **Needs you** — ONLY the items under NEW SINCE LAST BRIEF, most "
+    "time-sensitive first, each with its why-now when given. If the context "
+    "has a CARRIED OVER line, add exactly one sentence after the list "
+    "('N older items still open — see /today'); never re-list carried items.\n"
+    "  5. **Waiting on** — people whose reply you're still waiting for, with "
+    "how long. One line each.\n"
+    "  6. **At risk** — departments / goals trending off-track the principal "
+    "hasn't already been briefed on.\n\n"
     "Skip headers entirely for sections with no content. If everything is "
     "genuinely quiet, output one line: 'Quiet right now — nothing pressing.'"
 )
@@ -115,14 +127,28 @@ def _viewer_system_prompt(name: str, role: str) -> str:
     )
 
 
+def _age_days(iso: str | None, now: datetime) -> int:
+    dt = parse_aware(iso)
+    return max(0, (now - dt).days) if dt is not None else 0
+
+
 def render_briefing_context(
     *,
     period_label: str,
     today_data: dict[str, Any],
     activity: list[dict[str, Any]],
+    since: datetime | None = None,
+    handled: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Pack the structured /today + activity inputs into a single user-turn block."""
+    """Pack the structured /today + activity inputs into a single user-turn block.
+
+    With ``since`` (the standalone briefs) proposals are split into NEW SINCE
+    LAST BRIEF vs a one-line CARRIED OVER count, and ``handled`` (autonomous
+    alert-review moves in the window) renders as its own block. With both
+    unset the output is byte-identical to the legacy /today header context.
+    """
     parts: list[str] = [f"PERIOD: {period_label}\n"]
+    now = datetime.now(UTC)
 
     depts = today_data.get("departments", [])
     at_risk = [d for d in depts if d.get("at_risk_count", 0) or d.get("off_track_count", 0)]
@@ -137,11 +163,40 @@ def render_briefing_context(
         parts.append("")
 
     proposals = today_data.get("proposals", [])
-    if proposals:
-        parts.append("PROPOSALS AWAITING DECISION:")
-        for p in proposals[:10]:
-            parts.append(f"- {p.get('headline', '')[:160]}")
-        parts.append("")
+    if since is None:
+        if proposals:
+            parts.append("PROPOSALS AWAITING DECISION:")
+            for p in proposals[:10]:
+                parts.append(f"- {p.get('headline', '')[:160]}")
+            parts.append("")
+    else:
+        from openexecutive.briefing.brief_state import split_proposals
+
+        new_items, carried = split_proposals(proposals, since)
+        if new_items:
+            parts.append("NEEDS YOU — NEW SINCE LAST BRIEF:")
+            for p in new_items[:10]:
+                line = f"- {p.get('headline', '')[:160]}"
+                if p.get("why_now"):
+                    line += f" (why now: {str(p['why_now'])[:80]})"
+                move = p.get("recommended_move")
+                if move and move != "none":
+                    line += f" [next move: {move}]"
+                parts.append(line)
+            parts.append("")
+        if carried:
+            oldest = max(_age_days(p.get("created_at"), now) for p in carried)
+            stale = sum(1 for p in carried if p.get("review_verdict") == "likely_stale")
+            line = f"CARRIED OVER: {len(carried)} older item(s) still open (oldest {oldest}d"
+            if stale:
+                line += f", {stale} flagged likely stale"
+            parts.append(line + ") — see /today")
+            parts.append("")
+        if handled:
+            parts.append("HANDLED OVERNIGHT BY THE EXECUTIVE (already done — report, don't ask):")
+            for h in handled[:15]:
+                parts.append(f"- [{str(h.get('at', ''))[:10]}] {h.get('kind', '')}: {str(h.get('summary', ''))[:140]}")
+            parts.append("")
 
     people = today_data.get("people", [])
     awaiting = [p for p in people if p.get("awaiting_count", 0)]
@@ -198,6 +253,8 @@ async def synthesize_briefing_narrative(
     period_label: str,
     viewer: dict[str, str] | None = None,
     standalone: bool = False,
+    since: datetime | None = None,
+    handled: list[dict[str, Any]] | None = None,
 ) -> str:
     """Synthesize the briefing narrative. Returns Markdown, or "" when empty.
 
@@ -224,7 +281,8 @@ async def synthesize_briefing_narrative(
     else:
         system = BRIEFING_NARRATIVE_SYSTEM
     user_content = render_briefing_context(
-        period_label=period_label, today_data=today_data, activity=activity
+        period_label=period_label, today_data=today_data, activity=activity,
+        since=since, handled=handled,
     )
     model = get_fast_model()
     response = await get_provider(model).messages_create(

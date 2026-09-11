@@ -1544,6 +1544,11 @@ async def handle_ack_alert(tool_input: dict[str, Any]) -> str:
         # Lost the race with another writer / delete — surface it.
         return json.dumps({"error": f"alert {alert_id} could not be updated"})
 
+    # Same feedback loop as the HTTP ack: a dismiss teaches the watch.
+    from openexecutive.alerts.lifecycle import record_ack_feedback
+
+    record_ack_feedback(existing, status)
+
     session = current_session.get()
     session_id = getattr(session, "session_id", None) if session is not None else None
     from openexecutive.audit import log_event as audit_log

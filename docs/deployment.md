@@ -188,7 +188,9 @@ docker compose exec api sqlite3 /data/episodic_memory.db \
 **Rollback** is an image-tag rollback: redeploy the previous tag. The volume is
 not versioned with the image, so a release that migrates schema forward is not
 undone by rolling the image back — check what changed under `*/store.py` before
-relying on it.
+relying on it. Additive column migrations (the common case — every column has a
+default and older builds name their columns explicitly) are safe to roll back
+over; a rolled-back build simply ignores the newer columns.
 
 **Backups.** There is no snapshot cron in this repo. `/data/episodic_memory.db`
 is the irreplaceable part (Chroma rebuilds from source documents), so back it up

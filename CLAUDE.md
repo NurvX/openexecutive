@@ -174,6 +174,19 @@ See `.env.example`. Required: `ANTHROPIC_API_KEY`. Optional integrations: `SLACK
 > interactive setup prompt. `npm run build` (`next build`) is the UI's
 > lint/type gate.
 
+> **Audit-log test pollution:** `audit.log_event` writes to the default
+> `./episodic_memory.db` unless the test isolates it. A test module that
+> exercises audited code (alerts review, sweeps) without monkeypatching
+> `openexecutive.audit.log_event` (or the audit logger's DB) leaks rows that
+> break *other* modules' assertions only in a full run (e.g. the brief's
+> "handled overnight" block). Patch it in an autouse fixture, and delete a
+> stray `packages/core/episodic_memory.db` (gitignored) if one appears.
+
+> **Known-red on `main`:** `tests/integration/test_chat_committee.py::
+> test_chat_with_committee_streams_phases_and_revised_text` fails on the
+> base commit independently of local changes; deselect it when comparing
+> full-suite runs.
+
 ```bash
 # Unit tests (no API calls)
 pytest packages/core/tests/unit/ -v

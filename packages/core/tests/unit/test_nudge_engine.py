@@ -95,6 +95,7 @@ def _settings(**overrides: object) -> Settings:
         nudge_max_defer_days=3,
         nudge_max_per_scan=10,
         nudge_max_per_person_per_scan=2,
+        nudge_max_per_scope=3,
     )
     base.update(overrides)
     return base  # type: ignore[return-value]
@@ -739,3 +740,61 @@ class TestHeartbeat:
         # Should be ~5 minutes in the future
         delta = run_at - now
         assert timedelta(minutes=4, seconds=30) <= delta <= timedelta(minutes=5, seconds=30)
+
+
+# ---------------------------------------------------------------------------
+# Per-scope cap (alert lifecycle): stop re-chasing the same item forever
+# ---------------------------------------------------------------------------
+
+class TestPerScopeCap:
+    def test_count_nudges_for_scope_counts_done_only(self) -> None:
+        now = _now()
+        ids = [
+            episodic.insert_scheduled_action(
+                run_at=now.isoformat(), channel="slack_dm", channel_ref="U_X",
+                intent_text="nudge", kind="proactive_nudge",
+                scope_key="nudge:stalled:run_cap", status="pending",
+            )
+            for _ in range(4)
+        ]
+        with sqlite3.connect(str(episodic.DB_PATH)) as conn:
+            for aid, status in zip(ids, ("done", "done", "cancelled", "pending"), strict=True):
+                conn.execute("UPDATE scheduled_actions SET status = ? WHERE id = ?", (status, aid))
+            # A non-nudge row sharing the scope_key (calendar / onboarding
+            # namespaces also use scope_key) must not count.
+            conn.execute(
+                "UPDATE scheduled_actions SET kind = 'ad_hoc' WHERE id = ?", (ids[0],)
+            )
+            conn.commit()
+        assert episodic.count_nudges_for_scope("nudge:stalled:run_cap") == 1
+        assert episodic.count_nudges_for_scope("nudge:stalled:other") == 0
+
+    @pytest.mark.asyncio
+    async def test_scan_skips_scope_at_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_settings(monkeypatch, nudge_max_per_scope=2)
+        pid = _make_person(slack_user_id="U_ALICE", preferred="slack")
+        now = _now()
+        _insert_workflow_run(
+            run_id="run_capped",
+            awaiting_person_id=pid,
+            awaiting_until=now + timedelta(hours=12),
+            updated_at=now - timedelta(days=2),
+        )
+        # Two nudges already delivered for this scope, both outside the cooldown.
+        for days_ago in (5, 3):
+            episodic.insert_scheduled_action(
+                run_at=(now - timedelta(days=days_ago)).isoformat(), channel="slack_dm",
+                channel_ref="U_ALICE", intent_text="nudge", kind="proactive_nudge",
+                scope_key="nudge:stalled:run_capped", status="done",
+            )
+        with sqlite3.connect(str(episodic.DB_PATH)) as conn:
+            conn.execute(
+                "UPDATE scheduled_actions SET created_at = ? WHERE status = 'done'",
+                ((now - timedelta(days=3)).isoformat(),),
+            )
+            conn.commit()
+        assert await nudge_engine.run_nudge_scan(now=now) == 0
+
+        # Cap disabled → the chase resumes.
+        _patch_settings(monkeypatch, nudge_max_per_scope=0)
+        assert await nudge_engine.run_nudge_scan(now=now) == 1

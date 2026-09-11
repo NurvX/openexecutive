@@ -15,8 +15,7 @@ from openexecutive.briefing import narrative as briefing_narrative
 from openexecutive.briefing import narrative_cache
 from openexecutive.departments import registry as dept_registry
 from openexecutive.departments import store as dept_store
-from openexecutive.memory import decision_ledger
-from openexecutive.memory import episodic
+from openexecutive.memory import decision_ledger, episodic
 from openexecutive.people import insights_cache
 from openexecutive.people import registry as people_registry
 from openexecutive.people import store as people_store
@@ -965,14 +964,16 @@ def test_proposals_recency_tiebreak_within_band(
         source="triage", external_id="newer", severity="high",
         headline="newer action", body="y", db_path=db,
     )
+    # Both inside the action TTL (alerts/lifecycle.py) — a backdate past the
+    # TTL would drop the row from the live queue rather than sort it.
     with sqlite3.connect(str(db)) as conn:
         conn.execute(
             "UPDATE alerts SET created_at=? WHERE external_id=?",
-            ("2026-01-01T00:00:00+00:00", "older"),
+            ((datetime.now(UTC) - timedelta(hours=2)).isoformat(), "older"),
         )
         conn.execute(
             "UPDATE alerts SET created_at=? WHERE external_id=?",
-            ("2026-05-01T00:00:00+00:00", "newer"),
+            ((datetime.now(UTC) - timedelta(hours=1)).isoformat(), "newer"),
         )
         conn.commit()
 
@@ -1408,3 +1409,99 @@ def test_today_talent_empty_when_no_searches(client: TestClient) -> None:
     resp = client.get("/today")
     assert resp.status_code == 200
     assert resp.json()["talent"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Alert lifecycle on the read side (alerts/lifecycle.py)
+# --------------------------------------------------------------------------- #
+
+
+def test_proposals_exclude_expired_resolved_and_past_ttl_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only live unread rows surface: swept (`expired`), Executive-closed
+    (`resolved`) and unswept-but-past-TTL rows are all absent."""
+    import sqlite3
+
+    db = tmp_path / "lifecycle.db"
+    _setup_isolated_db(db, monkeypatch)
+    from openexecutive.alerts import lifecycle
+
+    monkeypatch.setattr(lifecycle, "_ttl_settings", lambda: (3, 14))
+
+    alert_store.insert_alert(
+        source="triage", external_id="live", severity="high",
+        headline="live item", body="x", db_path=db,
+    )
+    swept = alert_store.insert_alert(
+        source="triage", external_id="swept", severity="high",
+        headline="swept item", body="x", db_path=db,
+    )
+    resolved = alert_store.insert_alert(
+        source="triage", external_id="resolved", severity="high",
+        headline="resolved item", body="x", db_path=db,
+    )
+    alert_store.insert_alert(
+        source="triage", external_id="old", severity="high",
+        headline="past ttl item", body="x", db_path=db,
+    )
+    assert swept is not None and resolved is not None
+    alert_store.set_status(swept, "expired", db_path=db)
+    alert_store.set_status(resolved, "resolved", db_path=db)
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "UPDATE alerts SET created_at=? WHERE external_id='old'",
+            ((datetime.now(UTC) - timedelta(days=20)).isoformat(),),
+        )
+        conn.commit()
+
+    headlines = [p["headline"] for p in _make_client().get("/today").json()["proposals"]]
+    assert headlines == ["live item"]
+
+
+def test_proposals_carry_lifecycle_fields_and_demote_likely_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "fields.db"
+    _setup_isolated_db(db, monkeypatch)
+
+    stale = alert_store.insert_alert(
+        source="triage", external_id="s", severity="high",
+        headline="stale one", body="x", db_path=db,
+    )
+    fresh = alert_store.insert_alert(
+        source="triage", external_id="f", severity="high",
+        headline="fresh one", body="x", db_path=db,
+    )
+    folded = alert_store.insert_alert(
+        source="triage", external_id="dup", severity="high",
+        headline="dup", body="x", db_path=db,
+    )
+    assert stale is not None and fresh is not None and folded is not None
+    alert_store.set_review(
+        stale, verdict="likely_stale", note="no activity in 9 days",
+        recommended_move="close", db_path=db,
+    )
+    alert_store.set_review(
+        fresh, verdict="relevant", note="Dana replied overnight",
+        recommended_move="nudge", why_now="SLA ends today",
+        due_at=(datetime.now(UTC) + timedelta(hours=6)).isoformat(), db_path=db,
+    )
+    alert_store.mark_superseded(folded, fresh, db_path=db)
+
+    proposals = _make_client().get("/today").json()["proposals"]
+    by_headline = {p["headline"]: p for p in proposals}
+    assert set(by_headline) == {"stale one", "fresh one"}
+    assert proposals[0]["headline"] == "fresh one"  # due-soon bonus + stale penalty
+    f = by_headline["fresh one"]
+    assert f["review_verdict"] == "relevant"
+    assert f["review_note"] == "Dana replied overnight"
+    assert f["recommended_move"] == "nudge"
+    assert f["why_now"] == "SLA ends today"
+    assert f["due_at"] is not None
+    assert f["superseded_count"] == 1
+    assert f["occurrence_count"] == 2
+    assert f["last_reviewed_at"] is not None
+    s = by_headline["stale one"]
+    assert s["review_verdict"] == "likely_stale"
+    assert s["score"] < f["score"]

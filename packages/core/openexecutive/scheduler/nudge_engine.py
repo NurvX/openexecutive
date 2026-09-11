@@ -484,6 +484,7 @@ async def run_nudge_scan(
     """One scan pass: collect → cap → dedup → route → insert. Returns count emitted."""
     from openexecutive.config import get_settings
     from openexecutive.memory.episodic import (
+        count_nudges_for_scope,
         insert_scheduled_action,
         recent_nudge_for_scope,
     )
@@ -537,10 +538,21 @@ async def run_nudge_scan(
     )
 
     emitted = 0
+    max_per_scope = settings.nudge_max_per_scope
     for cand in ranked:
         if recent_nudge_for_scope(
             cand.scope_key, now - cand.cooldown, db_path=db_path
         ):
+            continue
+        # Per-scope cap: after N delivered chases the item stays visible on
+        # /today (its alert / awaiting row) but the engine stops re-pinging.
+        if max_per_scope > 0 and count_nudges_for_scope(
+            cand.scope_key, db_path=db_path
+        ) >= max_per_scope:
+            logger.info(
+                "nudge_engine: scope %s hit the per-scope cap (%d) — not re-chasing",
+                cand.scope_key, max_per_scope,
+            )
             continue
         routed = _route_candidate(
             cand, now, max_defer_days=settings.nudge_max_defer_days

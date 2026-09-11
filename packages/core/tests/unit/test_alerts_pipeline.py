@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from openexecutive.alerts import store as alert_store
 from openexecutive.alerts.models import (
     AlertChannel,
     AlertEvent,
@@ -217,3 +218,165 @@ def test_in_quiet_hours_wraparound_window() -> None:
     assert _in_quiet_hours(prefs, now=datetime(2030, 1, 1, 3, 0, tzinfo=UTC))
     # 12:00 UTC — outside.
     assert not _in_quiet_hours(prefs, now=datetime(2030, 1, 1, 12, 0, tzinfo=UTC))
+
+
+# --------------------------------------------------------------------------- #
+# Coalescing, routing, dedup hint (alert lifecycle)
+# --------------------------------------------------------------------------- #
+
+
+def _stub_triage(monkeypatch, *, severity=AlertSeverity.MEDIUM, dedup_key="model-key",
+                 tags=None):
+    from openexecutive.agents import triage as triage_module
+
+    async def fake_triage(self, event, **kwargs):  # noqa: ARG001
+        return TriageDecision(
+            alert=True,
+            severity=severity,
+            channels=[AlertChannel.PERSISTED],
+            headline="Stub",
+            body=f"body for {event.external_id}",
+            topic_tags=list(tags or ["customer"]),
+            dedup_key=dedup_key or f"key-{event.external_id}",
+        )
+
+    monkeypatch.setattr(triage_module.TriageAgent, "triage", fake_triage)
+
+
+def _count_dispatches(monkeypatch) -> list:
+    from openexecutive.alerts import dispatcher
+
+    calls: list = []
+
+    async def fake_dispatch(alert, channels, **kw):  # noqa: ARG001
+        calls.append(alert.id)
+
+    monkeypatch.setattr(dispatcher, "dispatch_all", fake_dispatch)
+    return calls
+
+
+def test_pipeline_routes_person_only_from_the_explicit_field(monkeypatch, db: Path) -> None:
+    from openexecutive.alerts import pipeline
+
+    _stub_triage(monkeypatch, dedup_key=None)
+    _count_dispatches(monkeypatch)
+
+    async def run():
+        _, a = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="email", external_id="f", body="x", routed_to_person_id=4),
+            db_path=db,
+        )
+        _, b = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="email", external_id="u", body="x", user="person:9"),
+            db_path=db,
+        )
+        _, c = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="email", external_id="n", body="x", user="U123"),
+            db_path=db,
+        )
+        return a, b, c
+
+    a, b, c = asyncio.run(run())
+    assert alert_store.get_alert(a, db_path=db).routed_to_person_id == 4  # type: ignore[union-attr]
+    # `event.user` is a sender-controlled display name on some integrations —
+    # a "person:9" there must never pick the routing target.
+    assert alert_store.get_alert(b, db_path=db).routed_to_person_id is None  # type: ignore[union-attr]
+    assert alert_store.get_alert(c, db_path=db).routed_to_person_id is None  # type: ignore[union-attr]
+
+
+def test_pipeline_replay_of_same_external_id_stays_a_noop(monkeypatch, db: Path) -> None:
+    """A webhook retry (same source + external_id) must not coalesce into a
+    second occurrence — it is the same event, not a repeat of the situation."""
+    from openexecutive.alerts import pipeline
+
+    _stub_triage(monkeypatch, dedup_key="same-key")
+    calls = _count_dispatches(monkeypatch)
+
+    async def run():
+        _, a = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="email", external_id="msg-1", body="x"), db_path=db,
+        )
+        _, b = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="email", external_id="msg-1", body="x"), db_path=db,
+        )
+        return a, b
+
+    a, b = asyncio.run(run())
+    assert a is not None and b is None
+    row = alert_store.get_alert(a, db_path=db)
+    assert row is not None and row.occurrence_count == 1 and calls == [a]
+
+
+def test_pipeline_adds_department_tag_from_channel(monkeypatch, db: Path) -> None:
+    from openexecutive.alerts import pipeline
+
+    _stub_triage(monkeypatch, tags=["finance"])
+    _count_dispatches(monkeypatch)
+
+    async def run():
+        _, aid = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="email", external_id="d", body="x", channel="department:Finance"),
+            db_path=db,
+        )
+        return aid
+
+    aid = asyncio.run(run())
+    row = alert_store.get_alert(aid, db_path=db)
+    assert row is not None and row.topic_tags == ["finance", "department:finance"]
+
+
+def test_pipeline_coalesces_same_key_without_dispatch_and_redispatches_on_escalation(
+    monkeypatch, db: Path
+) -> None:
+    from openexecutive.alerts import pipeline
+
+    calls = _count_dispatches(monkeypatch)
+
+    async def run():
+        _stub_triage(monkeypatch, severity=AlertSeverity.LOW, dedup_key="k")
+        _, first = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="stock", external_id="day1", body="x"), db_path=db,
+        )
+        _, second = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="stock", external_id="day2", body="x"), db_path=db,
+        )
+        _stub_triage(monkeypatch, severity=AlertSeverity.URGENT, dedup_key="k")
+        _, third = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="stock", external_id="day3", body="crash"), db_path=db,
+        )
+        return first, second, third
+
+    first, second, third = asyncio.run(run())
+    assert first is not None and second is None and third == first
+    row = alert_store.get_alert(first, db_path=db)
+    assert row is not None
+    assert row.occurrence_count == 3
+    assert row.severity == "urgent"
+    assert row.body == "body for day3"
+    # One dispatch for the insert, none for the quiet repeat, one for the escalation.
+    assert calls == [first, first]
+    assert len(alert_store.list_alerts(db_path=db)) == 1
+
+
+def test_pipeline_dedup_hint_overrides_model_key(monkeypatch, db: Path) -> None:
+    from openexecutive.alerts import pipeline
+
+    _count_dispatches(monkeypatch)
+
+    async def run():
+        _stub_triage(monkeypatch, dedup_key="model-a")
+        _, a = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="rss", external_id="1", body="x", dedup_hint="watch:acme-news"),
+            db_path=db,
+        )
+        _stub_triage(monkeypatch, dedup_key="model-b")
+        _, b = await pipeline.evaluate_and_dispatch(
+            AlertEvent(source="rss", external_id="2", body="x", dedup_hint="watch:acme-news"),
+            db_path=db,
+        )
+        return a, b
+
+    a, b = asyncio.run(run())
+    assert a is not None and b is None
+    row = alert_store.get_alert(a, db_path=db)
+    assert row is not None and row.dedup_key == "watch:acme-news" and row.occurrence_count == 2

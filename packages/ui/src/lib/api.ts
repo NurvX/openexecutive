@@ -2501,6 +2501,35 @@ export interface ProposalItem {
   // /decisions endpoints (which book/cancel server-side) instead of the
   // ack-and-handoff-to-chat flow. Null/absent for ordinary alert proposals.
   decision_instance_id?: number | null;
+  // Alert lifecycle (alerts/lifecycle.py + alerts/review.py). All optional so
+  // older API builds and test mocks keep compiling.
+  // Coalescing: how many times the same situation re-fired, and when last.
+  occurrence_count?: number;
+  last_seen_at?: string | null;
+  // The Executive's latest review: verdict ('' | relevant | changed |
+  // likely_stale | drafted | routed | merged | resolved | stale — the last
+  // two only on closed rows), the one-line "what changed
+  // since you last looked", the move the card should lead with, a short
+  // "why now", and a deadline when one exists.
+  last_reviewed_at?: string | null;
+  review_verdict?: string;
+  review_note?: string;
+  recommended_move?: string;
+  why_now?: string;
+  due_at?: string | null;
+  // Rows the review folded into this one (merge).
+  superseded_count?: number;
+  // Registry workflow the review suggested as the next step ('' = none).
+  suggested_workflow?: string;
+}
+
+// One autonomous alert-review move since the last delivered morning brief
+// (routed / nudged / escalated / drafted / merged / closed / changed).
+export interface HandledItem {
+  kind: string;
+  summary: string;
+  at: string;
+  alert_id?: number | null;
 }
 
 export interface InFlightItem {
@@ -2581,6 +2610,9 @@ export interface Today {
   // vs "across the team". Null when no caller could be resolved.
   // Optional to keep existing test mocks and older API builds compiling.
   caller_person_id?: number | null;
+  // What the Executive's alert review did on its own since the last morning
+  // brief — the "handled overnight" rail with Undo. Optional/default-empty.
+  handled_overnight?: HandledItem[];
 }
 
 export async function getToday(): Promise<Today> {
@@ -2595,13 +2627,60 @@ export async function getToday(): Promise<Today> {
 export async function ackAlert(
   alertId: number,
   status: "read" | "ack" | "dismissed",
+  opts: { muteTopic?: string | boolean } = {},
 ): Promise<void> {
+  const body: Record<string, unknown> = { status };
+  if (opts.muteTopic) body.mute_topic = opts.muteTopic;
   const res = await fetch(`${API_BASE}/alerts/${alertId}/ack`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ status }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`Failed to ack alert ${alertId}: ${res.statusText}`);
+}
+
+// Groom many alerts at once. The briefing sends explicit ids (it knows which
+// cards the caller owns); `older_than_days` / `category` are for ops use.
+export async function bulkAckAlerts(body: {
+  status: "ack" | "dismissed";
+  alert_ids?: number[];
+  older_than_days?: number;
+  category?: "action" | "monitoring";
+}): Promise<{ count: number }> {
+  const res = await fetch(`${API_BASE}/alerts/bulk-ack`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Failed to bulk-ack alerts: ${res.statusText}`);
+  return res.json();
+}
+
+// Undo for an autonomous close / expiry / dismiss: back to the live queue.
+export async function reopenAlert(alertId: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/alerts/${alertId}/reopen`, { method: "POST" });
+  // 409 = already open (not an Undo target any more); callers treat it as done.
+  if (!res.ok) throw new Error(`Failed to reopen alert ${alertId}: ${res.status} ${res.statusText}`);
+}
+
+export interface AlertReviewSummary {
+  reviewed: number;
+  closed: number;
+  changed: number;
+  routed: number;
+  nudged: number;
+  escalated: number;
+  drafted: number;
+  merged: number;
+  suggested: number;
+  annotated: number;
+}
+
+// Run the Executive's relevance review on demand ("Re-check relevance").
+export async function reviewAlerts(): Promise<AlertReviewSummary> {
+  const res = await fetch(`${API_BASE}/alerts/review`, { method: "POST" });
+  if (!res.ok) throw new Error(`Failed to run alert review: ${res.statusText}`);
+  return res.json();
 }
 
 // Recent self-initiated Executive activity for the briefing rail.

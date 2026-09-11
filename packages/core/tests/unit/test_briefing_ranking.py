@@ -159,3 +159,43 @@ def test_surfaced_reason_aligns_with_categorize() -> None:
     )
     assert ranking.categorize(**args) == "action"
     assert ranking.surfaced_reason(**args) is not None
+
+
+# --------------------------------------------------------------------------- #
+# Review / deadline / trust adjustments
+# --------------------------------------------------------------------------- #
+
+
+def test_score_penalises_likely_stale_and_low_trust_boosts_due_soon() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from openexecutive.briefing.ranking import score, watch_slug_from_tags
+
+    base = score(severity="medium", routed_to_person_id=None)
+    assert score(severity="medium", routed_to_person_id=None, review_verdict="likely_stale") == base - 30
+    now = datetime.now(UTC)
+    soon = (now + timedelta(hours=3)).isoformat()
+    later = (now + timedelta(days=5)).isoformat()
+    assert score(severity="medium", routed_to_person_id=None, due_at=soon, now=now) == base + 20
+    assert score(severity="medium", routed_to_person_id=None, due_at=later, now=now) == base
+    assert score(severity="medium", routed_to_person_id=None, due_at="garbage", now=now) == base
+    assert score(severity="medium", routed_to_person_id=None, trust_score=1.0) == base
+    assert score(severity="medium", routed_to_person_id=None, trust_score=0.0) == base - 10
+    assert score(severity="medium", routed_to_person_id=None, trust_score=0.5) == base - 5
+    assert watch_slug_from_tags(["external:stock", "external:stock-aapl"]) == "stock-aapl"
+    assert watch_slug_from_tags(["external:rss"]) is None
+    assert watch_slug_from_tags(["customer"]) is None
+
+
+def test_score_and_categorize_applies_trust_by_slug() -> None:
+    from openexecutive.briefing.ranking import score_and_categorize
+
+    alert = {
+        "source": "stock", "severity": "high", "routed_to_person_id": None,
+        "topic_tags": ["external:stock", "external:stock-aapl"],
+    }
+    s_full, _, _ = score_and_categorize(alert, trust_by_slug={"stock-aapl": 1.0})
+    s_low, _, _ = score_and_categorize(alert, trust_by_slug={"stock-aapl": 0.2})
+    s_none, _, _ = score_and_categorize(alert)
+    assert s_full == s_none
+    assert s_low == s_full - 8

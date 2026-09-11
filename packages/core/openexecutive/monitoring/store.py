@@ -421,6 +421,41 @@ def mark_fired(
         )
 
 
+# Trust feedback: the principal's dismiss / approve on a watch-sourced alert
+# teaches the watch. Multiplicative decay with a floor so one bad week never
+# silences a watch for good; approvals climb back slowly.
+_TRUST_DECAY = 0.8
+_TRUST_FLOOR = 0.2
+_TRUST_RECOVERY = 0.05
+
+
+def record_dismissal(slug: str, db_path: Path | None = None) -> bool:
+    """A watch-sourced alert was dismissed: bump dismiss_count, decay trust."""
+    resolved = _resolve_db_path(db_path)
+    if not slug or not resolved.exists():
+        return False
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE watchlist SET dismiss_count = dismiss_count + 1, "
+            "trust_score = MAX(?, trust_score * ?) WHERE slug = ?",
+            (_TRUST_FLOOR, _TRUST_DECAY, slug),
+        )
+        return cursor.rowcount > 0
+
+
+def record_confirmation(slug: str, db_path: Path | None = None) -> bool:
+    """A watch-sourced alert was approved / acted on: recover trust a little."""
+    resolved = _resolve_db_path(db_path)
+    if not slug or not resolved.exists():
+        return False
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE watchlist SET trust_score = MIN(1.0, trust_score + ?) WHERE slug = ?",
+            (_TRUST_RECOVERY, slug),
+        )
+        return cursor.rowcount > 0
+
+
 _ALLOWED_UPDATE_COLUMNS: frozenset[str] = frozenset({
     "enabled",
     "mode",
@@ -728,6 +763,8 @@ __all__ = [
     "DB_PATH",
     "delete_watchlist_item",
     "get_watchlist_item",
+    "record_confirmation",
+    "record_dismissal",
     "get_watchlist_item_by_slug",
     "initialize_db",
     "insert_signal",

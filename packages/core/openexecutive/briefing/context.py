@@ -9,7 +9,8 @@ Executive had no record of it and couldn't discuss it.
 This renders the current open alerts into a compact ``<briefing>`` block that the
 chat route injects into the **user turn** (never a cached system block, so prompt
 caching is unaffected). It mirrors how ``/today`` builds proposals
-(`api/routes/today.py`): company-wide, ``status="unread"``.
+(`api/routes/today.py`): company-wide, live ``unread`` rows (inside TTL,
+not snoozed — see ``alerts.lifecycle.list_live_alerts``).
 """
 from __future__ import annotations
 
@@ -44,11 +45,11 @@ def format_open_alerts_for_prompt(db_path: Path | None = None, limit: int = _MAX
     site. Never raises: any failure logs and returns ``""`` so a chat turn is
     never blocked by an alerts-store hiccup.
     """
-    from openexecutive.alerts.store import list_alerts
+    from openexecutive.alerts.lifecycle import list_live_alerts
     from openexecutive.briefing.ranking import score_and_categorize
 
     try:
-        alerts = list_alerts(status="unread", limit=limit, db_path=db_path)
+        alerts = list_live_alerts(limit=limit, db_path=db_path)
     except Exception:
         logger.exception("briefing_context.list_alerts_failed")
         return ""
@@ -66,6 +67,15 @@ def format_open_alerts_for_prompt(db_path: Path | None = None, limit: int = _MAX
             line += f" | suggested: {alert.suggested_action.strip()}"
         if alert.topic_tags:
             line += f" | tags: {', '.join(alert.topic_tags)}"
+        if alert.review_verdict:
+            review = f" | review: {alert.review_verdict}"
+            if alert.review_note:
+                review += f" — {alert.review_note.strip()}"
+            if alert.recommended_move and alert.recommended_move != "none":
+                review += f" | next move: {alert.recommended_move}"
+            line += review
+        if alert.occurrence_count > 1:
+            line += f" | seen x{alert.occurrence_count}"
         lines.append(line)
 
     if not lines:

@@ -48,6 +48,16 @@ class MorningBriefInput(BaseModel):
         default="",
         description="Human-readable period label (e.g. '2026-05-26'). Auto-filled when blank.",
     )
+    force_full: bool = Field(
+        default=False,
+        description=(
+            "Render the full brief even when nothing changed since the last "
+            "delivered one (bypasses the one-line 'nothing new' suppression)."
+        ),
+    )
+
+
+BRIEF_KIND = "principal_brief_morning"
 
 
 # Narrative synthesis (system prompt + context render + LLM call) is shared
@@ -102,6 +112,11 @@ class MorningBriefWorkflow(Workflow):
         )
 
         from openexecutive.api.routes import today as today_route
+        from openexecutive.briefing import brief_state
+
+        # The window is "since the last brief I actually delivered" (24 h on
+        # a cold store), so "what changed" is a real delta, not the latest N.
+        since = brief_state.since_for(BRIEF_KIND)
 
         try:
             today_response = today_route._build_today()
@@ -118,11 +133,23 @@ class MorningBriefWorkflow(Workflow):
             today_data = {"departments": [], "people": [], "proposals": []}
 
         try:
-            activity_response = today_route._build_activity(limit=20)
+            activity_response = today_route._build_activity(20, since=since)
             activity = [item.model_dump() for item in activity_response.items]
         except Exception:
             logger.exception("morning_brief: /today/activity aggregation failed")
             activity = []
+
+        handled = brief_state.handled_since(since)
+        fingerprint = brief_state.build_brief_fingerprint(
+            today_data=today_data, activity=activity, handled=handled, since=since,
+        )
+        previous = brief_state.last_delivered(BRIEF_KIND)
+        suppressed = (
+            brief_state.suppress_unchanged_enabled()
+            and not inputs.force_full
+            and previous is not None
+            and previous.input_hash == fingerprint
+        )
 
         yield WorkflowEvent(
             type="step_done",
@@ -130,9 +157,31 @@ class MorningBriefWorkflow(Workflow):
             summary=(
                 f"depts={len(today_data['departments'])} "
                 f"proposals={len(today_data['proposals'])} "
-                f"activity={len(activity)}"
+                f"activity={len(activity)} handled={len(handled)} "
+                f"since={since.isoformat()[:16]}"
             ),
         )
+        # Structured payload for the scheduler: it records the fingerprint
+        # only after a successful delivery, so "delivered" stays exact.
+        yield WorkflowEvent(
+            type="result",
+            data={
+                "brief_fingerprint": fingerprint,
+                "suppressed": suppressed,
+                "since": since.isoformat(),
+            },
+        )
+
+        if suppressed:
+            artifact_text = brief_state.suppressed_line(len(today_data["proposals"]))
+            yield WorkflowEvent(
+                type="step_done",
+                step_id="synthesize",
+                summary="unchanged since last brief — one-liner, no model call",
+            )
+            yield WorkflowEvent(type="artifact", content=artifact_text)
+            yield WorkflowEvent(type="done")
+            return
 
         # ------------------------------------------------------------------ #
         # Step 2: synthesize
@@ -150,7 +199,7 @@ class MorningBriefWorkflow(Workflow):
             # not the /today header synthesis.
             artifact_text = await synthesize_briefing_narrative(
                 today_data=today_data, activity=activity, period_label=period,
-                standalone=True,
+                standalone=True, since=since, handled=handled,
             )
         except Exception as exc:
             logger.exception("morning_brief: synthesis failed")
@@ -185,4 +234,4 @@ class MorningBriefWorkflow(Workflow):
 # / form) and from the scheduler. The scheduler invocation path lives in
 # `openexecutive.scheduler.runner._execute_action` (see the
 # `principal_brief_morning` branch).
-__all__ = ["MorningBriefWorkflow", "MorningBriefInput"]
+__all__ = ["BRIEF_KIND", "MorningBriefWorkflow", "MorningBriefInput"]

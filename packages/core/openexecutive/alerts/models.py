@@ -46,6 +46,13 @@ class AlertEvent(BaseModel):
     channel: str | None = None
     user: str | None = None
     title: str | None = None  # for documents
+    # Producer-supplied dedup key that overrides the triage model's own
+    # (monitoring sets ``watch:<slug>`` so one watch = one open alert).
+    dedup_hint: str = ""
+    # Person the alert should be routed to (assigned_to_person_id from the
+    # Executive's create_alert tool). Lands on the row so the "principal
+    # owns unrouted" rule stops sweeping every triage-born alert to them.
+    routed_to_person_id: int | None = None
 
 
 class TriageDecision(BaseModel):
@@ -86,7 +93,11 @@ class Alert(BaseModel):
     channels_attempted: list[str] = Field(default_factory=list)
     channels_delivered: list[str] = Field(default_factory=list)
     dedup_key: str = ""
-    status: str = "unread"  # unread | read | ack | dismissed
+    # unread | read | ack | dismissed | resolved | expired. `ack` means the
+    # user approved (the Executive executes the suggested action);
+    # `resolved` means the Executive's review closed it with evidence;
+    # `expired` means the lifecycle sweep aged it out (alerts/lifecycle.py).
+    status: str = "unread"
     created_at: str
     # Phase 4: person the alert is routed to for approval. NULL means the
     # alert is general (not routed to a specific approver).
@@ -95,6 +106,28 @@ class Alert(BaseModel):
     # timestamp means the artifact was archived (hidden from the default list
     # but restorable). Only meaningful for source='artifact' rows.
     archived_at: str | None = None
+    # Lifecycle (alerts/lifecycle.py + alerts/review.py). All additive with
+    # defaults so rows written by older builds read back unchanged.
+    # Coalescing: a repeat of an open alert bumps these instead of stacking.
+    last_seen_at: str | None = None
+    occurrence_count: int = 1
+    # Executive review verdict: '' | relevant | changed | likely_stale |
+    # drafted | routed | merged, plus resolved | stale on rows the review
+    # closed; `review_note` is the one-line "what changed since
+    # you last looked"; `recommended_move` the next move the card leads with;
+    # `why_now` a short urgency note; `due_at` an ISO deadline when one exists.
+    last_reviewed_at: str | None = None
+    review_verdict: str = ""
+    review_note: str = ""
+    recommended_move: str = ""
+    why_now: str = ""
+    due_at: str | None = None
+    # Set on a row folded into another (merge): the surviving alert's id.
+    superseded_by_alert_id: int | None = None
+    # Hidden from the live queue until this ISO timestamp (snooze).
+    snoozed_until: str | None = None
+    # Registry workflow the review suggested as the next step ('' = none).
+    suggested_workflow: str = ""
 
 
 class UserPreferences(BaseModel):

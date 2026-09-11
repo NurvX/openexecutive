@@ -75,6 +75,7 @@ async def handle_create_alert(tool_input: dict[str, Any]) -> str:
             event.channel = f"department:{dept}"
         if person_id_raw is not None:
             with contextlib.suppress(TypeError, ValueError):
+                event.routed_to_person_id = int(person_id_raw)
                 event.user = f"person:{int(person_id_raw)}"
         schedule_evaluation(event)
         logger.info("create_alert: scheduled subject=%r", tool_input["subject"])
