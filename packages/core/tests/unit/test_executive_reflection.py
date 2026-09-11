@@ -419,3 +419,26 @@ def test_action_chips_registry_drift_still_passes() -> None:
     assert not unclassified, (
         f"Shift 5 changes left tools unclassified: {sorted(unclassified)}"
     )
+
+
+def test_previous_reflection_artifact_reads_last_done_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.workflows import persistence as wf_persistence
+    from openexecutive.workflows.executive_reflection import _previous_reflection_artifact
+
+    db = tmp_path / "runs.db"
+    monkeypatch.setattr(wf_persistence, "DB_PATH", db)
+    wf_persistence.initialize_runs_db(db)
+    assert _previous_reflection_artifact() is None
+
+    wf_persistence.create_run("r1", "executive_reflection", "Reflection day 1", {})
+    wf_persistence.complete_run("r1", "**Acted on:** DM'd Dana")
+    wf_persistence.create_run("r2", "morning_brief", "Brief", {})
+    wf_persistence.complete_run("r2", "BRIEF TEXT")
+    wf_persistence.create_run("r3", "executive_reflection", "Reflection running", {})
+    assert _previous_reflection_artifact() == "**Acted on:** DM'd Dana"
+
+    wf_persistence.create_run("r4", "executive_reflection", "Reflection empty", {})
+    wf_persistence.complete_run("r4", "(no artifact)")
+    assert _previous_reflection_artifact() is None

@@ -983,6 +983,24 @@ def scope_key_in_use(scope_key: str, db_path: Path | None = None) -> bool:
     return row is not None
 
 
+def count_nudges_for_scope(scope_key: str, db_path: Path | None = None) -> int:
+    """Delivered (``done``) nudges ever emitted for ``scope_key``.
+
+    Backs the per-scope cap in the nudge engine so the same stalled item is
+    not chased forever; ``cancelled`` / ``failed`` rows never count.
+    """
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return 0
+    with _get_conn(resolved) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM scheduled_actions "
+            "WHERE scope_key = ? AND status = 'done' AND kind = 'proactive_nudge'",
+            (scope_key,),
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
 def recent_nudge_for_scope(
     scope_key: str,
     since: datetime,
@@ -1338,7 +1356,7 @@ def list_scheduled_actions(
 # commitments — excluded from the briefing's "In flight" list (and mirrored by
 # the activity feed's own filter in api/routes/today.py:_build_activity).
 _INTERNAL_ACTION_CHANNEL = "__internal__"
-_INTERNAL_ACTION_KINDS = frozenset({"nudge_scan"})
+_INTERNAL_ACTION_KINDS = frozenset({"nudge_scan", "alert_review_scan"})
 
 
 def list_pending_scheduled_actions(

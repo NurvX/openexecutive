@@ -262,13 +262,13 @@ async def test_scan_runs_when_stale_despite_unchanged_state(
     await research_scheduler.run_watchlist_research_scan(db_path=db, store=MagicMock())
     assert calls["n"] == 1
 
-    # A tick just after still skips (well within the default 24h floor).
+    # A tick just after still skips (well within the default 168h floor).
     await research_scheduler.run_watchlist_research_scan(db_path=db, store=MagicMock())
     assert calls["n"] == 1
 
     # A tick past the floor runs again, even though profile / initiatives /
     # watchlist are unchanged.
-    future = datetime.now(UTC) + timedelta(hours=25)
+    future = datetime.now(UTC) + timedelta(hours=169)
     await research_scheduler.run_watchlist_research_scan(
         db_path=db, store=MagicMock(), now=future,
     )

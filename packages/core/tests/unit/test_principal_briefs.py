@@ -184,3 +184,77 @@ def test_has_pending_brief_detects_existing(
     runner.seed_principal_briefs()
     assert runner._has_pending_brief("principal_brief_morning") is True
     assert runner._has_pending_brief("principal_brief_eod") is True
+
+
+# ---------------------------------------------------------------------------
+# Delivered-brief state: the runner records the fingerprint only on delivery
+# ---------------------------------------------------------------------------
+
+
+def _fake_brief_workflow(fingerprint: str, artifact: str = "BRIEF"):
+    from openexecutive.workflows.base import WorkflowEvent
+    from openexecutive.workflows.morning_brief import MorningBriefInput, MorningBriefWorkflow
+
+    class _Fake(MorningBriefWorkflow):
+        async def run(self, inputs, store):  # type: ignore[override]
+            yield WorkflowEvent(type="result", data={"brief_fingerprint": fingerprint, "suppressed": False})
+            yield WorkflowEvent(type="artifact", content=artifact)
+            yield WorkflowEvent(type="done")
+
+        def input_model(self):  # type: ignore[override]
+            return MorningBriefInput
+
+    return _Fake()
+
+
+def _run_brief(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, deliver_ok: bool) -> None:
+    import asyncio
+
+    from openexecutive.briefing import narrative_cache
+    from openexecutive.workflows import persistence as wf_persistence
+
+    db = tmp_path / "brief.db"
+    _setup_isolated_db(db, monkeypatch)
+    monkeypatch.setattr(narrative_cache, "DB_PATH", tmp_path / "cache.db")
+    monkeypatch.setattr(wf_persistence, "DB_PATH", db)
+    monkeypatch.setitem(WORKFLOW_REGISTRY, "morning_brief", _fake_brief_workflow("fp-123"))
+
+    async def _deliver(text: str) -> tuple[bool, str]:
+        return deliver_ok, "discord_dm → 1"
+
+    monkeypatch.setattr(runner, "_deliver_to_principal", _deliver)
+    monkeypatch.setattr(runner, "_enqueue_next_principal_brief", lambda kind, after: None)
+
+    class _Store:
+        def __init__(self, **kw): ...
+
+    import openexecutive.knowledge.store as kstore
+
+    monkeypatch.setattr(kstore, "ChromaDBStore", _Store)
+
+    action_id = episodic.insert_scheduled_action(
+        run_at=datetime.now(UTC).isoformat(), channel="__internal__", channel_ref="principal",
+        intent_text="brief", kind="principal_brief_morning",
+    )
+    action = episodic.get_scheduled_action(action_id)
+    assert action is not None
+    asyncio.run(runner._run_principal_brief(action, datetime.now(UTC)))
+
+
+def test_run_principal_brief_records_fingerprint_after_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.briefing import brief_state
+
+    _run_brief(tmp_path, monkeypatch, deliver_ok=True)
+    last = brief_state.last_delivered("principal_brief_morning")
+    assert last is not None and last.input_hash == "fp-123" and last.narrative_text == "BRIEF"
+
+
+def test_run_principal_brief_does_not_record_on_delivery_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.briefing import brief_state
+
+    _run_brief(tmp_path, monkeypatch, deliver_ok=False)
+    assert brief_state.last_delivered("principal_brief_morning") is None

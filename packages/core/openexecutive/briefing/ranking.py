@@ -17,7 +17,10 @@ call per alert inside ``_build_today``.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+from openexecutive.alerts.lifecycle import parse_aware
 
 # Severity → base weight. Mirrors AlertSeverity ("low"/"medium"/"high"/
 # "urgent"); unknown strings fall back to the medium band so a new
@@ -127,19 +130,62 @@ def surfaced_reason(
     return _SURFACED_BY_SEVERITY.get(severity)
 
 
+# Review-driven adjustments (alerts/review.py). An item the Executive judged
+# "likely stale" sinks below live work but is never hidden; an item with a
+# deadline inside a day floats up; a watch the principal keeps dismissing
+# (low trust_score) is discounted so it stops crowding out signal.
+_LIKELY_STALE_PENALTY = 30
+_DUE_SOON_BONUS = 20
+_DUE_SOON_WINDOW = timedelta(hours=24)
+_LOW_TRUST_MAX_PENALTY = 10
+
+
 def score(
     *,
     severity: str,
     routed_to_person_id: int | None,
+    review_verdict: str = "",
+    due_at: str | None = None,
+    trust_score: float | None = None,
+    now: datetime | None = None,
 ) -> int:
     """Attention sort key for the ``action`` queue (higher leads)."""
     base = _SEVERITY_WEIGHT.get(severity, _DEFAULT_SEVERITY_WEIGHT)
     if routed_to_person_id is not None:
         base += _ROUTED_BONUS
+    if review_verdict == "likely_stale":
+        base -= _LIKELY_STALE_PENALTY
+    if due_at:
+        due = parse_aware(due_at)
+        if due is not None and due - (now or datetime.now(UTC)) <= _DUE_SOON_WINDOW:
+            base += _DUE_SOON_BONUS
+    if trust_score is not None:
+        clamped = min(1.0, max(0.0, float(trust_score)))
+        base -= int(round(_LOW_TRUST_MAX_PENALTY * (1.0 - clamped)))
     return base
 
 
-def score_and_categorize(alert: Any) -> tuple[int, str, str | None]:
+def watch_slug_from_tags(topic_tags: list[str]) -> str | None:
+    """The watchlist slug carried by an ``external:<slug>`` tag, if any.
+
+    Skips the adapter-kind tag (``external:stock``) so ``external:stock-aapl``
+    resolves to ``stock-aapl``.
+    """
+    for tag in topic_tags:
+        if not tag.startswith("external:"):
+            continue
+        slug = tag[len("external:"):]
+        if slug and slug not in _EXTERNAL_SOURCES:
+            return slug
+    return None
+
+
+def score_and_categorize(
+    alert: Any,
+    *,
+    trust_by_slug: dict[str, float] | None = None,
+    now: datetime | None = None,
+) -> tuple[int, str, str | None]:
     """Convenience wrapper over an ``Alert``-shaped object.
 
     Reads ``source``, ``severity``, ``routed_to_person_id`` and
@@ -158,8 +204,21 @@ def score_and_categorize(alert: Any) -> tuple[int, str, str | None]:
     routed = _get("routed_to_person_id", None)
     topic_tags = list(_get("topic_tags", []) or [])
 
+    trust: float | None = None
+    if trust_by_slug:
+        slug = watch_slug_from_tags(topic_tags)
+        if slug is not None:
+            trust = trust_by_slug.get(slug)
+
     return (
-        score(severity=severity, routed_to_person_id=routed),
+        score(
+            severity=severity,
+            routed_to_person_id=routed,
+            review_verdict=str(_get("review_verdict", "") or ""),
+            due_at=_get("due_at", None),
+            trust_score=trust,
+            now=now,
+        ),
         categorize(
             source=source,
             severity=severity,
@@ -175,4 +234,10 @@ def score_and_categorize(alert: Any) -> tuple[int, str, str | None]:
     )
 
 
-__all__ = ["categorize", "score", "score_and_categorize", "surfaced_reason"]
+__all__ = [
+    "categorize",
+    "score",
+    "score_and_categorize",
+    "surfaced_reason",
+    "watch_slug_from_tags",
+]

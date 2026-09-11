@@ -8,10 +8,14 @@ import remarkGfm from "remark-gfm";
 import {
   ackAlert,
   approveDecision,
+  bulkAckAlerts,
   getToday,
   rejectDecision,
+  reopenAlert,
+  reviewAlerts,
   type CandidateStage,
   type DepartmentBriefItem,
+  type HandledItem,
   type InFlightItem,
   type OnboardingBriefItem,
   type PersonBriefItem,
@@ -48,6 +52,50 @@ const NARRATIVE_HEAD_BULLETS = 2;
 // A proposal body longer than this (chars) is clamped to a few lines at rest
 // with a Show more/less toggle, so the "Needs you" queue stays scannable.
 const LONG_BODY_CHARS = 180;
+
+// "Needs you" shows this many cards after "Start here" before a Show-more
+// toggle takes over — a queue, not a wall.
+const NEEDS_YOU_VISIBLE = 8;
+// Bulk-dismiss cutoffs (days) offered under each lane.
+const NEEDS_YOU_DISMISS_OLDER_THAN_DAYS = 7;
+const MONITORING_DISMISS_OLDER_THAN_DAYS = 3;
+
+// Compact age label ("3h", "9d") for a card chip; "" for an unparseable stamp.
+function ageLabel(iso: string | null | undefined, now: Date = new Date()): string {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "";
+  const mins = Math.max(0, Math.round((now.getTime() - t) / 60000));
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+// Whole days between now and an ISO stamp: 0 = due within the day, negative =
+// past (floor, so an 11-hour-old deadline is -1 → "overdue", never "due today").
+// null if unparseable.
+function daysUntil(iso: string | null | undefined, now: Date = new Date()): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return Math.floor((t - now.getTime()) / 86400000);
+}
+
+// Ids of proposals older than `days` — what the bulk "Dismiss older than"
+// footer sends: explicit ids from the caller's own lane (visible cards and
+// those behind "Show more" alike), never a server-side age sweep, which would
+// also hit teammates' routed items.
+function olderThan(proposals: ProposalItem[], days: number, now: Date = new Date()): number[] {
+  const cutoff = now.getTime() - days * 86400000;
+  return proposals
+    .filter((p) => {
+      // Same age anchor as the server's TTL: a re-firing situation is not old.
+      const t = Date.parse(p.last_seen_at ?? p.created_at);
+      return !Number.isNaN(t) && t < cutoff;
+    })
+    .map((p) => p.alert_id);
+}
 
 interface BriefingProps {
   // Called when the user clicks a briefing item to continue the thread
@@ -387,6 +435,7 @@ const STAT_TONES: Record<StatTone, string> = {
 // ids and the `id={…}` attributes on the sections stay in sync.
 const SECTION_IDS = {
   needsYou: "sec-needs-you",
+  handled: "sec-handled",
   inFlight: "sec-in-flight",
   monitoring: "sec-monitoring",
   departments: "sec-departments",
@@ -415,6 +464,7 @@ function scrollToFirstVisible(ids: string[]): void {
 // dropped; an empty result renders an "All clear" pill at the call site.
 function briefingStats(args: {
   needsYou: number;
+  handledOvernight: number;
   peopleOverdue: number;
   peopleNeedReply: number;
   deptAtRisk: number;
@@ -426,6 +476,10 @@ function briefingStats(args: {
   const peopleTargets = [SECTION_IDS.people];
   if (args.needsYou > 0)
     pills.push({ label: `${args.needsYou} need${args.needsYou === 1 ? "s" : ""} you`, tone: "indigo", targetIds: [SECTION_IDS.needsYou] });
+  // What the Executive already did on its own — shown right after the ask,
+  // so the first read is "N need you, it handled M" (trust + relief).
+  if (args.handledOvernight > 0)
+    pills.push({ label: `Executive handled ${args.handledOvernight} overnight`, tone: "sky", targetIds: [SECTION_IDS.handled] });
   if (args.peopleOverdue > 0)
     pills.push({ label: `${args.peopleOverdue} overdue`, tone: "rose", targetIds: peopleTargets });
   if (args.peopleNeedReply > 0)
@@ -445,6 +499,118 @@ function briefingStats(args: {
   if (args.monitoring > 0)
     pills.push({ label: `${args.monitoring} monitoring`, tone: "slate", targetIds: [SECTION_IDS.monitoring] });
   return pills;
+}
+
+// Lifecycle presentation for one proposal card — the review-driven pieces the
+// card composes: the one-line "what changed since you last looked", the chip
+// row (age, seen ×N, why-now / due, likely-stale, folded-in, draft-ready), the
+// muted "Reviewed <ago>" footer, and the single recommended move as a control.
+// A pure builder (no hooks) so ProposalCard stays a layout function.
+function buildProposalLifecycle({
+  proposal,
+  assignee,
+  onContinue,
+  busy,
+}: {
+  proposal: ProposalItem;
+  assignee: PersonBriefItem | null | undefined;
+  onContinue?: (p: string) => void;
+  busy: boolean;
+}): {
+  reviewLine: React.ReactNode;
+  lifecycleRow: React.ReactNode;
+  reviewedFooter: React.ReactNode;
+  moveButton: React.ReactNode;
+} {
+// Lifecycle signals from the Executive's review (alerts/review.py) and the
+// coalescing pipeline: the one-line "what changed since you last looked",
+// then chips — age, seen ×N, why-now / deadline, likely-stale, folded-in,
+// updated — and a muted "Reviewed <ago>" footer.
+const verdict = proposal.review_verdict ?? "";
+const isLikelyStale = verdict === "likely_stale";
+const age = ageLabel(proposal.created_at);
+const dueIn = daysUntil(proposal.due_at);
+const reviewLine = proposal.review_note ? (
+  <p className={`mb-1.5 text-xs leading-snug ${isLikelyStale ? "text-amber-300" : "text-fg-muted"}`}>
+    <span className="text-[10px] uppercase tracking-wide mr-1">
+      {isLikelyStale ? "Likely stale" : verdict === "changed" ? "Updated" : "Since you last looked"}
+    </span>
+    {proposal.review_note}
+  </p>
+) : null;
+const lifecycleChips: { label: string; cls: string; title?: string }[] = [];
+if (age) lifecycleChips.push({ label: age, cls: "text-fg-subtle border-line", title: `Raised ${new Date(proposal.created_at).toLocaleString()}` });
+if ((proposal.occurrence_count ?? 1) > 1)
+  lifecycleChips.push({
+    label: `seen ×${proposal.occurrence_count}`,
+    cls: "text-fg-muted border-line",
+    title: proposal.last_seen_at ? `Last seen ${ageLabel(proposal.last_seen_at)} ago` : undefined,
+  });
+if (proposal.why_now || dueIn != null) {
+  const due = dueIn == null ? "" : dueIn < 0 ? "overdue" : dueIn === 0 ? "due today" : `due in ${dueIn}d`;
+  lifecycleChips.push({
+    label: [proposal.why_now, due].filter(Boolean).join(" · "),
+    cls: "bg-amber-500/15 text-amber-300 border-amber-500/30",
+  });
+}
+if (isLikelyStale && !proposal.review_note)
+  lifecycleChips.push({ label: "Likely stale", cls: "bg-amber-500/15 text-amber-300 border-amber-500/30" });
+if ((proposal.superseded_count ?? 0) > 0)
+  lifecycleChips.push({ label: `${proposal.superseded_count} folded in`, cls: "text-fg-muted border-line" });
+if (verdict === "changed" && !proposal.review_note)
+  lifecycleChips.push({ label: "Updated by the Executive", cls: "text-sky-300 border-sky-500/30" });
+if (verdict === "drafted")
+  lifecycleChips.push({ label: "Draft ready in your queue", cls: "bg-amber-500/15 text-amber-300 border-amber-500/30" });
+const lifecycleRow = lifecycleChips.length > 0 ? (
+  <div className="mb-1.5 flex flex-wrap gap-1">
+    {lifecycleChips.map((c) => (
+      <span key={c.label} title={c.title} className={`inline-block px-1.5 py-0.5 rounded border text-[10px] ${c.cls}`}>
+        {c.label}
+      </span>
+    ))}
+  </div>
+) : null;
+const reviewedFooter = proposal.last_reviewed_at ? (
+  <p className="mt-1 text-[10px] text-fg-subtle">
+    Reviewed {ageLabel(proposal.last_reviewed_at)} ago
+    {verdict && verdict !== "likely_stale" ? ` · ${verdict}` : ""}
+  </p>
+) : null;
+// The single recommended move, as the primary control on the card. Route /
+// escalate / draft already happened server-side (the card shows their
+// trace); nudge and a suggested workflow are the two the user completes.
+const moveButton = (() => {
+  const move = proposal.recommended_move ?? "";
+  if (move === "nudge" && onContinue) {
+    const who = assignee?.full_name ?? "the owner";
+    return (
+      <button
+        type="button"
+        onClick={() => onContinue(
+          `Nudge ${who} about this item — it has gone quiet: ${proposal.headline}\n\n` +
+          `Send a short, friendly check-in via message_person and tell me what you sent.`,
+        )}
+        disabled={busy}
+        className="text-xs font-medium text-indigo-300 hover:text-indigo-200 px-2 py-1 rounded border border-indigo-500/30 transition-colors disabled:opacity-50"
+      >
+        ↪ Nudge {assignee?.full_name?.split(" ")[0] ?? "owner"}
+      </button>
+    );
+  }
+  if (move === "suggest_workflow" && proposal.suggested_workflow) {
+    return (
+      <Link
+        href={`/jobs/${proposal.suggested_workflow}`}
+        onClick={(e) => e.stopPropagation()}
+        className="text-xs font-medium text-indigo-300 hover:text-indigo-200 px-2 py-1 rounded border border-indigo-500/30 transition-colors"
+      >
+        ▶ Run {proposal.suggested_workflow.replace(/_/g, " ")}
+      </Link>
+    );
+  }
+  return null;
+})();
+  return { reviewLine, lifecycleRow, reviewedFooter, moveButton };
 }
 
 function ProposalCard({
@@ -621,8 +787,14 @@ function ProposalCard({
   // document layout + amber badge), not a user-meaningful topic — hide it
   // from the tag pills so it doesn't double up with the "Artifact" badge.
   const visibleTags = proposal.topic_tags.filter((t) => t !== "artifact");
+  const { reviewLine, lifecycleRow, reviewedFooter, moveButton } = buildProposalLifecycle({
+    proposal, assignee, onContinue, busy,
+  });
+  const isLikelyStale = (proposal.review_verdict ?? "") === "likely_stale";
   const meta = (
     <>
+      {reviewLine}
+      {lifecycleRow}
       {suggestedActionBlock}
       {surfacedNote}
       {visibleTags.length > 0 && (
@@ -646,6 +818,7 @@ function ProposalCard({
           })}
         </div>
       )}
+      {reviewedFooter}
     </>
   );
   // Card splits into a content area and an action row living as siblings
@@ -806,6 +979,7 @@ function ProposalCard({
               explicit so the affordance is discoverable. Hidden on the
               standalone /today route (no onContinue). */}
           <div className="flex items-center gap-2">
+            {moveButton}
             {onContinue && (
               <button
                 type="button"
@@ -840,7 +1014,11 @@ function ProposalCard({
                     type="button"
                     onClick={() => onDismiss(proposal)}
                     disabled={busy}
-                    className="text-xs text-fg-muted hover:text-rose-300 px-2 py-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    className={`text-xs px-2 py-1 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                      isLikelyStale
+                        ? "font-medium text-amber-300 hover:text-amber-200 border border-amber-500/30"
+                        : "text-fg-muted hover:text-rose-300"
+                    }`}
                   >
                     ✕ Dismiss
                   </button>
@@ -1259,13 +1437,16 @@ function MonitoringPanel({
   proposals,
   onContinue,
   onDismiss,
+  onBulkDismiss,
   id,
 }: {
   proposals: ProposalItem[];
   onContinue?: (p: string) => void;
   onDismiss?: (p: ProposalItem) => void;
+  onBulkDismiss?: (ids: number[]) => void;
   id?: string;
 }) {
+  const staleIds = olderThan(proposals, MONITORING_DISMISS_OLDER_THAN_DAYS);
   if (proposals.length === 0) return null;
   return (
     <section id={id} className="rounded-xl border border-line bg-surface-elevated p-4">
@@ -1281,6 +1462,87 @@ function MonitoringPanel({
         {proposals.map((p) => (
           <MonitoringRow key={p.alert_id} proposal={p} onContinue={onContinue} onDismiss={onDismiss} />
         ))}
+      </div>
+      {onBulkDismiss && staleIds.length > 0 && (
+        <button
+          type="button"
+          onClick={() => onBulkDismiss(staleIds)}
+          className="mt-2 text-[11px] text-fg-muted hover:text-rose-300 transition-colors"
+        >
+          ✕ Dismiss {staleIds.length} older than {MONITORING_DISMISS_OLDER_THAN_DAYS} days
+        </button>
+      )}
+    </section>
+  );
+}
+
+// Handled overnight — what the Executive's alert review did on its own since
+// the last morning brief (routed, nudged, escalated, drafted, merged, closed,
+// updated). Every autonomous close is reversible here (Undo → reopen), which
+// is what makes the autonomy un-scary: visible, evidence-cited, one click back.
+const HANDLED_KIND_LABEL: Record<string, string> = {
+  closed: "Closed",
+  routed: "Routed",
+  nudged: "Nudged",
+  escalated: "Escalated",
+  drafted: "Drafted",
+  merged: "Merged",
+  suggested_workflow: "Suggested",
+  changed: "Updated",
+};
+
+// Stable key for one handled row (an alert can appear twice in one pass —
+// e.g. updated then closed — so the alert id alone is not unique).
+function handledKey(h: HandledItem): string {
+  return `${h.kind}-${h.at}-${h.alert_id ?? ""}`;
+}
+
+function HandledOvernightPanel({
+  items,
+  onReopen,
+  undone,
+}: {
+  items: HandledItem[];
+  onReopen?: (rowKey: string, alertId: number) => void;
+  undone: Set<string>;
+}) {
+  if (items.length === 0) return null;
+  return (
+    <section id={SECTION_IDS.handled} className="rounded-xl border border-line bg-surface-elevated p-4">
+      <div className="flex items-center gap-1.5 mb-1">
+        <SectionHeading title="Handled overnight" count={items.length} icon="check" />
+        <InfoTip align="left">
+          Moves the Executive made on its own while reviewing open alerts —
+          each one audited with its evidence. Undo brings an item back to
+          your queue.
+        </InfoTip>
+      </div>
+      <div className="max-h-[24rem] overflow-y-auto pr-1 divide-y divide-line">
+        {items.map((h) => {
+          const rowKey = handledKey(h);
+          const canUndo = onReopen && h.alert_id != null && (h.kind === "closed" || h.kind === "merged");
+          const isUndone = undone.has(rowKey);
+          return (
+            <div key={rowKey} className="py-2 flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <span className="mr-1.5 inline-block px-1.5 py-0.5 rounded border text-[10px] text-sky-300 border-sky-500/30">
+                  {HANDLED_KIND_LABEL[h.kind] ?? h.kind}
+                </span>
+                <span className={`text-xs ${isUndone ? "line-through text-fg-subtle" : "text-fg-muted"}`}>{h.summary}</span>
+                <span className="ml-1.5 text-[10px] text-fg-subtle">{ageLabel(h.at)} ago</span>
+              </div>
+              {canUndo && !isUndone && (
+                <button
+                  type="button"
+                  onClick={() => onReopen(rowKey, h.alert_id as number)}
+                  className="flex-shrink-0 text-[11px] text-fg-muted hover:text-indigo-300 transition-colors"
+                >
+                  ↶ Undo
+                </button>
+              )}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
@@ -1298,6 +1560,13 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
   // the click feels instant; the canonical state will be picked up by
   // the next /today fetch.
   const [actedAlertIds, setActedAlertIds] = useState<Set<number>>(new Set());
+  // "Needs you" shows NEEDS_YOU_VISIBLE cards after "Start here"; the rest
+  // sit behind one toggle so a long queue reads as a queue, not a wall.
+  const [showAllNeedsYou, setShowAllNeedsYou] = useState(false);
+  // "Re-check relevance" runs the Executive's review on demand.
+  const [recheckBusy, setRecheckBusy] = useState(false);
+  // Handled-rail rows undone this session (keyed per row, see handledKey).
+  const [undoneRows, setUndoneRows] = useState<Set<string>>(new Set());
 
   // Re-pull /today after a server-side mutation (e.g. a decision approve/reject)
   // so derived data — the narrative header, per-person and department counts —
@@ -1373,6 +1642,59 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
       console.error("Dismiss failed", e);
     }
   }, [actedAlertIds, refreshToday]);
+
+  // Bulk dismiss: the footer under a lane sends explicit ids (the cards the
+  // caller can see), never a server-side age sweep. Same optimistic-removal
+  // + rollback pattern as the single-card handlers.
+  const handleBulkDismiss = useCallback(async (ids: number[]) => {
+    if (ids.length === 0) return;
+    const prev = actedAlertIds;
+    const next = new Set(prev);
+    ids.forEach((id) => next.add(id));
+    setActedAlertIds(next);
+    try {
+      await bulkAckAlerts({ status: "dismissed", alert_ids: ids });
+      refreshToday();
+    } catch (e) {
+      setActedAlertIds(prev);
+      // eslint-disable-next-line no-console
+      console.error("Bulk dismiss failed", e);
+    }
+  }, [actedAlertIds, refreshToday]);
+
+  // Re-check relevance: ask the Executive to review every open alert now
+  // (route / escalate / draft / merge / resolve within authority), then
+  // re-pull /today so the verdicts, chips and "handled" rail refresh.
+  const handleRecheck = useCallback(async () => {
+    setRecheckBusy(true);
+    try {
+      await reviewAlerts();
+      refreshToday();
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("Alert review failed", e);
+    } finally {
+      setRecheckBusy(false);
+    }
+  }, [refreshToday]);
+
+  // Undo an autonomous close from the "Handled overnight" rail. The rail is
+  // rebuilt from the audit log on every fetch (the "closed" row persists after
+  // a reopen), so a 409 "already open" after a reload counts as done.
+  const handleReopen = useCallback(async (rowKey: string, alertId: number) => {
+    try {
+      await reopenAlert(alertId);
+      setUndoneRows((prev) => new Set(prev).add(rowKey));
+      refreshToday();
+    } catch (e) {
+      if (e instanceof Error && /409|already/i.test(e.message)) {
+        setUndoneRows((prev) => new Set(prev).add(rowKey));
+        return;
+      }
+      // eslint-disable-next-line no-console
+      console.error("Reopen failed", e);
+    }
+  }, [refreshToday]);
 
   // Approve-with-edits: user has tweaked the draft text and wants OE to
   // send exactly what they wrote (no LLM rephrasing). Same optimistic-
@@ -1477,6 +1799,8 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
   // so mineProposals[0] is the sharpest.
   const startHereProposal = mineProposals[0] ?? null;
   const restProposals = mineProposals.slice(1);
+  const staleNeedsYouIds = olderThan(mineProposals, NEEDS_YOU_DISMISS_OLDER_THAN_DAYS);
+  const handledOvernight = today?.handled_overnight ?? [];
 
   // Status-strip inputs, all from data already computed above.
   const inFlightCount = today?.in_flight?.length ?? 0;
@@ -1498,6 +1822,7 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
   const statPills: StatPill[] = today
     ? briefingStats({
         needsYou: mineProposals.length,
+        handledOvernight: handledOvernight.length,
         peopleOverdue,
         peopleNeedReply,
         deptAtRisk: deptAtRiskCount,
@@ -1702,7 +2027,7 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
                               emphasized
                             />
                           </div>
-                          {restProposals.map((p) => (
+                          {(showAllNeedsYou ? restProposals : restProposals.slice(0, NEEDS_YOU_VISIBLE)).map((p) => (
                             <ProposalCard
                               key={p.alert_id}
                               proposal={p}
@@ -1713,10 +2038,44 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
                               onApproveWithEdits={handleApproveWithEdits}
                             />
                           ))}
+                          {restProposals.length > NEEDS_YOU_VISIBLE && (
+                            <button
+                              type="button"
+                              onClick={() => setShowAllNeedsYou((v) => !v)}
+                              className="w-full py-2 text-[11px] text-fg-muted hover:text-fg transition-colors"
+                            >
+                              {showAllNeedsYou
+                                ? "Show fewer"
+                                : `Show ${restProposals.length - NEEDS_YOU_VISIBLE} more`}
+                            </button>
+                          )}
                         </div>
                       ) : !isQuiet ? (
                         <p className="text-sm text-fg-muted py-3">Nothing waiting on you.</p>
                       ) : null}
+                      {/* Relief valves: clear the old tail in one click, or ask
+                          the Executive to re-judge everything right now. */}
+                      {(staleNeedsYouIds.length > 0 || mineProposals.length > 0) && (
+                        <div className="mt-2 flex flex-wrap items-center gap-3">
+                          {staleNeedsYouIds.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => handleBulkDismiss(staleNeedsYouIds)}
+                              className="text-[11px] text-fg-muted hover:text-rose-300 transition-colors"
+                            >
+                              ✕ Dismiss {staleNeedsYouIds.length} older than {NEEDS_YOU_DISMISS_OLDER_THAN_DAYS} days
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={handleRecheck}
+                            disabled={recheckBusy}
+                            className="text-[11px] text-fg-muted hover:text-indigo-300 transition-colors disabled:opacity-50"
+                          >
+                            {recheckBusy ? "⟳ Re-checking…" : "⟳ Re-check relevance"}
+                          </button>
+                        </div>
+                      )}
                     </details>
                   </section>
 
@@ -1858,10 +2217,16 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
                     clients={today.practice_clients ?? []}
                     id={SECTION_IDS.practice}
                   />
+                  <HandledOvernightPanel
+                    items={handledOvernight}
+                    onReopen={handleReopen}
+                    undone={undoneRows}
+                  />
                   <MonitoringPanel
                     proposals={monitoringProposals}
                     onContinue={onContinue}
                     onDismiss={handleDismiss}
+                    onBulkDismiss={handleBulkDismiss}
                     id={SECTION_IDS.monitoring}
                   />
                 </div>

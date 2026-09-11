@@ -78,3 +78,11 @@ def test_standalone_dm_prompt_enumerates_actionables() -> None:
     assert "What changed" in STANDALONE_BRIEF_SYSTEM
     # ...and must NOT assume a card list renders below it.
     assert "cards BELOW" not in STANDALONE_BRIEF_SYSTEM
+
+
+def test_standalone_dm_prompt_carries_older_items_as_one_line() -> None:
+    lowered = STANDALONE_BRIEF_SYSTEM.lower()
+    assert "never re-list carried items" in lowered
+    assert "Handled overnight" in STANDALONE_BRIEF_SYSTEM
+    assert "Top call" in STANDALONE_BRIEF_SYSTEM
+    assert "delta" in lowered

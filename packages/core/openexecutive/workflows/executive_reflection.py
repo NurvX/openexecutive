@@ -59,6 +59,9 @@ class ExecutiveReflectionInput(BaseModel):
     )
 
 
+# Cap on yesterday's standup rendered into today's prompt.
+_PREVIOUS_REFLECTION_CHARS = 1500
+
 # Maximum iterations of the tool-use loop INSIDE the reflection workflow.
 # The reflection model can call a few tools, see the results, then
 # emit a final summary. 4 iterations is enough for "DM Sara + schedule
@@ -139,6 +142,13 @@ def _build_reflection_system(configured: set[str], has_roster: bool = True) -> s
         "message rather than three. When you cite an EXTERNAL signal, "
         "include the source's provenance_url in the message so the "
         "principal can verify in one click.\n\n"
+        "Memory: the block YESTERDAY'S STANDUP lists what you already did "
+        "on the previous run. Do NOT re-act on or re-notify anyone about a "
+        "signal listed there unless the input shows it changed since — "
+        "repeating a DM or a proposal a day later is noise, not diligence. "
+        "Open alerts carry the review verdict of your alert-review job "
+        "(relevant / changed / likely_stale) and its recommended move; you "
+        "never close alerts here (that job does, with evidence).\n\n"
         "Per signal in the input, decide one of:\n"
         "  (a) ACT NOW — call a tool to execute a follow-up, a DM, a "
         "broadcast, a workflow suggestion, or an alert.\n"
@@ -167,9 +177,13 @@ def _render_reflection_context(
     activity: list[dict[str, Any]],
     recent_alerts: list[dict[str, Any]],
     external_signals: list[dict[str, Any]],
+    previous_reflection: str | None = None,
 ) -> str:
     """Pack /today + activity + open alerts + external signals into a
     single user-turn block for the LLM to reason over.
+
+    ``previous_reflection`` is yesterday's standup artifact (capped) so the
+    model can see what it already handled and not repeat it.
 
     Research output is NOT a separate block — the executive_research
     workflow routes findings via DMs / alerts / watchlist additions
@@ -225,10 +239,25 @@ def _render_reflection_context(
     if recent_alerts:
         parts.append("RECENT OPEN ALERTS:")
         for a in recent_alerts[:10]:
-            parts.append(
-                f"- [{a.get('severity', '?')}] {a.get('headline', '')[:140]} "
+            line = (
+                f"- alert_id={a.get('alert_id')} [{a.get('severity', '?')}] "
+                f"{a.get('headline', '')[:140]} "
                 f"tags={','.join(a.get('topic_tags') or [])}"
             )
+            verdict = a.get("review_verdict")
+            if verdict:
+                line += f" review={verdict}"
+                if a.get("review_note"):
+                    line += f" ({str(a['review_note'])[:100]})"
+                move = a.get("recommended_move")
+                if move and move != "none":
+                    line += f" next={move}"
+            parts.append(line)
+        parts.append("")
+
+    if previous_reflection:
+        parts.append("YESTERDAY'S STANDUP (already handled — do not repeat):")
+        parts.append(previous_reflection.strip()[:_PREVIOUS_REFLECTION_CHARS])
         parts.append("")
 
     if external_signals:
@@ -265,6 +294,25 @@ from openexecutive.workflows._synthesis import (  # noqa: E402
 from openexecutive.workflows._synthesis import (  # noqa: E402
     extract_artifact_from_response as _extract_artifact_from_response,
 )
+
+
+def _previous_reflection_artifact() -> str | None:
+    """Yesterday's standup: the artifact of the last completed reflection run."""
+    try:
+        from openexecutive.workflows import persistence
+
+        runs = persistence.list_runs(
+            workflow_name="executive_reflection", status="done", limit=1
+        )
+        if not runs:
+            return None
+        run = persistence.get_run(runs[0]["run_id"])
+        artifact = (run or {}).get("artifact") or ""
+        artifact = str(artifact).strip()
+        return artifact if artifact and artifact != "(no artifact)" else None
+    except Exception:
+        logger.debug("reflection: previous artifact lookup failed", exc_info=True)
+        return None
 
 
 class ExecutiveReflectionWorkflow(Workflow):
@@ -326,7 +374,7 @@ class ExecutiveReflectionWorkflow(Workflow):
             step_title="Gather org signals",
         )
 
-        from openexecutive.alerts import store as alert_store
+        from openexecutive.alerts.lifecycle import list_live_alerts
         from openexecutive.api.routes import today as today_route
 
         try:
@@ -345,12 +393,16 @@ class ExecutiveReflectionWorkflow(Workflow):
             activity = []
 
         try:
-            recent_alerts_objs = alert_store.list_alerts(status="unread", limit=10)
+            recent_alerts_objs = list_live_alerts(limit=10)
             recent_alerts = [
                 {
+                    "alert_id": a.id,
                     "severity": a.severity,
                     "headline": a.headline,
                     "topic_tags": a.topic_tags,
+                    "review_verdict": a.review_verdict,
+                    "review_note": a.review_note,
+                    "recommended_move": a.recommended_move,
                 }
                 for a in recent_alerts_objs
             ]
@@ -430,6 +482,7 @@ class ExecutiveReflectionWorkflow(Workflow):
             activity=activity,
             recent_alerts=recent_alerts,
             external_signals=external_signals,
+            previous_reflection=_previous_reflection_artifact(),
         )
         roster = _render_team_roster(people)
         if roster:

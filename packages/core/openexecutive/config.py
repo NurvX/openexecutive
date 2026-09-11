@@ -602,6 +602,37 @@ class Settings(BaseSettings):
     # 03:30), read by the scheduler like the principal-brief times.
     client_rotation_enabled: bool = Field(False, alias="CLIENT_ROTATION_ENABLED")
 
+    # Alert lifecycle (alerts/lifecycle.py). An `unread` alert older than its
+    # category TTL is expired by the scheduler sweep (and hidden by the read
+    # side before the sweep runs). Monitoring = unrouted low/medium watchlist
+    # signals; action = everything a human should look at. 0 disables expiry
+    # for that category. Artifacts and decision-backed alerts never expire.
+    alert_ttl_days_monitoring: int = Field(3, alias="ALERT_TTL_DAYS_MONITORING")
+    alert_ttl_days_action: int = Field(14, alias="ALERT_TTL_DAYS_ACTION")
+
+    # Executive alert review (alerts/review.py) — a scheduler heartbeat that
+    # re-examines open alerts with evidence and lets the Executive route,
+    # nudge, escalate, draft, merge or resolve them within authority. Runs
+    # every `interval` hours and once right before the morning brief. Only
+    # alerts at least `min_age` hours old and not reviewed within the interval
+    # are sent to the model; `max_per_scan` bounds the model calls and
+    # `max_moves_per_scan` bounds outbound side effects (DMs, drafts) per pass
+    # — 0 keeps the review but makes it annotate-only.
+    alert_review_enabled: bool = Field(True, alias="ALERT_REVIEW_ENABLED")
+    alert_review_interval_hours: int = Field(6, alias="ALERT_REVIEW_INTERVAL_HOURS")
+    alert_review_min_age_hours: int = Field(2, alias="ALERT_REVIEW_MIN_AGE_HOURS")
+    alert_review_max_per_scan: int = Field(25, alias="ALERT_REVIEW_MAX_PER_SCAN")
+    alert_review_batch_size: int = Field(8, alias="ALERT_REVIEW_BATCH_SIZE")
+    alert_review_max_moves_per_scan: int = Field(
+        10, alias="ALERT_REVIEW_MAX_MOVES_PER_SCAN"
+    )
+
+    # Principal briefs: when nothing changed since the last delivered brief,
+    # send a one-line "nothing new" instead of re-synthesising the same list.
+    principal_brief_suppress_unchanged: bool = Field(
+        True, alias="PRINCIPAL_BRIEF_SUPPRESS_UNCHANGED"
+    )
+
     # Proactive nudge engine — heartbeat that scans for stalled workflows,
     # stale commitments, and idle initiatives and emits per-channel nudges
     # routed via Person.preferred_channel + availability windows.
@@ -617,6 +648,9 @@ class Settings(BaseSettings):
     nudge_max_defer_days: int = Field(3, alias="NUDGE_MAX_DEFER_DAYS")
     nudge_max_per_scan: int = Field(10, alias="NUDGE_MAX_PER_SCAN")
     nudge_max_per_person_per_scan: int = Field(2, alias="NUDGE_MAX_PER_PERSON_PER_SCAN")
+    # Stop re-chasing the same item forever: after this many delivered nudges
+    # for one scope_key, the scan stops emitting for it. 0 disables the cap.
+    nudge_max_per_scope: int = Field(3, alias="NUDGE_MAX_PER_SCOPE")
 
     # External-condition monitoring — heartbeat that polls source adapters
     # (vendor_status in PR-A; RSS + stock in PR-B) and emits external_signals
@@ -709,8 +743,10 @@ class Settings(BaseSettings):
     # purely-external developments (a competitor move, a regulation change)
     # that the internal-state fingerprint can't see. Set <= 0 to disable the
     # floor and rely solely on skip-if-unchanged.
+    # Weekly by default: a daily forced re-run re-derived the same findings
+    # from unchanged state and re-filed them as fresh alerts every morning.
     watchlist_research_max_staleness_hours: int = Field(
-        24, alias="WATCHLIST_RESEARCH_MAX_STALENESS_HOURS"
+        168, alias="WATCHLIST_RESEARCH_MAX_STALENESS_HOURS"
     )
 
     # Notion → isolated wiki-collection sync. OFF by default. When on, a

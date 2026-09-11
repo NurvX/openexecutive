@@ -86,6 +86,9 @@ system:
     - External-monitor adapters are read-only — they never write to upstream systems. The whole `monitoring/` subsystem is observation-only; surfacing happens through the alert pipeline, never via a direct upstream side-effect.
     - External signals never auto-execute on the principal's behalf. Every signal that surfaces is proposed via the alert pipeline (and thus subject to triage / mute / severity gates); the scheduler never dispatches an outbound message directly off a signal.
     - An external signal whose `dedup_key` already exists is dropped at ingest via the UNIQUE(dedup_key) constraint on `external_signals`. Adapter retries / re-polls cannot multiply alerts for the same upstream event.
+    - Alerts have a lifetime. Every user-facing surface (`/today`, the chat `<briefing>` block, the briefs, the reflection) reads `alerts.lifecycle.list_live_alerts` — unread, inside its category TTL, not snoozed — and the scheduler sweep persists the same predicate as status `expired`. `artifact` and `decision_scheduling` rows are exempt (own lifecycle). Every autonomous close is reversible via `POST /alerts/{id}/reopen`.
+    - A repeat of an open alert with the same `(source, dedup_key)` coalesces into the existing row (`alerts.store.coalesce_alert`) rather than inserting a second card, and does not re-dispatch unless severity rose into high/urgent. Monitoring alerts carry a producer-supplied `watch:<slug>` key so one watch = one open card.
+    - The alert review model (`agents.alert_review`) never mutates state. `alerts.review.apply_verdict` is the only writer: it closes only on a high-confidence `resolved`/`stale` verdict with named evidence, routes only to a person on the roster slice it showed the model (scope-holders or the principal for board/comp/legal matters), runs department moves through `departments.authority.gate_action` (propose-only → `propose_via_alert`, never a third-party DM), caps outbound moves per pass, and audits every move with its evidence and prior state. Status `resolved` (Executive closed) is distinct from `ack` (user approved).
 
 caching:
   block_layout: |
@@ -325,7 +328,119 @@ routing:
     ("Approved proposal #N" / "Dismissed proposal #N"). The button-driven
     Approve / Dismiss path on the briefing page still acks via the HTTP
     route — the tool exists for the chat-driven path that the model
-    self-detects from natural-language approval.
+    self-detects from natural-language approval. The same feedback loop as
+    the HTTP ack applies: a `dismissed` on a watch-sourced alert lowers
+    that watch's `trust_score` (`monitoring.store.record_dismissal`); an
+    `ack` recovers it a little.
+  alert_lifecycle: |
+    `openexecutive.alerts.lifecycle` gives every alert a lifetime and one
+    shared read view. TTL per category — `ALERT_TTL_DAYS_ACTION` (14) for
+    anything a human should look at, `ALERT_TTL_DAYS_MONITORING` (3) for
+    unrouted low/medium watchlist signals (`briefing.ranking.categorize`
+    decides), computed from `created_at` at read/sweep time (no stored
+    expiry, so a setting change applies to existing rows; 0 = never).
+    The age anchor is the later of `created_at` and `last_seen_at`, so a
+    situation that keeps re-firing (coalescing) stays live.
+    `list_live_alerts` = unread ∧ inside TTL ∧ `snoozed_until` null/past
+    (`snoozed_until` is a column only — nothing writes it yet; snooze UI is
+    a follow-up); `is_live(alert, now)` is the same predicate for one row;
+    `/today`, `briefing.context`, the briefs and the reflection all read it.
+    `expire_stale_alerts` (called by the scheduler loop every 15 min and once
+    at boot, `runner._maybe_sweep_alerts`) flips past-TTL rows to `expired`
+    and audits `alert_sweep`. `artifact` and `decision_scheduling` rows are
+    exempt. Additive `alerts` columns: `last_seen_at`, `occurrence_count`
+    (coalescing), `last_reviewed_at`, `review_verdict`, `review_note`,
+    `recommended_move`, `why_now`, `due_at`, `superseded_by_alert_id`,
+    `snoozed_until`, `suggested_workflow` (review). Store helpers:
+    `coalesce_alert`, `bulk_set_status`, `update_alert_content`,
+    `set_review`, `update_alert_routing`, `mark_superseded`,
+    `count_superseded_by`, `reopen_alert`. Routes (`api/routes/alerts.py`):
+    `POST /alerts/{id}/ack` (now accepts `mute_topic`: a pattern or `true`
+    to derive `external:<slug>` / `department:<slug>` / first tag), `POST
+    /alerts/bulk-ack` (`status`, `alert_ids` and/or `older_than_days`,
+    `category`; exempt sources skipped), `POST /alerts/{id}/reopen` (Undo: only `resolved` /
+    `expired` / `dismissed` rows, never `ack` or exempt sources; clears every
+    review stamp incl. `last_reviewed_at`, stamps `last_seen_at = now` so a
+    past-TTL row is live again, and hands a merged row's occurrence count
+    back to its survivor),
+    `POST /alerts/review` (on-demand review, ignores the interval but not the
+    kill switch, the caps, the lock or per-alert idempotency). `ack` applies
+    feedback / mute only on a real status transition; `bulk-ack` caps
+    `alert_ids` at 500, requires `older_than_days >= 1`, and applies the same
+    watch feedback per row; `mute_topic` must be one of the alert's own tags
+    or an `external:` / `department:` scoped pattern (≥ 4 chars).
+  alert_review: |
+    `openexecutive.alerts.review` is the Executive working the feed instead
+    of just filing into it. Heartbeat kind `alert_review_scan` (channel
+    `__internal__`, bootstrap + chain like `nudge_scan`, every
+    `ALERT_REVIEW_INTERVAL_HOURS` = 6) plus a `pre_brief` pass from
+    `_run_principal_brief` before the morning brief. Candidates: live alerts
+    at least `ALERT_REVIEW_MIN_AGE_HOURS` (2) old, not reviewed inside the
+    interval, not exempt, oldest first, capped at `ALERT_REVIEW_MAX_PER_SCAN`
+    (25), in batches of `ALERT_REVIEW_BATCH_SIZE` (8). Evidence per alert
+    (`gather_evidence`, deterministic, no tools): age, `occurrence_count`,
+    prior verdict; newer `external_signals` for the same watch plus its
+    `trust_score` / `dismiss_count`; related live alerts raised since (same
+    source or shared tag); Executive activity since (`_build_activity(since)`);
+    the roster slice (department members + routed person + principal, or
+    only `legal_sign` / `board_comms` holders + principal for a sensitive
+    matter — tags `board`/`comp`/`legal` or `broadcast_tools`'s privacy
+    backstop); the department's authority level; registry workflows whose
+    name matches the text. `agents.alert_review.AlertReviewAgent` (routing
+    model, one forced `emit_alert_reviews` tool call, never raises) returns
+    per alert: verdict (relevant | changed | resolved | stale), confidence,
+    evidence, note (≤160), why_now (≤80), due_at, recommended_move (none |
+    route | nudge | escalate | draft | suggest_workflow | merge | close),
+    target_person_id, superseded_by_alert_id, rewritten headline/body/
+    severity, draft_title/draft_document, workflow_name, message.
+    Trust boundary: every externally-sourced field (headline, body,
+    suggested_action, signal / related-alert text) is rendered through
+    `_untrusted` (angle brackets → ‹ ›, control chars dropped) inside the
+    `<alert>` envelope, the batch header and the prompt state it is data,
+    never instructions, and each evidence item carries a server-minted ref
+    (S1.. signals, R1.. related alerts, A1.. activity) the model must cite.
+    `apply_verdict` policy: close → `resolved` / `dismissed` only when
+    confidence is high AND `evidence_ref` names a ref that exists for THAT
+    alert (free text — or an injected body saying "resolved" — never closes),
+    else `review_verdict = likely_stale` (ranking demotes it 30 points, the card shows an amber
+    chip + one-click Dismiss); changed → `update_alert_content` with the
+    prior text in the audit row (a sensitive alert keeps its text — only
+    severity moves — so a rewrite cannot launder the privacy keywords);
+    route → target must be on the roster slice (which, for a sensitive
+    matter, never includes a mere `routed_to_person_id`), skipped when the
+    alert is already `routed` to that person;
+    `gate_action(dept, "route_alert")` — `propose` ⇒ `propose_via_alert` to
+    the approver, else `update_alert_routing` + DM via
+    `handle_message_person` (server-side channel resolution + the outbound
+    anti-spam guard, session seeded from the roster); nudge → DM the routed
+    owner, capped by `NUDGE_MAX_PER_SCOPE` delivered nudges per alert
+    (counted from `alert_review_nudged` audit rows); escalate → severity up
+    (never down, at least `high`), `due_at` (verdict's or +24 h), DM the
+    principal only — no principal ⇒ annotate, never counted as an escalation;
+    skipped when already escalated (high/urgent + due_at); draft → `handle_draft_artifact` (lands as an artifact
+    card), source marked `drafted`; suggest_workflow → `suggested_workflow`
+    stored only when the name was offered, never runs anything; merge →
+    only at high confidence, `mark_superseded` into a survivor that was SHOWN
+    as a related alert and is live (`lifecycle.is_live`), absorbing the merged
+    row's occurrence_count (handed back on reopen); draft → skipped when the
+    source is already `drafted`; escalate → the DM goes first and only a
+    delivered DM bumps severity / sets `due_at` / counts; a `_dm` that fell
+    back to creating an alert ("alerted") counts as not delivered. Activity
+    refs (A1..) are only minted for items that mention the alert's subject
+    (`_subject_terms`), and untrusted text is collapsed to one line so a body
+    cannot forge a section header;
+    a standalone `close` move is ignored (closing is only ever a verdict).
+    Every DM goes out as "[Alert review] Re: <headline>\n\n<text>"
+    (`_dm_text`) so provenance is visible. `run_alert_review` honours
+    `ALERT_REVIEW_ENABLED` for every caller (the manual endpoint does not
+    bypass it) and is single-flight (`asyncio.Lock`: an overlapping
+    heartbeat / pre-brief / manual pass is skipped). Outbound moves
+    (route/nudge/escalate/draft) count against
+    `ALERT_REVIEW_MAX_MOVES_PER_SCAN` (10; 0 = annotate-only). Audit event
+    types: `alert_review` (annotation), `alert_review_closed`, `_routed`,
+    `_nudged`, `_escalated`, `_drafted`, `_merged`, `_suggested_workflow`,
+    `_changed` — `briefing.brief_state.handled_since` reads them for the
+    brief's "Handled overnight" block and `/today.handled_overnight`.
   artifact_tools: |
     `draft_artifact(title, document, why_interesting, source_urls?,
     severity?)` (openexecutive.orchestrator.artifact_tools) lets the
@@ -1030,13 +1145,14 @@ scheduler:
     - dept_cadence — internal action fired by department cadences; the runner invokes the `department_check_in` workflow and re-enqueues the next occurrence via `cadence.enqueue_next`. Pending rows are cancelled when their department is deleted, and orphaned rows (department no longer exists) are swept by `cadence.cancel_orphaned_cadences` on lifespan boot.
     - awaiting_human — placed by the `wait_for_human` workflow step; the run resumes when an inbound message matches.
     - "dynamic_workflow — cadence-fired run of a user-created (dynamic) workflow. Enqueued by `workflows.dynamic_cadence.schedule_dynamic_workflow_cadence` (channel=`__internal__`, channel_ref=the workflow name, assigned_to_person_id=the delivery recipient). The runner's `_run_dynamic_workflow` resolves the stored definition, runs the generic `DynamicWorkflow`, DMs the artifact to the recipient via `handle_message_person`, and re-chains the next occurrence — same crash-survival pattern as the principal briefs. Saving/updating/deleting/deactivating the definition reconciles its pending rows via `dynamic_cadence.cancel_cadence_rows`. See the `workflows:` → `dynamic_user_created` key."
-    - nudge_scan — internal heartbeat row owned by the nudge engine; the runner calls `nudge_engine.run_nudge_scan()` and chains the next tick via `nudge_engine.enqueue_next_scan()`. Bypasses outbound dispatch.
+    - nudge_scan — internal heartbeat row owned by the nudge engine; the runner calls `nudge_engine.run_nudge_scan()` and chains the next tick via `nudge_engine.enqueue_next_scan()`. Bypasses outbound dispatch. Emission is also capped per `scope_key` at `NUDGE_MAX_PER_SCOPE` (default 3) delivered nudges (`episodic.count_nudges_for_scope`), so a parked item is not chased forever.
+    - "alert_review_scan — internal heartbeat row owned by the Executive alert review (`alerts.review`). Bootstrapped idempotently at scheduler startup when `ALERT_REVIEW_ENABLED`, fires every `ALERT_REVIEW_INTERVAL_HOURS` (default 6); the runner calls `run_alert_review(reason='heartbeat')`, marks done, and chains the next tick — same crash-resilient shape as nudge_scan. `_run_principal_brief` also runs a `pre_brief` pass before the morning brief so the brief reflects fresh verdicts (a review failure never blocks the brief). Bypasses outbound dispatch itself; the moves it makes go through the real DM / draft handlers. See the `alert_review:` key. Not a kind but loop-level: the runner also calls `_maybe_sweep_alerts` (alert TTL expiry, `alerts.lifecycle.expire_stale_alerts`) once at boot and every 15 min at the top of the tick — BEFORE the company-profile and rotation gates, so an old backlog expires even pre-onboarding — pure DB hygiene, no heartbeat row."
     - proactive_nudge — per-channel nudge action emitted by `run_nudge_scan`. Carries a `scope_key` for cooldown dedup and `assigned_to_person_id` for a dispatch-time on-leave re-check that runs BEFORE the ad-hoc dispatch path: if the assignee has gone unreachable since the scan, the runner reschedules into the next available slot (clamped to fall after on_leave_until) or drops the nudge with an audit event rather than dispatching to a deaf channel.
     - "principal_brief_morning — Shift 3 recurring row that runs the `morning_brief` workflow and DMs the artifact to the principal via their preferred channel. Seeded once per database at scheduler startup via `seed_principal_briefs()`; each fire chains the next occurrence in `_run_principal_brief()` so the recurring rhythm survives crashes. Time-of-day reads `PRINCIPAL_BRIEF_MORNING_TIME` (HH:MM UTC, default 08:00). Single-timezone for v1."
     - "principal_brief_eod — same shape as morning_brief, fires once per day at `PRINCIPAL_BRIEF_EOD_TIME` (default 18:00 UTC). Runs `end_of_day_digest` workflow. Both brief kinds bypass the per-channel anti-spam guards because the principal is by definition deliverable (channel_ref=`principal`, channel=`__internal__` triggers the workflow run rather than a direct send)."
     - "executive_reflection — Shift 5 recurring row. Seeded alongside the principal briefs (idempotent via `_has_pending_brief`), default 07:30 UTC, override via `PRINCIPAL_REFLECTION_TIME`. The scheduler runs `_run_executive_reflection`: invokes the `executive_reflection` workflow, stores the artifact via `complete_run`, audits the outcome, then chains the next occurrence — same crash-survival pattern as principal briefs. Unlike the briefs, the artifact is NOT delivered to the principal — the morning brief that fires 30 minutes later surfaces what reflection decided via the existing /today/activity rail."
     - "external_monitor_scan — heartbeat owned by the external-condition monitoring layer. Default every 5 min via EXTERNAL_MONITOR_SCAN_INTERVAL_MINUTES. The runner calls `monitoring.pipeline.run_external_monitor_scan()` which walks enabled watchlist rows whose `last_polled_at` is stale enough, fires the matching adapter (vendor_status, rss, stock, the billed standing-query `query` adapter, the `edgar` SEC-filings adapter, and the stateful `page_watch` change-detector), enriches promotable signals with capture-time relevance, writes `external_signals` rows, and promotes qualifying signals into the alerts pipeline. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`external_monitor`). Chains the next tick via `enqueue_next_external_monitor_scan` after firing — same idempotent / crash-resilient pattern as `nudge_scan`."
-    - "watchlist_research_scan — periodic cron for the executive_research workflow (default every 120 min via WATCHLIST_RESEARCH_INTERVAL_MINUTES). The handler short-circuits when the company profile / initiatives / watchlist haven't changed since the last successful run, so quiet days cost zero tokens — except that a staleness floor (WATCHLIST_RESEARCH_MAX_STALENESS_HOURS, default 24) forces a run once that long has elapsed since the last successful run, so a static internal state can't keep the council blind to external change indefinitely. Does NOT write its own Alert — the workflow's Executive synthesis step routes findings directly via DMs / send_department_message / create_alert / add_watchlist_entry, so a separate cron Alert would duplicate the briefing. After routing, a DEDICATED watchlist-analysis pass (its own budget, separate from the routing budget) explicitly decides which findings are ongoing monitorable conditions and calls add_watchlist_entry for each; the run's markdown artifact is also persisted into the separate `recent_research` knowledge collection (keep-latest) so future runs + chat can recall it. The cron's only side-effects on success are the audit row (`watchlist_research_periodic_ran`) and whatever routing tools the synthesis fired. The scheduled-action kind keeps the legacy `watchlist_research_scan` name (matched by the env var WATCHLIST_RESEARCH_INTERVAL_MINUTES + the three audit event_types) even though the workflow itself is registered as `executive_research` — naming is mixed intentionally to avoid a migration on already-pending heartbeat rows. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`watchlist_research`)."
+    - "watchlist_research_scan — periodic cron for the executive_research workflow (default every 120 min via WATCHLIST_RESEARCH_INTERVAL_MINUTES). The handler short-circuits when the company profile / initiatives / watchlist haven't changed since the last successful run, so quiet days cost zero tokens — except that a staleness floor (WATCHLIST_RESEARCH_MAX_STALENESS_HOURS, default 168 — weekly; a daily forced run re-derived the same findings from unchanged state and re-filed them as fresh alerts every morning) forces a run once that long has elapsed since the last successful run, so a static internal state can't keep the council blind to external change indefinitely. Does NOT write its own Alert — the workflow's Executive synthesis step routes findings directly via DMs / send_department_message / create_alert / add_watchlist_entry, so a separate cron Alert would duplicate the briefing. After routing, a DEDICATED watchlist-analysis pass (its own budget, separate from the routing budget) explicitly decides which findings are ongoing monitorable conditions and calls add_watchlist_entry for each; the run's markdown artifact is also persisted into the separate `recent_research` knowledge collection (keep-latest) so future runs + chat can recall it. The cron's only side-effects on success are the audit row (`watchlist_research_periodic_ran`) and whatever routing tools the synthesis fired. The scheduled-action kind keeps the legacy `watchlist_research_scan` name (matched by the env var WATCHLIST_RESEARCH_INTERVAL_MINUTES + the three audit event_types) even though the workflow itself is registered as `executive_research` — naming is mixed intentionally to avoid a migration on already-pending heartbeat rows. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`watchlist_research`)."
     - "notion_sync_scan — optional heartbeat (NOTION_SYNC_ENABLED, default off) that incrementally re-indexes Notion pages shared with an internal integration into the isolated `notion_wiki` collection (NOT COMPANY — synced pages are multi-writer and unreviewed). Interval NOTION_SYNC_INTERVAL_MINUTES (default 60). Caps ingest per tick via NOTION_MAX_PAGES_PER_SCAN; overflow is retried and the watermark does not advance past failed or uningested pages. Each tick reconciles: un-shared/deleted pages have files + chunks purged. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`notion_sync`). Chains the next tick via enqueue_next_notion_sync_scan. See knowledge.collections NOTION_WIKI."
   channel_routing: |
     The delivery channel is stored ON the scheduled_actions row itself
@@ -1091,6 +1207,32 @@ today:
     - "GET /today/activity?limit=N — Returns ActivityResponse(items). Each item is one recent self-initiated Executive action — a fired scheduled_action (DM dispatched, follow-up fired, cadence run, paused workflow resumed) or an extracted decision/advice row. Items carry `kind` (coarse classifier the UI maps to verb + icon — dm_sent, email_sent, nudge_sent, cadence_sent, workflow_resumed, proposal_routed, decision_logged, advice_given, workflow_done, initiative_started, decision_resolved, alert_raised, or action for unclassified), `summary`, `actor` (always Executive for now), `target` (channel ref / person, or null), `department`, and `at` (ISO timestamp). Sources merged — `scheduled_actions` with status=done (excluding `nudge_scan` heartbeat and `__internal__` channel), `decisions`, `advice_given`, completed `workflow_runs` (status=done — briefings/check-ins/research, bucketed at `updated_at`), `initiatives` (kicked-off projects, at `created_at`), resolved `decision_instances` (terminal gated-decision outcomes — approved/rejected/reversed, at `resolved_at`; pending ones stay in `proposals`, not the rail), and `alerts` raised (excluding source=`decision_scheduling`, which is the companion alert for a gated booking already represented by its `decision_resolved` row). This broadens the feed beyond the original messaging-heavy three sources so it reflects all self-initiated Executive activity, not just dispatched messages. Actions on `propose_only` departments are reclassified to `proposal_routed` because the runner marks them done without dispatching (the proposal is surfaced via /today's `proposals` field; the activity rail shows it as 'proposed to <approver>' rather than implying a DM was sent). Sorted by `at DESC`, then capped at `limit` (default 20, clamped to 1..100 via FastAPI Query validation — 422 on out-of-range). The Pulse page polls this endpoint (limit=100) every ~20s so new activity streams into the 'Recent activity' card without a reload; the card scrolls internally at a fixed max-height rather than growing the page."
     - "GET /today/activity/daily?days=N — Returns DailyActivityResponse(days), the per-day counts behind the Pulse page's 'heartbeat' heatmap (the GitHub-contributions-style grid at `/memories`). Same source set and exclusions as /today/activity — the union of `decisions`, `advice_given`, status=done `scheduled_actions` (excluding the `nudge_scan` heartbeat and `__internal__` channel), completed `workflow_runs`, `initiatives`, resolved `decision_instances`, and `alerts` — but bucketed by calendar day (UTC) in `episodic.count_activity_by_day` rather than returned as individual items — decisions/advice by their `timestamp`, fired actions by `run_at` (fire time, not `created_at` queue time, so a cadence queued the night before counts on the day it fires), workflow runs by `updated_at` (completion), initiatives by `created_at`, resolved decisions by `resolved_at`, alerts by `created_at`. The `workflow_runs` and `alerts` tables are owned by other stores (not `episodic.initialize_db`), so each UNION arm is included only when its table exists — `count_activity_by_day` checks `sqlite_master` and still counts the sources episodic owns on a DB initialised by episodic alone. The response is DENSE: every calendar day in the window is present (count 0 when nothing fired), oldest→newest, so the UI renders a gap-free grid without client-side fill. `days` defaults to 90, clamped to 1..365 via FastAPI Query validation (422 on out-of-range). Read-only, unauthenticated (matches /today/activity and /memories/*), uncached."
     - GET /morning-brief — deprecated alias for GET /today, kept for one release for older UI builds and bookmarks. Sends a Deprecation header with a Sunset date.
+  lifecycle: |
+    `proposals` is now the LIVE unread set (`alerts.lifecycle.list_live_alerts`:
+    unread ∧ inside TTL ∧ not snoozed — the read-side twin of the scheduler's
+    expiry sweep, so the page is right before the sweep runs), never
+    `expired` / `resolved` rows. Each ProposalItem additionally carries
+    `occurrence_count` / `last_seen_at` (coalescing), `last_reviewed_at`,
+    `review_verdict` ('' | relevant | changed | likely_stale | drafted |
+    routed | merged), `review_note` (the one-line "what changed since you
+    last looked"), `recommended_move`, `why_now`, `due_at`,
+    `superseded_count` (rows folded into it) and `suggested_workflow`.
+    `briefing.ranking.score` now subtracts 30 for `likely_stale`, adds 20
+    when `due_at` is within 24 h, and discounts up to 10 by the watch's
+    `trust_score` (looked up once per distinct `external:<slug>` tag).
+    `TodayResponse.handled_overnight` (additive) lists the alert review's
+    autonomous moves since the last delivered morning brief (`brief_state.
+    handled_since`: kind, summary, at, alert_id) — the UI's "Handled
+    overnight" rail (Undo → `POST /alerts/{id}/reopen`) and the "Executive
+    handled N overnight" status pill. UI: cards lead with `review_note`
+    (amber "Likely stale" / "Updated" / "Since you last looked"), chips for
+    age, seen ×N, why-now / due, folded-in, draft-ready, a "Reviewed <ago>"
+    footer, a primary move control (Nudge <owner> → chat handoff; Run
+    <workflow> → /jobs/<name>); "Needs you" shows "Start here" + 8 cards +
+    "Show N more", a "Dismiss N older than 7 days" footer that sends
+    explicit ids to `POST /alerts/bulk-ack` (never a server-side age sweep),
+    and "Re-check relevance" (`POST /alerts/review`); Monitoring gets the
+    same footer at 3 days; the ack body may carry `mute_topic`.
   ui_route: / (Next.js app router root) — the briefing is the default landing surface. `/today` still renders the same content as a standalone route (no sidebar shell) for bookmarks and the sidebar Briefing button. The chat lives at the same root behind a `mode` toggle — entering chat from "New chat" or by selecting a session swaps the main content; clicking the sidebar brandmark or the "Briefing" sidebar button returns to the briefing. A standalone "Pulse" link (→ `/memories`, the page titled "Pulse") is pinned directly beneath Briefing in the rail, the chat-home sidebar, and the mobile bottom bar — an always-visible top-level destination rather than a Knowledge-group entry (the Knowledge group now lists "RAG" → `/knowledge` and Skills). Both navs render it from the shared `PULSE_NAV_ITEM` in `navConfig.ts`.
   briefing_first_landing: |
     The root page (`packages/ui/src/app/page.tsx`) defaults to `mode="briefing"`
@@ -1444,7 +1586,19 @@ external_monitoring:
     `external:<source>` + `external:<watchlist_slug>` topic tag — those tags
     (and the source itself, via briefing.ranking `_is_external_signal`) are
     what land an unrouted low/medium signal in the briefing's Monitoring lane
-    rather than the "Needs you" action queue.
+    rather than the "Needs you" action queue. The event also carries
+    `dedup_hint="watch:<slug>"`, which `alerts.pipeline` uses as the ALERT
+    dedup_key (overriding the triage model's free-text key): a repeat from
+    the same watch coalesces into the open card (`occurrence_count`,
+    `last_seen_at`, severity max) instead of a new one, re-pinging only when
+    severity rose into high/urgent — the signal-level `dedup_key` (stock's
+    UTC-date bucket, vendor_status's `<updated>`) is untouched, so every
+    observation still lands in `external_signals`. Feedback: dismissing a
+    watch-sourced alert (HTTP ack or the `ack_alert` tool) calls
+    `store.record_dismissal(slug)` — `dismiss_count += 1`, `trust_score =
+    max(0.2, trust_score × 0.8)`; an ack calls `record_confirmation`
+    (+0.05, capped at 1.0). `trust_score` discounts `briefing.ranking.score`
+    (up to −10) and is shown to the alert review as WATCH TRUST evidence.
   heartbeat:
     kind: external_monitor_scan
     channel: __internal__
@@ -1623,7 +1777,7 @@ external_monitoring:
     triggers:
       - "Manual chat — the principal asks 'what should we look into?'; the Executive calls the `run_executive_research` chat tool. The tool runs the workflow, which both researches AND routes; the chat tool returns the structured summary so the Executive can describe to the principal what it researched and what it did with each finding."
       - "Onboarding completion — when the wizard finishes (build_and_save_profile fires), `api/routes/onboarding._fire_post_onboarding_research` schedules the workflow as a background task. The workflow's synthesis step fires whatever routing tools it deems necessary (DMs to heads, briefing alert, watchlist additions) — the wrapper just runs the workflow with a wall-clock ceiling and creates / completes the workflow_run row."
-      - "Periodic cron — `watchlist_research_scan` scheduled-action kind (default every 120 min via `WATCHLIST_RESEARCH_INTERVAL_MINUTES`). Each tick computes a state fingerprint (company profile + active initiatives + watchlist slugs/targets) and SKIPS the run when nothing has changed since the last successful periodic research. Quiet days cost zero tokens; first tick after any material profile / initiative / watchlist change fires immediately. A staleness floor (`WATCHLIST_RESEARCH_MAX_STALENESS_HOURS`, default 24) overrides the skip once that many hours have elapsed since the last successful run, so a static internal state cannot keep the council blind to purely-external change forever (set <= 0 to disable). The cron does NOT write its own Alert — the workflow's synthesis step already routes findings directly. After routing, a dedicated watchlist-analysis pass (separate budget) explicitly adds ongoing monitors via add_watchlist_entry, and the run artifact is persisted into the separate `recent_research` knowledge collection (keep-latest). Cron's only side-effects on success are the `watchlist_research_periodic_ran` audit row + whatever the workflow's Executive synthesis + watchlist pass fired."
+      - "Periodic cron — `watchlist_research_scan` scheduled-action kind (default every 120 min via `WATCHLIST_RESEARCH_INTERVAL_MINUTES`). Each tick computes a state fingerprint (company profile + active initiatives + watchlist slugs/targets) and SKIPS the run when nothing has changed since the last successful periodic research. Quiet days cost zero tokens; first tick after any material profile / initiative / watchlist change fires immediately. A staleness floor (`WATCHLIST_RESEARCH_MAX_STALENESS_HOURS`, default 168, i.e. weekly) overrides the skip once that many hours have elapsed since the last successful run, so a static internal state cannot keep the council blind to purely-external change forever (set <= 0 to disable). The cron does NOT write its own Alert — the workflow's synthesis step already routes findings directly. After routing, a dedicated watchlist-analysis pass (separate budget) explicitly adds ongoing monitors via add_watchlist_entry, and the run artifact is persisted into the separate `recent_research` knowledge collection (keep-latest). Cron's only side-effects on success are the `watchlist_research_periodic_ran` audit row + whatever the workflow's Executive synthesis + watchlist pass fired."
     skip_if_unchanged: |
       The periodic cron handler (`monitoring.research.scheduler.run_watchlist_research_scan`)
       computes a sha256 over (`CompanyProfile.to_prompt_block()`,
@@ -1852,9 +2006,9 @@ workflows:
     - inbound_resolver — matches human replies back to paused workflow runs.
     - crisis_comms — drafts incident response messaging.
     - churn_deep_dive — structured customer-loss analysis.
-    - "morning_brief — Shift 3 recurring workflow. Fires once per day from the scheduler (default 08:00 UTC, override via PRINCIPAL_BRIEF_MORNING_TIME env var). Targets the principal: utility_fast model renders a ≤200-word Markdown briefing covering at-risk goals, proposals awaiting decision, OE's overnight actions, and the top call. Artifact is DM'd via the principal's preferred_channel (slack_dm → discord_dm → telegram → email fallback chain). First workflow to target the principal rather than be user-invoked."
-    - "end_of_day_digest — Shift 3 recurring workflow. Fires once per day from the scheduler (default 18:00 UTC, override via PRINCIPAL_BRIEF_EOD_TIME). Same shape as morning_brief but framed as a recap: what OE did today, what's still pending, what's at risk for tomorrow, one optional 'sleep on this' question."
-    - "executive_reflection — Shift 5 recurring workflow. Fires once per day ~30 minutes before the morning brief (default 07:30 UTC, override via PRINCIPAL_REFLECTION_TIME). The first workflow OE runs ON ITSELF — not for a department, not for the principal, but for its own org-coordination judgment. Three steps: (1) gather /today + /today/activity + recent open alerts, (2) single LLM call with the full outbound toolkit (schedule_followup, send_*_dm, send_department_message, send_company_broadcast, suggest_workflow, create_alert, etc.) bounded to ≤4 iterations — the model decides per signal whether to act now, notify the right audience via the persona's 'Choosing Who to Tell' rule, raise it for the morning brief, or ignore, (3) emit a short Markdown summary with a structured tool-call log. The artifact is stored via complete_run but NOT DM'd — the morning brief surfaces what was decided via /today/activity. This operationalizes the 'When You Notice Something on Your Own' persona section (Shift 1)."
+    - "morning_brief — Shift 3 recurring workflow. Fires once per day from the scheduler (default 08:00 UTC, override via PRINCIPAL_BRIEF_MORNING_TIME env var). Targets the principal: utility_fast model renders a ≤200-word Markdown briefing. CHANGE-AWARE: the window is 'since the last DELIVERED morning brief' (`briefing.brief_state.since_for`, 24 h on a cold store, clamped to 7 d); activity comes from `_build_activity(20, since=…)`; proposals (action category only) split into NEW SINCE LAST BRIEF (enumerated, with why_now / next move) vs a one-line CARRIED OVER count (with the likely-stale count); a HANDLED OVERNIGHT block lists the alert review's autonomous moves (`brief_state.handled_since`). Section order: top call → what changed → handled overnight → needs you (new only) → waiting on → at risk. A fingerprint of the inputs (`build_brief_fingerprint`, date-free) is compared to the last delivered one: unchanged ⇒ the artifact is the one-liner 'Nothing new since yesterday's brief — N items still waiting on you.' and no model call (`PRINCIPAL_BRIEF_SUPPRESS_UNCHANGED`, bypass with `force_full=true` on a manual run). The workflow yields a `result` event `{brief_fingerprint, suppressed, since}`; only `_run_principal_brief` records the fingerprint, after a successful delivery (`brief_state.record_delivered`, stored in `briefing_narrative` under scope `brief:<kind>`). Artifact is DM'd via the principal's preferred_channel (slack_dm → discord_dm → telegram → email fallback chain)."
+    - "end_of_day_digest — Shift 3 recurring workflow. Fires once per day from the scheduler (default 18:00 UTC, override via PRINCIPAL_BRIEF_EOD_TIME). Same shape as morning_brief but framed as a recap since the last DELIVERED digest (`brief_state.since_for`, 24 h on a cold store): what OE did today (activity since), alerts it handled today, what's still pending (NEW SINCE LAST BRIEF, action category only, carried-over as one line), what's at risk for tomorrow, one optional 'sleep on this' question. Same fingerprint / one-liner suppression and `force_full` as morning_brief, under scope `brief:principal_brief_eod`."
+    - "executive_reflection — Shift 5 recurring workflow. Fires once per day ~30 minutes before the morning brief (default 07:30 UTC, override via PRINCIPAL_REFLECTION_TIME). The first workflow OE runs ON ITSELF — not for a department, not for the principal, but for its own org-coordination judgment. Three steps: (1) gather /today + /today/activity + recent open alerts, (2) single LLM call with the full outbound toolkit (schedule_followup, send_*_dm, send_department_message, send_company_broadcast, suggest_workflow, create_alert, etc.) bounded to ≤4 iterations — the model decides per signal whether to act now, notify the right audience via the persona's 'Choosing Who to Tell' rule, raise it for the morning brief, or ignore, (3) emit a short Markdown summary with a structured tool-call log. MEMORY: the context carries a YESTERDAY'S STANDUP block (the previous done run's artifact, capped at 1500 chars) and the prompt forbids re-acting on or re-notifying about anything listed there unless it changed; open alerts render with `alert_id`, the review verdict, note and recommended move. Reflection never closes alerts (the alert review does, with evidence) — the prompt does not instruct `ack_alert`. The artifact is stored via complete_run but NOT DM'd — the morning brief surfaces what was decided via /today/activity. This operationalizes the 'When You Notice Something on Your Own' persona section (Shift 1)."
     - "candidate_screen — Talent-platform (Phase 1) workflow. Screens one candidate against one executive-search engagement: loads the engagement + candidate from `talent.store`, consults the `talent` specialist for a fit assessment, parses the 0-100 fit score from the response, and persists score + summary back onto the candidate via `talent.store.record_screening` (which advances a raw `lead` to `screened`). Emits a structured `result` event plus a Markdown scorecard artifact. See the `talent:` key."
     - "candidate_outreach — Talent-platform (Phase 3) recruiting-automation workflow. Drafts a personalized first-touch + N follow-ups for a candidate via the `talent` specialist and schedules each touch as a REMINDER TO THE PRINCIPAL (a `scheduled_actions` row, assigned_to_person_id=principal, run_at = now + i*interval) — never a direct message to the candidate. Draft-and-approve posture: each reminder is the human checkpoint (the Executive DMs the principal the ready-to-send draft at fire time; the principal sends it manually). Deliberately uses reminders rather than a `wait_for_human` gate because gate-resume is deferred (a gate would pause and never schedule). Channel resolution maps the principal's people-channel → scheduled-actions vocabulary (slack→slack_dm etc.). See the `talent:` key."
     - "interview_coordination — Talent-platform (Phase 3) workflow. Designs an N-round interview loop + a candidate-facing availability-request via the `talent` specialist, then schedules ONE reminder to the principal to kick off scheduling (line up the panel, send the availability request). Never contacts the candidate directly. See the `talent:` key."

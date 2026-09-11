@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -48,6 +48,39 @@ def _company_profile_active() -> bool:
     except Exception:
         logger.exception("scheduler: failed to load company profile — holding actions")
         return False
+
+
+# Alert lifecycle sweep (alerts/lifecycle.py). A throttled call inside the
+# tick loop rather than a scheduled_actions heartbeat: pure DB hygiene with
+# no model call, so it needs no bootstrap / chain / kind branch, and it must
+# not be held by the company-profile gate (an old backlog should expire even
+# before onboarding completes).
+_ALERT_SWEEP_INTERVAL = timedelta(minutes=15)
+_last_alert_sweep_at: datetime | None = None
+
+
+def _maybe_sweep_alerts(now: datetime) -> int:
+    """Run the expiry sweep if the interval has elapsed. Returns rows expired.
+
+    Never raises — a sweep failure is logged and the tick continues.
+    """
+    global _last_alert_sweep_at
+    if (
+        _last_alert_sweep_at is not None
+        and now - _last_alert_sweep_at < _ALERT_SWEEP_INTERVAL
+    ):
+        return 0
+    _last_alert_sweep_at = now
+    try:
+        from openexecutive.alerts.lifecycle import expire_stale_alerts
+
+        expired = expire_stale_alerts(now)
+        if expired:
+            logger.info("scheduler: expired %d stale alert(s)", expired)
+        return expired
+    except Exception:
+        logger.exception("scheduler: alert expiry sweep failed")
+        return 0
 
 
 async def run_scheduler(
@@ -93,6 +126,20 @@ async def run_scheduler(
     except Exception:
         logger.exception("scheduler: rotation reconcile/seed failed")
 
+    # Expire past-TTL alerts once at boot (a redeploy cleans an old backlog
+    # immediately) and then every _ALERT_SWEEP_INTERVAL from the tick loop.
+    _maybe_sweep_alerts(datetime.now(UTC))
+
+    # Executive alert review heartbeat — idempotent bootstrap, like nudge_scan.
+    try:
+        from openexecutive.alerts.review import bootstrap_alert_review_scan
+        from openexecutive.config import get_settings as _review_settings
+
+        if _review_settings().alert_review_enabled:
+            bootstrap_alert_review_scan()
+    except Exception:
+        logger.exception("scheduler: alert_review bootstrap failed")
+
     logger.info(
         "scheduler started (poll_interval=%ds)", poll_interval_seconds
     )
@@ -101,6 +148,9 @@ async def run_scheduler(
     while True:
         try:
             now = datetime.now(UTC)
+            # Alert expiry is pure DB hygiene and must not wait for
+            # onboarding or a client rotation — it runs before both gates.
+            _maybe_sweep_alerts(now)
             if not _company_profile_active():
                 # No active company profile — don't claim or run anything.
                 # Due rows stay 'pending' and fire once onboarding completes.
@@ -394,6 +444,36 @@ async def _execute_action(
             logger.exception(
                 "scheduler: failed to chain next nudge_scan heartbeat — "
                 "engine will stall until next bootstrap"
+            )
+        return
+
+    # ------------------------------------------------------------------
+    # Executive alert review heartbeat (alerts/review.py): re-examine open
+    # alerts with evidence and route / escalate / draft / merge / resolve
+    # within authority. Same crash-resilient shape as nudge_scan.
+    # ------------------------------------------------------------------
+    if action.kind == "alert_review_scan":
+        from openexecutive.alerts.review import (
+            enqueue_next_alert_review_scan,
+            run_alert_review,
+        )
+        try:
+            summary = await run_alert_review(reason="heartbeat", now=now)
+            logger.info("scheduler: alert_review_scan %s", summary.as_dict())
+        except Exception:
+            logger.exception("scheduler: alert_review_scan (action %d) crashed", action.id)
+        try:
+            mark_action_done(action.id)
+        except Exception:
+            logger.exception(
+                "scheduler: alert_review_scan (action %d) — mark_done failed", action.id
+            )
+        try:
+            enqueue_next_alert_review_scan(after=datetime.now(UTC))
+        except Exception:
+            logger.exception(
+                "scheduler: failed to chain next alert_review_scan heartbeat — "
+                "review will stall until next bootstrap"
             )
         return
 
@@ -1362,6 +1442,16 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
     wf_inputs = input_cls()
     run_id = str(uuid.uuid4())
 
+    # Fresh relevance pass right before the morning brief so what it lists
+    # reflects overnight evidence; a review failure never blocks the brief.
+    if kind == "principal_brief_morning":
+        try:
+            from openexecutive.alerts.review import run_alert_review
+
+            await run_alert_review(reason="pre_brief", now=now)
+        except Exception:
+            logger.exception("scheduler: pre-brief alert review failed")
+
     try:
         create_run(
             run_id, workflow_name, f"{workflow.title} {now.strftime('%Y-%m-%d')}",
@@ -1369,9 +1459,14 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         )
         store = ChromaDBStore(persist_directory=get_settings().vector_store_path)
         artifact = ""
+        fingerprint: str | None = None
+        suppressed = False
         async for event in workflow.run(inputs=wf_inputs, store=store):
             if event.type == "artifact" and event.content:
                 artifact = event.content
+            elif event.type == "result" and event.data and event.data.get("brief_fingerprint"):
+                fingerprint = str(event.data["brief_fingerprint"])
+                suppressed = bool(event.data.get("suppressed"))
             elif event.type == "error" and event.message:
                 raise RuntimeError(event.message)
         complete_run(run_id, artifact or "(no artifact)")
@@ -1384,8 +1479,17 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
                     "scheduled_action",
                     f"{kind} delivered ({detail})",
                     actor="scheduler",
-                    details={"phase": "delivered", "kind": kind, "channel_detail": detail},
+                    details={
+                        "phase": "delivered", "kind": kind, "channel_detail": detail,
+                        "suppressed": suppressed,
+                    },
                 )
+                # Only a delivered brief advances the "since last brief"
+                # window and the unchanged-detection fingerprint.
+                if fingerprint:
+                    from openexecutive.briefing import brief_state
+
+                    brief_state.record_delivered(kind, fingerprint, artifact)
             else:
                 logger.warning("scheduler: %s NOT delivered — %s", kind, detail)
                 audit_log(

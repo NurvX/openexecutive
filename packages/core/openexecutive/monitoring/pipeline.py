@@ -274,6 +274,10 @@ def _signal_to_alert_event(
         external_id=signal.dedup_key,
         subject=summary[:200],
         body="\n".join(parts)[:4000],
+        # One watch = one open alert: repeats of the same watch coalesce
+        # into the existing card (alerts.pipeline) while the signal-level
+        # dedup_key keeps every observation in external_signals.
+        dedup_hint=f"watch:{item.slug}",
     )
 
 

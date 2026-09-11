@@ -71,6 +71,19 @@ def initialize_db(db_path: Path | None = None) -> None:
             ("routed_to_person_id", "INTEGER"),
             # Artifacts gallery soft-delete: NULL = active, ISO ts = archived.
             ("archived_at", "TEXT"),
+            # Lifecycle (alerts/lifecycle.py, alerts/review.py). NOT NULL
+            # columns carry a DEFAULT — SQLite requires it on ADD COLUMN.
+            ("last_seen_at", "TEXT"),
+            ("occurrence_count", "INTEGER NOT NULL DEFAULT 1"),
+            ("last_reviewed_at", "TEXT"),
+            ("review_verdict", "TEXT NOT NULL DEFAULT ''"),
+            ("review_note", "TEXT NOT NULL DEFAULT ''"),
+            ("recommended_move", "TEXT NOT NULL DEFAULT ''"),
+            ("why_now", "TEXT NOT NULL DEFAULT ''"),
+            ("due_at", "TEXT"),
+            ("superseded_by_alert_id", "INTEGER"),
+            ("snoozed_until", "TEXT"),
+            ("suggested_workflow", "TEXT NOT NULL DEFAULT ''"),
         ):
             if col not in existing:
                 try:
@@ -248,6 +261,304 @@ def set_status(alert_id: int, status: str, db_path: Path | None = None) -> bool:
             "UPDATE alerts SET status = ? WHERE id = ?", (status, alert_id)
         )
         return cursor.rowcount > 0
+
+
+# --- Lifecycle helpers (alerts/lifecycle.py, alerts/review.py, routes) ---
+
+# Cap on ids per bulk UPDATE (SQLite's default variable limit is 32,766); the
+# HTTP route caps its own `alert_ids` at 500, the sweep may need more.
+_BULK_MAX_IDS = 5000
+# Statuses `reopen_alert` may bring back: the closes the lifecycle / review
+# / dismiss paths produce. `ack` (user approved and the Executive executed)
+# is not an Undo target.
+_REOPENABLE_STATUSES = ("resolved", "expired", "dismissed")
+
+
+def coalesce_alert(
+    *,
+    source: str,
+    dedup_key: str,
+    severity: str,
+    body: str,
+    db_path: Path | None = None,
+) -> tuple[int, bool] | None:
+    """Fold a repeat of an open alert into the existing row.
+
+    When an ``unread`` alert with the same ``(source, dedup_key)`` exists,
+    bump ``occurrence_count`` and ``last_seen_at``, refresh ``body`` (the
+    newest wording of the same situation), and raise ``severity`` if the
+    repeat is graver — never lower it. Returns ``(alert_id, severity_raised)``
+    on a hit, ``None`` when there is nothing to coalesce into (empty key, or no
+    open row) so the caller inserts a fresh alert.
+
+    Uses the ``idx_alerts_dedup`` index; the newest open match wins if a key
+    was somehow reused.
+    """
+    from openexecutive.alerts.models import SEVERITY_RANK
+
+    if not dedup_key or not _resolve_db_path(db_path).exists():
+        return None
+    with _get_conn(db_path) as conn:
+        # Take the write lock up front so two concurrent repeats cannot both
+        # miss the row (read-then-update race) or overwrite each other's body.
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT id, severity FROM alerts "
+            "WHERE source = ? AND dedup_key = ? AND status = 'unread' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (source, dedup_key),
+        ).fetchone()
+        if row is None:
+            return None
+        current_rank = SEVERITY_RANK.get(str(row["severity"]), 0)
+        new_rank = SEVERITY_RANK.get(severity, 0)
+        raised = new_rank > current_rank
+        effective = severity if raised else str(row["severity"])
+        conn.execute(
+            "UPDATE alerts SET last_seen_at = ?, "
+            "occurrence_count = COALESCE(occurrence_count, 1) + 1, "
+            "body = ?, severity = ? WHERE id = ?",
+            (_now(), body, effective, int(row["id"])),
+        )
+    return int(row["id"]), raised
+
+
+def bulk_set_status(
+    status: str,
+    *,
+    alert_ids: list[int] | None = None,
+    before: str | None = None,
+    category: str | None = None,
+    only_status: str | None = "unread",
+    exclude_sources: tuple[str, ...] = (),
+    db_path: Path | None = None,
+) -> list[int]:
+    """Set ``status`` on many alerts at once. Returns the ids updated.
+
+    Selects candidates by explicit ``alert_ids`` and/or ``created_at <
+    before`` (ISO), restricted to ``only_status`` (default ``unread``; pass
+    ``None`` for any) and excluding ``exclude_sources``. ``category``
+    (``"action"`` / ``"monitoring"``) is applied in Python via
+    ``briefing.ranking.categorize`` so the bulk path and ``/today`` agree on
+    what counts as monitoring noise. With neither ``alert_ids`` nor ``before``
+    nothing is touched (a bulk call must always carry a selector).
+    """
+    if alert_ids is None and before is None:
+        return []
+    if not _resolve_db_path(db_path).exists():
+        return []
+    clauses: list[str] = []
+    params: list[object] = []
+    if only_status:
+        clauses.append("status = ?")
+        params.append(only_status)
+    if before is not None:
+        # Same age anchor as the TTL: a situation that keeps re-firing is
+        # not "old" just because its first occurrence was.
+        clauses.append("COALESCE(last_seen_at, created_at) < ?")
+        params.append(before)
+    if alert_ids is not None:
+        if not alert_ids:
+            return []
+        # Bound the IN list well under SQLite's variable limit.
+        alert_ids = list(alert_ids)[:_BULK_MAX_IDS]
+        clauses.append(f"id IN ({','.join('?' * len(alert_ids))})")
+        params.extend(int(i) for i in alert_ids)
+    for src in exclude_sources:
+        clauses.append("source != ?")
+        params.append(src)
+    where = " AND ".join(clauses)
+    with _get_conn(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")  # select + update under one write lock
+        rows = conn.execute(f"SELECT * FROM alerts WHERE {where}", params).fetchall()
+        targets = [_row_to_alert(r) for r in rows]
+        if category:
+            from openexecutive.briefing.ranking import categorize
+
+            targets = [
+                a for a in targets
+                if categorize(
+                    source=a.source, severity=a.severity,
+                    routed_to_person_id=a.routed_to_person_id,
+                    topic_tags=a.topic_tags or [],
+                ) == category
+            ]
+        ids = [a.id for a in targets if a.id is not None][:_BULK_MAX_IDS]
+        if not ids:
+            return []
+        status_guard = " AND status = ?" if only_status else ""
+        guard_params: list[object] = [only_status] if only_status else []
+        conn.execute(
+            f"UPDATE alerts SET status = ? WHERE id IN ({','.join('?' * len(ids))}){status_guard}",
+            (status, *ids, *guard_params),
+        )
+        return ids
+
+
+def update_alert_content(
+    alert_id: int,
+    *,
+    headline: str | None = None,
+    body: str | None = None,
+    severity: str | None = None,
+    db_path: Path | None = None,
+) -> bool:
+    """Rewrite headline / body / severity in place (a ``changed`` verdict)."""
+    sets: list[str] = []
+    params: list[object] = []
+    if headline is not None:
+        sets.append("headline = ?")
+        params.append(headline[:200])
+    if body is not None:
+        sets.append("body = ?")
+        params.append(body)
+    if severity is not None:
+        sets.append("severity = ?")
+        params.append(severity)
+    if not sets or not _resolve_db_path(db_path).exists():
+        return False
+    params.append(alert_id)
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE alerts SET {', '.join(sets)} WHERE id = ?", params
+        )
+        return cursor.rowcount > 0
+
+
+def set_review(
+    alert_id: int,
+    *,
+    verdict: str,
+    note: str = "",
+    recommended_move: str = "",
+    why_now: str = "",
+    due_at: str | None = None,
+    reviewed_at: str | None = None,
+    suggested_workflow: str = "",
+    db_path: Path | None = None,
+) -> bool:
+    """Stamp the Executive's latest review verdict on an alert."""
+    if not _resolve_db_path(db_path).exists():
+        return False
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE alerts SET last_reviewed_at = ?, review_verdict = ?, "
+            "review_note = ?, recommended_move = ?, why_now = ?, due_at = ?, "
+            "suggested_workflow = ? WHERE id = ?",
+            (
+                reviewed_at or _now(), verdict[:32], note[:400],
+                recommended_move[:32], why_now[:160], due_at,
+                suggested_workflow[:64], alert_id,
+            ),
+        )
+        return cursor.rowcount > 0
+
+
+def update_alert_routing(
+    alert_id: int, person_id: int | None, db_path: Path | None = None
+) -> bool:
+    """Assign (or clear) the person an alert is routed to."""
+    if not _resolve_db_path(db_path).exists():
+        return False
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE alerts SET routed_to_person_id = ? WHERE id = ?",
+            (person_id, alert_id),
+        )
+        return cursor.rowcount > 0
+
+
+def mark_superseded(
+    alert_id: int, by_alert_id: int, db_path: Path | None = None
+) -> bool:
+    """Fold ``alert_id`` into ``by_alert_id``: the merged row is dismissed and
+    points at the survivor, whose ``occurrence_count`` absorbs it."""
+    if alert_id == by_alert_id or not _resolve_db_path(db_path).exists():
+        return False
+    with _get_conn(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        survivor = conn.execute(
+            "SELECT 1 FROM alerts WHERE id = ?", (by_alert_id,)
+        ).fetchone()
+        if survivor is None:
+            return False
+        merged = conn.execute(
+            "SELECT occurrence_count FROM alerts WHERE id = ? AND status = 'unread'",
+            (alert_id,),
+        ).fetchone()
+        if merged is None:
+            return False
+        absorbed = int(merged["occurrence_count"] or 1)
+        conn.execute(
+            "UPDATE alerts SET superseded_by_alert_id = ?, status = 'dismissed' "
+            "WHERE id = ? AND status = 'unread'",
+            (by_alert_id, alert_id),
+        )
+        conn.execute(
+            "UPDATE alerts SET occurrence_count = COALESCE(occurrence_count, 1) + ?, "
+            "last_seen_at = ? WHERE id = ?",
+            (absorbed, _now(), by_alert_id),
+        )
+        return True
+
+
+def count_superseded_by(db_path: Path | None = None) -> dict[int, int]:
+    """``{survivor_id: number of rows folded into it}`` in one query."""
+    if not _resolve_db_path(db_path).exists():
+        return {}
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT superseded_by_alert_id AS sid, COUNT(*) AS n FROM alerts "
+            "WHERE superseded_by_alert_id IS NOT NULL GROUP BY superseded_by_alert_id"
+        ).fetchall()
+    return {int(r["sid"]): int(r["n"]) for r in rows}
+
+
+def reopen_alert(
+    alert_id: int, db_path: Path | None = None, *, exclude_sources: tuple[str, ...] = ()
+) -> bool:
+    """Bring a ``resolved`` / ``expired`` / ``dismissed`` alert back to ``unread``.
+
+    The Undo for every autonomous close. Clears the review stamps (verdict,
+    note, move, why-now, deadline, last_reviewed_at) and any supersede link
+    so the row is judged afresh on the very next pass, stamps `last_seen_at`
+    = now so a row older than its TTL is live again rather than re-expired
+    on the next sweep, and hands back the occurrence count a merge had
+    folded into the survivor. Returns
+    False when the row is missing, already ``unread``, ``ack``'d (approved
+    and executed — not an Undo target) or from an excluded source
+    (artifacts / decision-backed alerts have their own lifecycle).
+    """
+    if not _resolve_db_path(db_path).exists():
+        return False
+    clauses = [f"status IN ({','.join('?' * len(_REOPENABLE_STATUSES))})"]
+    params: list[object] = [*_REOPENABLE_STATUSES]
+    for src in exclude_sources:
+        clauses.append("source != ?")
+        params.append(src)
+    with _get_conn(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            f"SELECT superseded_by_alert_id, occurrence_count FROM alerts "
+            f"WHERE id = ? AND {' AND '.join(clauses)}",
+            (alert_id, *params),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["superseded_by_alert_id"] is not None:
+            conn.execute(
+                "UPDATE alerts SET occurrence_count = MAX(1, COALESCE(occurrence_count, 1) - ?) "
+                "WHERE id = ?",
+                (int(row["occurrence_count"] or 1), int(row["superseded_by_alert_id"])),
+            )
+        conn.execute(
+            "UPDATE alerts SET status = 'unread', review_verdict = '', "
+            "review_note = '', recommended_move = '', why_now = '', due_at = NULL, "
+            "last_reviewed_at = NULL, superseded_by_alert_id = NULL, "
+            "snoozed_until = NULL, suggested_workflow = '', last_seen_at = ? WHERE id = ?",
+            (_now(), alert_id),
+        )
+        return True
 
 
 def get_alert_by_external(

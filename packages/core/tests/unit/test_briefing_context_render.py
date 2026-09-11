@@ -1,0 +1,82 @@
+"""render_briefing_context / _render_eod_context: the since-bounded delta view."""
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+from openexecutive.briefing.narrative import render_briefing_context
+from openexecutive.workflows.end_of_day_digest import _render_eod_context
+
+
+def _proposal(alert_id: int, *, hours_ago: float, **extra: object) -> dict:
+    return {
+        "alert_id": alert_id,
+        "headline": f"item {alert_id}",
+        "created_at": (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat(),
+        "category": "action",
+        **extra,
+    }
+
+
+def _today() -> dict:
+    return {
+        "departments": [{"title": "Sales", "slug": "sales", "at_risk_count": 1, "off_track_count": 0, "awaiting_count": 0}],
+        "proposals": [
+            _proposal(1, hours_ago=2, why_now="SLA ends today", recommended_move="nudge"),
+            _proposal(2, hours_ago=60, review_verdict="likely_stale"),
+            _proposal(3, hours_ago=90),
+        ],
+        "people": [{"full_name": "Dana", "role": "CFO", "awaiting_count": 1, "soonest_sla_at": "x"}],
+        "talent": [],
+    }
+
+
+def test_render_context_without_since_is_the_legacy_single_list() -> None:
+    text = render_briefing_context(period_label="2026-09-11", today_data=_today(), activity=[])
+    assert "PROPOSALS AWAITING DECISION:" in text
+    assert "- item 1" in text and "- item 2" in text and "- item 3" in text
+    assert "NEW SINCE LAST BRIEF" not in text
+    assert "CARRIED OVER" not in text
+    assert "HANDLED OVERNIGHT" not in text
+
+
+def test_render_context_splits_new_vs_carried_and_lists_handled() -> None:
+    since = datetime.now(UTC) - timedelta(hours=24)
+    handled = [{"kind": "routed", "summary": "Routed 'Acme renewal' to Dana", "at": "2026-09-11T07:00:00+00:00"}]
+    text = render_briefing_context(
+        period_label="2026-09-11", today_data=_today(), activity=[], since=since, handled=handled,
+    )
+    assert "NEEDS YOU — NEW SINCE LAST BRIEF:" in text
+    assert "- item 1 (why now: SLA ends today) [next move: nudge]" in text
+    assert "- item 2" not in text and "- item 3" not in text
+    assert "CARRIED OVER: 2 older item(s) still open (oldest 3d, 1 flagged likely stale) — see /today" in text
+    assert "HANDLED OVERNIGHT BY THE EXECUTIVE" in text
+    assert "routed: Routed 'Acme renewal' to Dana" in text
+    assert "PROPOSALS AWAITING DECISION:" not in text
+    # Sections that are unchanged by the window still render.
+    assert "DEPARTMENTS WITH RISK:" in text
+    assert "PEOPLE WAITING ON YOU:" in text
+
+
+def test_render_context_with_since_and_nothing_new_still_reports_carried() -> None:
+    since = datetime.now(UTC) - timedelta(hours=1)
+    today = {"departments": [], "proposals": [_proposal(7, hours_ago=50)], "people": []}
+    text = render_briefing_context(period_label="p", today_data=today, activity=[], since=since)
+    assert "NEW SINCE LAST BRIEF" not in text
+    assert "CARRIED OVER: 1 older item(s) still open (oldest 2d) — see /today" in text
+
+
+def test_eod_context_splits_and_lists_handled() -> None:
+    since = datetime.now(UTC) - timedelta(hours=24)
+    handled = [{"kind": "closed", "summary": "Resolved 'Stripe incident'", "at": "2026-09-11T12:00:00+00:00"}]
+    text = _render_eod_context(
+        period_label="2026-09-11", today_data=_today(), activity=[
+            {"kind": "dm_sent", "summary": "DM'd Dana", "at": "2026-09-11T10:00:00+00:00"}
+        ], since=since, handled=handled,
+    )
+    assert "WHAT OE DID TODAY" in text
+    assert "ALERTS I HANDLED TODAY" in text and "closed: Resolved 'Stripe incident'" in text
+    assert "STILL AWAITING DECISION — NEW SINCE LAST BRIEF:" in text
+    assert "- item 1" in text and "- item 3" not in text
+    assert "CARRIED OVER: 2 older item(s)" in text
+    legacy = _render_eod_context(period_label="p", today_data=_today(), activity=[])
+    assert "STILL AWAITING DECISION:" in legacy and "CARRIED OVER" not in legacy

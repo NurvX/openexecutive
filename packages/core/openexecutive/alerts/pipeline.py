@@ -27,6 +27,34 @@ _recent_event_ts: deque[float] = deque(maxlen=_RATE_LIMIT_PER_MIN)
 _rate_lock = threading.Lock()
 
 
+# Severities that justify re-dispatching a coalesced alert (a repeat that
+# escalated the open situation into "look now" territory).
+_REDISPATCH_SEVERITIES = frozenset({"high", "urgent"})
+
+
+def _person_id_from_event(event: AlertEvent) -> int | None:
+    """Routing target: ONLY the explicit ``routed_to_person_id`` field.
+
+    ``event.user`` is deliberately not parsed: integrations fill it with a
+    sender's self-chosen display name (Telegram, Google Chat), so a
+    ``person:<id>`` there would let an outsider pick the routing target.
+    The create_alert tool sets the explicit field itself.
+    """
+    return event.routed_to_person_id
+
+
+def _with_department_tag(tags: list[str], channel: str | None) -> list[str]:
+    """Carry a ``department:<slug>`` routing hint into the row's tags."""
+    chan = (channel or "").strip()
+    if not chan.startswith("department:"):
+        return list(tags)
+    slug = chan.split(":", 1)[1].strip().lower()
+    if not slug:
+        return list(tags)
+    tag = f"department:{slug}"
+    return list(tags) if tag in tags else [*tags, tag]
+
+
 def _rate_limited() -> bool:
     """Returns True when the per-minute cap has been hit."""
     now = time.monotonic()
@@ -116,6 +144,53 @@ async def evaluate_and_dispatch(
         decision.channels, decision.severity, prefs
     )
 
+    # A producer that knows the stable identity of the situation (a watch
+    # slug) wins over the model's free-text key.
+    dedup_key = event.dedup_hint or decision.dedup_key
+    topic_tags = _with_department_tag(decision.topic_tags, event.channel)
+    routed_to = _person_id_from_event(event)
+
+    # A replay of the SAME upstream event (webhook retry, re-poll) is a
+    # no-op, exactly as before: the (source, external_id) row already exists.
+    if event.external_id and store.get_alert_by_external(
+        event.source, event.external_id, db_path=path
+    ) is not None:
+        logger.info(
+            "alerts.pipeline duplicate suppressed source=%s ext_id=%s",
+            event.source, event.external_id,
+        )
+        return decision, None
+
+    # Coalesce a repeat of an open alert into the existing row instead of
+    # stacking another card — and stay quiet unless the repeat is graver
+    # (a 2% move followed by a 10% crash must still ping).
+    coalesced = store.coalesce_alert(
+        source=event.source,
+        dedup_key=dedup_key,
+        severity=decision.severity.value,
+        body=decision.body,
+        db_path=path,
+    )
+    if coalesced is not None:
+        existing_id, raised = coalesced
+        logger.info(
+            "alerts.pipeline coalesced source=%s ext_id=%s into alert=%d raised=%s",
+            event.source, event.external_id, existing_id, raised,
+        )
+        if not (raised and decision.severity.value in _REDISPATCH_SEVERITIES):
+            return decision, None
+        alert = store.get_alert(existing_id, db_path=path)
+        if alert is None:
+            return decision, None
+        await dispatcher.dispatch_all(
+            alert,
+            effective_channels,
+            db_path=path,
+            department_slug=decision.department_slug,
+            broadcast_integration=decision.broadcast_integration,
+        )
+        return decision, existing_id
+
     alert_id = store.insert_alert(
         source=event.source,
         external_id=event.external_id,
@@ -123,8 +198,9 @@ async def evaluate_and_dispatch(
         headline=decision.headline or (event.subject or event.title or event.source),
         body=decision.body,
         suggested_action=decision.suggested_action,
-        topic_tags=decision.topic_tags,
-        dedup_key=decision.dedup_key,
+        topic_tags=topic_tags,
+        dedup_key=dedup_key,
+        routed_to_person_id=routed_to,
         db_path=path,
     )
     if alert_id is None:

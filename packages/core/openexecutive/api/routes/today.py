@@ -135,6 +135,76 @@ class ProposalItem(BaseModel):
     # the /decisions endpoints (which book/cancel server-side) instead of the
     # ack-and-handoff-to-chat flow. Null for ordinary alert-backed proposals.
     decision_instance_id: int | None = None
+    # Lifecycle signals (alerts/lifecycle.py, alerts/review.py). Coalescing:
+    # how many times this situation re-fired and when it was last seen.
+    occurrence_count: int = 1
+    last_seen_at: str | None = None
+    # The Executive's latest review of this item: verdict ('' | relevant |
+    # changed | likely_stale | drafted | routed | merged; closed rows carry
+    # resolved | stale but never reach this list), a one-line "what changed
+    # since you last looked", the next move the card should lead with, a
+    # short "why now", and a deadline when one exists.
+    last_reviewed_at: str | None = None
+    review_verdict: str = ""
+    review_note: str = ""
+    recommended_move: str = ""
+    why_now: str = ""
+    due_at: str | None = None
+    # Rows the review folded into this one (merge).
+    superseded_count: int = 0
+    # Registry workflow the review suggested as the next step ('' = none).
+    suggested_workflow: str = ""
+
+
+def _handled_overnight(now: datetime) -> list[HandledItem]:
+    """What the alert review did since the last delivered morning brief."""
+    try:
+        from openexecutive.briefing import brief_state
+
+        since = brief_state.since_for("principal_brief_morning", now=now)
+        items: list[HandledItem] = []
+        for h in brief_state.handled_since(since, limit=20):
+            raw_id = h.get("alert_id")
+            try:
+                alert_id = int(raw_id) if raw_id is not None else None
+            except (TypeError, ValueError):
+                alert_id = None
+            items.append(HandledItem(
+                kind=str(h["kind"]), summary=str(h["summary"]), at=str(h["at"]), alert_id=alert_id,
+            ))
+        return items
+    except Exception:
+        logger.debug("today: handled_overnight unavailable", exc_info=True)
+        return []
+
+
+def _watch_trust_by_slug(alerts: list[Any]) -> dict[str, float]:
+    """``{watch slug: trust_score}`` for every watch referenced by ``alerts``.
+
+    One lookup per distinct slug so ranking can discount watches the
+    principal keeps dismissing. Never raises — a missing monitoring store
+    just yields an empty map (no discount).
+    """
+    from openexecutive.briefing.ranking import watch_slug_from_tags
+
+    slugs = {
+        slug for a in alerts
+        if (slug := watch_slug_from_tags(list(getattr(a, "topic_tags", []) or []))) is not None
+    }
+    if not slugs:
+        return {}
+    try:
+        from openexecutive.monitoring import store as monitoring_store
+
+        out: dict[str, float] = {}
+        for slug in slugs:
+            item = monitoring_store.get_watchlist_item_by_slug(slug)
+            if item is not None:
+                out[slug] = float(getattr(item, "trust_score", 1.0))
+        return out
+    except Exception:
+        logger.debug("today: watch trust lookup failed", exc_info=True)
+        return {}
 
 
 def _parse_decision_instance_id(topic_tags: list[str]) -> int | None:
@@ -190,6 +260,15 @@ class AwaitingItem(BaseModel):
     overdue: bool
 
 
+class HandledItem(BaseModel):
+    kind: str
+    summary: str
+    at: str
+    # The alert the move touched, when known — lets the UI offer Undo
+    # (POST /alerts/{id}/reopen) right next to the "handled" row.
+    alert_id: int | None = None
+
+
 class TodayResponse(BaseModel):
     departments: list[DepartmentBriefItem]
     people: list[PersonBriefItem]
@@ -220,6 +299,10 @@ class TodayResponse(BaseModel):
     # could be resolved (unrostered signed-in user, or a CLI hit with
     # no header). See chat._resolve_caller_person_id.
     caller_person_id: int | None = None
+    # Autonomous alert-review moves since the last delivered morning brief
+    # (routed / nudged / escalated / drafted / merged / closed), newest first
+    # — the "Executive handled N overnight" pill. Additive, default empty.
+    handled_overnight: list[HandledItem] = Field(default_factory=list)
 
 
 class ActivityItem(BaseModel):
@@ -347,7 +430,6 @@ def _build_today(
     `_attach_narrative`), so the caller-aware endpoints attach it after
     resolving the viewer from `x-caller-email`.
     """
-    from openexecutive.alerts.store import list_alerts
     from openexecutive.departments.store import list_departments
     from openexecutive.memory.episodic import (
         last_contact_at_by_person,
@@ -501,9 +583,15 @@ def _build_today(
     # Attention-worthy people first; stable name order within a priority band.
     person_items.sort(key=lambda p: (-p.priority, p.full_name))
 
+    from openexecutive.alerts.lifecycle import list_live_alerts
+    from openexecutive.alerts.store import count_superseded_by
     from openexecutive.briefing.ranking import score_and_categorize
 
-    raw_alerts = list_alerts(status="unread", limit=100)
+    # Live = unread AND inside its TTL AND not snoozed — the read-side twin of
+    # the scheduler's expiry sweep, so the page is right before the sweep runs.
+    raw_alerts = list_live_alerts(limit=100, now=now)
+    superseded_counts = count_superseded_by()
+    trust_by_slug = _watch_trust_by_slug(raw_alerts)
     proposal_items = []
     for alert in raw_alerts:
         # Surface every unread alert as a briefing action item, including
@@ -516,7 +604,9 @@ def _build_today(
         #
         # Score + categorize so the UI can lead with genuinely-actionable
         # items and collapse low-signal monitoring noise.
-        item_score, item_category, item_reason = score_and_categorize(alert)
+        item_score, item_category, item_reason = score_and_categorize(
+            alert, trust_by_slug=trust_by_slug, now=now
+        )
         proposal_items.append(ProposalItem(
             alert_id=alert.id or 0,
             headline=alert.headline,
@@ -529,6 +619,16 @@ def _build_today(
             category=item_category,
             surfaced_reason=item_reason,
             decision_instance_id=_parse_decision_instance_id(alert.topic_tags or []),
+            occurrence_count=alert.occurrence_count,
+            last_seen_at=alert.last_seen_at,
+            last_reviewed_at=alert.last_reviewed_at,
+            review_verdict=alert.review_verdict,
+            review_note=alert.review_note,
+            recommended_move=alert.recommended_move,
+            why_now=alert.why_now,
+            due_at=alert.due_at,
+            superseded_count=superseded_counts.get(alert.id or -1, 0),
+            suggested_workflow=alert.suggested_workflow,
         ))
 
     # Action items first (sharpest by score), monitoring noise after; ties
@@ -544,6 +644,7 @@ def _build_today(
         departments=dept_items,
         people=person_items,
         proposals=proposal_items,
+        handled_overnight=_handled_overnight(now),
     )
 
     # In-flight commitments (pending follow-ups / nudges) + people we're
@@ -716,8 +817,12 @@ def _payload_headline(payload_json: str | None) -> str | None:
     return None
 
 
-def _build_activity(limit: int) -> ActivityResponse:
+def _build_activity(limit: int, since: datetime | None = None) -> ActivityResponse:
     """Aggregate recent self-initiated Executive activity across sources.
+
+    ``since`` bounds the feed to items at/after that instant (the briefs pass
+    the previous delivery time so "what changed" is a real delta); the pool
+    is widened so a busy history cannot starve the window.
 
     Sources, all pulled from the shared SQLite database:
       • scheduled_actions with status='done' — fired follow-ups, nudges,
@@ -749,7 +854,7 @@ def _build_activity(limit: int) -> ActivityResponse:
 
     # Pull a generous pool from each source so the post-merge sort
     # produces a representative top-N; the route clamps `limit` itself.
-    pool = max(limit * 3, 30)
+    pool = max(limit * 3, 30) if since is None else max(limit * 5, 50)
 
     # Resolve channel_ref → person.full_name once per request so the
     # activity rail can say "DM'd Jordan Avery" instead of leaking the
@@ -879,6 +984,11 @@ def _build_activity(limit: int) -> ActivityResponse:
             at=alert.created_at,
         ))
 
+    if since is not None:
+        items = [
+            i for i in items
+            if (at := _parse_aware(i.at)) is not None and at >= since
+        ]
     items.sort(key=lambda i: i.at, reverse=True)
     return ActivityResponse(items=items[:limit])
 

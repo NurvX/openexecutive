@@ -41,6 +41,16 @@ class EndOfDayDigestInput(BaseModel):
         default="",
         description="Human-readable period label (e.g. '2026-05-26'). Auto-filled when blank.",
     )
+    force_full: bool = Field(
+        default=False,
+        description=(
+            "Render the full digest even when nothing changed since the last "
+            "delivered one (bypasses the one-line 'nothing new' suppression)."
+        ),
+    )
+
+
+BRIEF_KIND = "principal_brief_eod"
 
 
 _EOD_DIGEST_SYSTEM = (
@@ -52,8 +62,10 @@ _EOD_DIGEST_SYSTEM = (
     "  1. **What I did today** — actions you took without prompting "
     "(DMs sent, follow-ups scheduled, workflows queued, alerts "
     "flagged). One bullet per item, terse.\n"
-    "  2. **Still pending** — proposals or workflows waiting on someone "
-    "(name the person and what's blocking).\n"
+    "  2. **Still pending** — ONLY the NEW items listed under NEW SINCE LAST "
+    "BRIEF (name the person and what's blocking). If the context has a "
+    "CARRIED OVER line, add exactly one sentence ('N older items still "
+    "open — see /today'); never re-list carried items.\n"
     "  3. **At risk tomorrow** — what might trip if no action happens "
     "overnight or first-thing.\n"
     "  4. **Sleep on this** — at most ONE open question worth the "
@@ -68,6 +80,8 @@ def _render_eod_context(
     period_label: str,
     today_data: dict[str, Any],
     activity: list[dict[str, Any]],
+    since: datetime | None = None,
+    handled: list[dict[str, Any]] | None = None,
 ) -> str:
     """Pack /today + activity into the user-turn block.
 
@@ -86,12 +100,45 @@ def _render_eod_context(
             )
         parts.append("")
 
-    proposals = today_data.get("proposals", [])
-    if proposals:
-        parts.append("STILL AWAITING DECISION:")
-        for p in proposals[:10]:
-            parts.append(f"- {p.get('headline', '')[:160]}")
+    if handled:
+        parts.append("ALERTS I HANDLED TODAY (already done — report, don't ask):")
+        for h in handled[:15]:
+            parts.append(
+                f"- [{str(h.get('at', ''))[:10]}] {h.get('kind', '')}: "
+                f"{str(h.get('summary', ''))[:140]}"
+            )
         parts.append("")
+
+    proposals = today_data.get("proposals", [])
+    if since is None:
+        if proposals:
+            parts.append("STILL AWAITING DECISION:")
+            for p in proposals[:10]:
+                parts.append(f"- {p.get('headline', '')[:160]}")
+            parts.append("")
+    else:
+        from openexecutive.alerts.lifecycle import parse_aware
+        from openexecutive.briefing.brief_state import split_proposals
+
+        new_items, carried = split_proposals(proposals, since)
+        if new_items:
+            parts.append("STILL AWAITING DECISION — NEW SINCE LAST BRIEF:")
+            for p in new_items[:10]:
+                parts.append(f"- {p.get('headline', '')[:160]}")
+            parts.append("")
+        if carried:
+            now = datetime.now(UTC)
+            ages = [
+                (now - dt).days
+                for p in carried
+                if (dt := parse_aware(p.get("created_at"))) is not None
+            ]
+            stale = sum(1 for p in carried if p.get("review_verdict") == "likely_stale")
+            line = f"CARRIED OVER: {len(carried)} older item(s) still open (oldest {max(ages) if ages else 0}d"
+            if stale:
+                line += f", {stale} flagged likely stale"
+            parts.append(line + ") — see /today")
+            parts.append("")
 
     depts = today_data.get("departments", [])
     at_risk = [d for d in depts if d.get("at_risk_count", 0) or d.get("off_track_count", 0)]
@@ -165,20 +212,43 @@ class EndOfDayDigestWorkflow(Workflow):
         )
 
         from openexecutive.api.routes import today as today_route
+        from openexecutive.briefing import brief_state
+
+        # A recap since the last DELIVERED digest (24 h on a cold store,
+        # clamped to 7 d) — same window rule as the morning brief.
+        since = brief_state.since_for(BRIEF_KIND)
 
         try:
             today_response = today_route._build_today()
             today_data = today_response.model_dump()
+            # Same exclusion as the morning brief: monitoring noise is not
+            # "still pending" — it lives in the Monitoring lane on /today.
+            today_data["proposals"] = [
+                p for p in today_data["proposals"]
+                if p.get("category", "action") == "action"
+            ]
         except Exception:
             logger.exception("eod_digest: /today aggregation failed")
             today_data = {"departments": [], "people": [], "proposals": []}
 
         try:
-            activity_response = today_route._build_activity(limit=30)
+            activity_response = today_route._build_activity(30, since=since)
             activity = [item.model_dump() for item in activity_response.items]
         except Exception:
             logger.exception("eod_digest: /today/activity aggregation failed")
             activity = []
+
+        handled = brief_state.handled_since(since)
+        fingerprint = brief_state.build_brief_fingerprint(
+            today_data=today_data, activity=activity, handled=handled, since=since,
+        )
+        previous = brief_state.last_delivered(BRIEF_KIND)
+        suppressed = (
+            brief_state.suppress_unchanged_enabled()
+            and not inputs.force_full
+            and previous is not None
+            and previous.input_hash == fingerprint
+        )
 
         yield WorkflowEvent(
             type="step_done",
@@ -186,9 +256,28 @@ class EndOfDayDigestWorkflow(Workflow):
             summary=(
                 f"activity={len(activity)} "
                 f"proposals={len(today_data['proposals'])} "
-                f"depts={len(today_data['departments'])}"
+                f"depts={len(today_data['departments'])} handled={len(handled)}"
             ),
         )
+        yield WorkflowEvent(
+            type="result",
+            data={
+                "brief_fingerprint": fingerprint,
+                "suppressed": suppressed,
+                "since": since.isoformat(),
+            },
+        )
+
+        if suppressed:
+            artifact_text = brief_state.suppressed_line(len(today_data["proposals"]))
+            yield WorkflowEvent(
+                type="step_done",
+                step_id="synthesize",
+                summary="unchanged since last digest — one-liner, no model call",
+            )
+            yield WorkflowEvent(type="artifact", content=artifact_text)
+            yield WorkflowEvent(type="done")
+            return
 
         yield WorkflowEvent(
             type="step_start",
@@ -200,7 +289,8 @@ class EndOfDayDigestWorkflow(Workflow):
         from openexecutive.providers import get_provider
 
         user_content = _render_eod_context(
-            period_label=period, today_data=today_data, activity=activity
+            period_label=period, today_data=today_data, activity=activity,
+            since=since, handled=handled,
         )
 
         try:
@@ -234,4 +324,4 @@ class EndOfDayDigestWorkflow(Workflow):
         return {"period_label": ""}
 
 
-__all__ = ["EndOfDayDigestWorkflow", "EndOfDayDigestInput"]
+__all__ = ["BRIEF_KIND", "EndOfDayDigestWorkflow", "EndOfDayDigestInput"]

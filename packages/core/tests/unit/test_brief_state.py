@@ -1,0 +1,134 @@
+"""Delivered-brief state: window, new-vs-carried split, fingerprint, handled."""
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from openexecutive.briefing import brief_state, narrative_cache
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(narrative_cache, "DB_PATH", tmp_path / "cache.db")
+
+
+def _proposal(alert_id: int, *, hours_ago: float, **extra: object) -> dict:
+    return {
+        "alert_id": alert_id,
+        "headline": f"item {alert_id}",
+        "created_at": (datetime.now(UTC) - timedelta(hours=hours_ago)).isoformat(),
+        **extra,
+    }
+
+
+def test_since_for_defaults_to_24h_then_last_delivery() -> None:
+    now = datetime.now(UTC)
+    cold = brief_state.since_for("principal_brief_morning", now=now)
+    assert abs((now - cold) - timedelta(hours=24)) < timedelta(seconds=5)
+
+    brief_state.record_delivered("principal_brief_morning", "fp1", "text")
+    warm = brief_state.since_for("principal_brief_morning", now=now + timedelta(hours=3))
+    assert now - timedelta(seconds=5) <= warm <= now + timedelta(seconds=5)
+
+    # A delivery stamped AFTER `now` (clock skew) never yields a future window.
+    skewed = brief_state.since_for("principal_brief_morning", now=now - timedelta(hours=1))
+    assert skewed <= now - timedelta(hours=1)
+
+    # A delivery older than a week is clamped to 7 days back.
+    narrative_cache.put(narrative_cache.BriefingNarrative(
+        scope=brief_state.scope_for("principal_brief_eod"), input_hash="x",
+        narrative_text="t", generated_at=(now - timedelta(days=30)).isoformat(),
+    ))
+    clamped = brief_state.since_for("principal_brief_eod", now=now)
+    assert abs((now - clamped) - timedelta(days=7)) < timedelta(seconds=5)
+
+
+def test_record_and_last_delivered_roundtrip_per_kind() -> None:
+    assert brief_state.last_delivered("principal_brief_morning") is None
+    brief_state.record_delivered("principal_brief_morning", "fp-m", "morning text")
+    brief_state.record_delivered("principal_brief_eod", "fp-e", "eod text")
+    m = brief_state.last_delivered("principal_brief_morning")
+    e = brief_state.last_delivered("principal_brief_eod")
+    assert m is not None and m.input_hash == "fp-m" and m.narrative_text == "morning text"
+    assert e is not None and e.input_hash == "fp-e"
+    # The per-viewer header cache is untouched by the brief namespace.
+    assert narrative_cache.get("principal") is None
+
+
+def test_split_proposals_by_window() -> None:
+    since = datetime.now(UTC) - timedelta(hours=12)
+    new, carried = brief_state.split_proposals(
+        [_proposal(1, hours_ago=1), _proposal(2, hours_ago=30), {"alert_id": 3}], since
+    )
+    assert [p["alert_id"] for p in new] == [1, 3]  # unknown created_at counts as new
+    assert [p["alert_id"] for p in carried] == [2]
+    all_new, none = brief_state.split_proposals([_proposal(1, hours_ago=100)], None)
+    assert len(all_new) == 1 and none == []
+
+
+def test_fingerprint_is_order_independent_and_date_free() -> None:
+    since = datetime.now(UTC) - timedelta(hours=12)
+    a = _proposal(1, hours_ago=1)
+    b = _proposal(2, hours_ago=2)
+    old = _proposal(3, hours_ago=40, review_verdict="likely_stale")
+    act1 = {"kind": "dm_sent", "summary": "DM'd Dana", "at": "2026-09-11T08:00:00+00:00"}
+    act2 = {"kind": "decision_logged", "summary": "Chose vendor", "at": "2026-09-11T09:00:00+00:00"}
+    handled = [{"kind": "routed", "summary": "Routed X to Dana", "at": "2026-09-11T07:00:00+00:00"}]
+    depts = [{"slug": "sales", "at_risk_count": 1, "off_track_count": 0}]
+    people = [{"id": 5, "awaiting_count": 2}, {"id": 6, "awaiting_count": 0}]
+
+    fp1 = brief_state.build_brief_fingerprint(
+        today_data={"proposals": [a, b, old], "departments": depts, "people": people},
+        activity=[act1, act2], handled=handled, since=since,
+    )
+    fp2 = brief_state.build_brief_fingerprint(
+        today_data={"proposals": [old, b, a], "departments": depts, "people": list(reversed(people))},
+        activity=[act2, act1], handled=handled, since=since,
+    )
+    assert fp1 == fp2
+    # Same activity a day later (different stamps) → same fingerprint: the
+    # suppression must be able to fire on a day whose activity is unchanged.
+    later = [{**act1, "at": "2026-09-12T08:00:00+00:00"}, {**act2, "at": "2026-09-12T09:00:00+00:00"}]
+    fp_later = brief_state.build_brief_fingerprint(
+        today_data={"proposals": [a, b, old], "departments": depts, "people": people},
+        activity=later, handled=handled, since=since,
+    )
+    assert fp_later == fp1
+    # A new proposal, a resolved carried item, or a new handled move changes it.
+    fp3 = brief_state.build_brief_fingerprint(
+        today_data={"proposals": [a, b, old, _proposal(9, hours_ago=0.5)], "departments": depts, "people": people},
+        activity=[act1, act2], handled=handled, since=since,
+    )
+    fp4 = brief_state.build_brief_fingerprint(
+        today_data={"proposals": [a, b], "departments": depts, "people": people},
+        activity=[act1, act2], handled=handled, since=since,
+    )
+    fp5 = brief_state.build_brief_fingerprint(
+        today_data={"proposals": [a, b, old], "departments": depts, "people": people},
+        activity=[act1, act2], handled=[], since=since,
+    )
+    assert len({fp1, fp3, fp4, fp5}) == 4
+
+
+def test_suppressed_line_pluralises() -> None:
+    assert brief_state.suppressed_line(1).endswith("1 item still waiting on you.")
+    assert brief_state.suppressed_line(12).endswith("12 items still waiting on you.")
+
+
+def test_handled_since_reads_review_audit_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.audit import logger as audit_logger
+
+    al = audit_logger.AuditLogger(db_path=tmp_path / "audit.db")
+    al.initialize_db()
+    monkeypatch.setattr(audit_logger, "get_audit_logger", lambda: al)
+    al.log("alert_review_routed", "Routed 'Acme renewal' to Dana", actor="executive")
+    al.log("alert_review_closed", "Resolved 'Stripe incident' — vendor marked resolved", actor="executive")
+    al.log("tool_invocation", "unrelated", actor="executive")
+
+    handled = brief_state.handled_since(datetime.now(UTC) - timedelta(hours=1))
+    kinds = sorted(h["kind"] for h in handled)
+    assert kinds == ["closed", "routed"]
+    assert all(h["summary"] and h["at"] for h in handled)
+    assert brief_state.handled_since(datetime.now(UTC) + timedelta(hours=1)) == []
