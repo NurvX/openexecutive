@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `docker/docker-compose.yml` now binds the API to `127.0.0.1:8000` instead of
+  every host interface. The UI reaches the API over the compose network, so
+  nothing in the stack needed the public port. If you were calling `:8000`
+  directly from another host, put a reverse proxy in front of it and set
+  `BACKEND_SHARED_SECRET` and `OE_PUBLIC_DEPLOYMENT=1`.
+
 ## [0.1.0] - 2026-06-30
 
 Initial public release.
