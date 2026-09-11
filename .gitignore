@@ -61,10 +61,7 @@ Thumbs.db
 # IDE — track only the shared editor config (tasks, extension picks, repo
 # settings). Personal junk like launch.json profiles stays out.
 .idea/
-.vscode/*
-!.vscode/tasks.json
-!.vscode/extensions.json
-!.vscode/settings.json
+.vscode/
 *.swp
 *.swo
 
@@ -89,4 +86,3 @@ scripts/setup-flyctl.sh
 scripts/seed-google-workspace.sh
 .github/workflows/deploy.yml
 .github/workflows/deploy-qa.yml
-.vscode/

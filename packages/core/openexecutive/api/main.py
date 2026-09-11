@@ -464,7 +464,7 @@ def _is_public_deployment() -> bool:
     hosting provider's injected variables, so the check works identically on
     every platform (and in plain Docker). See docs/deployment.md.
     """
-    return os.environ.get("OE_PUBLIC_DEPLOYMENT", "").strip().lower() in _FALSEY_ENV
+    return os.environ.get("OE_PUBLIC_DEPLOYMENT", "").strip().lower() not in _FALSEY_ENV
 
 
 def create_app() -> FastAPI:

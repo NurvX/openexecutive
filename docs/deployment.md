@@ -33,7 +33,14 @@ containers. The UI is stateless and scales freely.
 
 The UI never talks to the API directly from the browser. It proxies through its
 own server (`/api/backend/*`), stamping the shared secret on each upstream call,
-so only the UI origin needs to be public. See [auth.md](auth.md).
+so the UI origin is the only one that *needs* to be public. See [auth.md](auth.md).
+
+> **The compose file binds the API to `127.0.0.1` on purpose.** The UI reaches it
+> over the compose network, so nothing needs it on `0.0.0.0`. If you change that
+> binding or put the API behind a proxy on its own hostname, you have made it
+> internet-reachable — set `BACKEND_SHARED_SECRET` **and** `OE_PUBLIC_DEPLOYMENT=1`
+> before you do. Neither is set by default, and without them the API serves every
+> route unauthenticated with only a log line to say so.
 
 ---
 
