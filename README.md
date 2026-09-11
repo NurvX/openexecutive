@@ -90,11 +90,8 @@ openexecutive/
 │   └── ui/                       # Next.js 15 web UI
 ├── evals/                        # Eval scenarios + LLM-as-judge runner
 ├── fixtures/                     # Demo company fixtures (profiles, docs, rosters)
-├── scripts/                      # Operator scripts (Fly secrets, Google auth)
+├── scripts/                      # Operator scripts (Google auth)
 ├── docker/                       # Dockerfile(s) + docker-compose.yml
-├── fly.api.toml / fly.ui.toml    # Fly.io configs — dev API + UI apps
-├── fly.api.qa.toml / fly.ui.qa.toml  # Fly.io configs — QA API + UI apps
-├── fly.honcho.toml               # Fly.io config — Honcho memory app (optional)
 └── docs/                         # Architecture + deployment docs
 ```
 
@@ -160,18 +157,17 @@ Users can DM the bot, `@mention` it in a channel (replies in a thread), or use `
 
 ### Deploying to production
 
-Just set the secrets on the existing API app — no new Fly app required:
+The bot runs inside the existing API process — no extra service. Set these on the API and restart it:
 
-```bash
-flyctl secrets set -a openexec-api-dev \
-  DISCORD_BOT_TOKEN=... \
-  DISCORD_APP_ID=... \
-  DISCORD_GUILD_IDS=...
+```
+DISCORD_BOT_TOKEN=...
+DISCORD_APP_ID=...
+DISCORD_GUILD_IDS=...
 ```
 
 Discord user access is managed via the /people UI — add a Person row with `discord_user_id` set.
 
-The machine restarts and the bot starts on the next lifespan boot. To disable in prod: `flyctl secrets unset -a openexec-api-dev DISCORD_BOT_TOKEN`.
+The bot starts on the next lifespan boot. To disable it, unset `DISCORD_BOT_TOKEN` and restart.
 
 ## Onboarding Your Company
 
@@ -211,65 +207,25 @@ curl -X POST http://localhost:8000/documents \
   -F "domain=strategy"
 ```
 
-## Deployment (Fly.io)
+## Deployment
 
-Two environments, each a separate set of Fly apps, driven by branch:
+Two containers — the FastAPI backend and the Next.js UI — plus one persistent
+volume at `/data`. [docker/docker-compose.yml](docker/docker-compose.yml) is the
+reference topology and also what `make docker` runs locally, so the local and
+deployed shapes match.
 
-| Environment | Trigger | Workflow | Apps |
-|---|---|---|---|
-| **dev** | push/merge to `main` (continuous) | `.github/workflows/deploy.yml` | `openexec-api-dev`, `openexec-ui-dev` |
-| **qa** | push/merge to `qa` (deliberate promotion) | `.github/workflows/deploy-qa.yml` | `openexec-api-qa`, `openexec-ui-qa` |
+> **⚠️ Single-instance only**: the scheduler claims rows via `UPDATE … RETURNING`,
+> which is not safe across processes. A second API replica double-fires every
+> scheduled action. Pin the API to one instance. The UI is stateless.
 
-Both workflows use `dorny/paths-filter` to deploy only the changed app (API, UI, or both). QA is a stable twin of dev — same image and runtime, only the app name differs (`fly.api.qa.toml` / `fly.ui.qa.toml`) — so it lags `main` and stays vetted. An optional Honcho memory app (`fly.honcho.toml`) deploys independently.
-
-### Topology
-
-| App | Purpose | State |
-|-----|---------|-------|
-| `openexec-api-{dev,qa}` | FastAPI + scheduler | Persistent volume `executive_data` at `/data` |
-| `openexec-ui-{dev,qa}` | Next.js 15 | Stateless |
-| `openexec-honcho-dev` | Honcho per-person memory (optional) | Postgres-backed |
-
-> **⚠️ Single-instance only**: The scheduler claims rows via `UPDATE … RETURNING`. Running two API machines would double-fire scheduled actions. `max_machines_running = 1` is set in `fly.api.toml` / `fly.api.qa.toml` — do not override it.
-
-### Required GitHub Actions secrets
-
-Deploys authenticate with per-app Fly deploy tokens stored as repo (or org) Actions secrets. Generate each with `flyctl tokens create deploy -a <app> -x 999999h`:
-
-| Secret | App | Used by |
-|---|---|---|
-| `FLY_API_TOKEN_API` | `openexec-api-dev` | dev |
-| `FLY_API_TOKEN_UI` | `openexec-ui-dev` | dev |
-| `FLY_API_TOKEN_HONCHO` | `openexec-honcho-dev` | dev (honcho job) |
-| `FLY_API_TOKEN_API_QA` | `openexec-api-qa` | qa |
-| `FLY_API_TOKEN_UI_QA` | `openexec-ui-qa` | qa |
-
-Per-app runtime secrets (`ANTHROPIC_API_KEY`, `BACKEND_SHARED_SECRET`, the `AUTH_*` set, integration tokens) are set directly on each Fly app — see `scripts/fly-secrets.sh.example`.
-
-### One-time bootstrap (dev)
-
-```bash
-# 1. Create apps and volume
-flyctl apps create openexec-api-dev
-flyctl apps create openexec-ui-dev
-flyctl volumes create executive_data --region iad --size 1 -a openexec-api-dev
-
-# 2. Set the required secret
-flyctl secrets set -a openexec-api-dev ANTHROPIC_API_KEY=sk-ant-...
-
-# 3. Create deploy tokens and add as GitHub secrets FLY_API_TOKEN_API and FLY_API_TOKEN_UI
-flyctl tokens create deploy -a openexec-api-dev -x 999999h
-flyctl tokens create deploy -a openexec-ui-dev  -x 999999h
-
-# 4. First deploy
-gh workflow run "Deploy (dev)" -f target=both
-```
-
-QA bootstraps the same way against the `-qa` app names (push to the `qa` branch, or `gh workflow run "Deploy (qa)"`). See [docs/deployment.md](docs/deployment.md) for the full runbook (operations, rollback, common failure modes, why `.flycast` isn't used).
+Set `ANTHROPIC_API_KEY`, `BACKEND_SHARED_SECRET`, `BACKEND_ALLOWED_ORIGINS` and
+`OE_PUBLIC_DEPLOYMENT=1` on any internet-reachable instance. See
+[docs/deployment.md](docs/deployment.md) for the full guide — persistent state,
+health-check timing, resource sizing, operations, and common failure modes.
 
 ### Access control
 
-The deployed UI is gated behind Google sign-in with an email allow-list, and the public API is protected by a shared-secret header between the UI proxy and the FastAPI backend. See [docs/auth.md](docs/auth.md) for the full setup (Google Cloud Console steps, required Fly secrets, adding/removing users, rotating secrets, and a debugging table).
+The deployed UI is gated behind Google sign-in with an email allow-list, and the public API is protected by a shared-secret header between the UI proxy and the FastAPI backend. See [docs/auth.md](docs/auth.md) for the full setup (Google Cloud Console steps, required environment variables, adding/removing users, rotating secrets, and a debugging table).
 
 ## Configuration
 
@@ -421,7 +377,7 @@ pytest packages/core/tests/unit/ -v
 
 ## Privacy
 
-Everything in `company/` is gitignored — the profile YAML, uploaded documents, and the ChromaDB vector store. None of this leaves your local machine (or your own Fly volume in cloud deployments) except as part of prompts sent to the Anthropic API. Anthropic does not train on API data.
+Everything in `company/` is gitignored — the profile YAML, uploaded documents, and the ChromaDB vector store. None of this leaves your local machine (or your own volume in cloud deployments) except as part of prompts sent to the Anthropic API. Anthropic does not train on API data.
 
 ## Contributing
 

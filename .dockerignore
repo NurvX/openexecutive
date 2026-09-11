@@ -1,8 +1,8 @@
-# Build-context excludes for `flyctl deploy` / `docker build` (context root = repo root).
+# Build-context excludes for `docker build` (context root = repo root).
 # Without this, a local deploy uploads the entire working tree (~31GB: .claude
 # worktrees, .venv, node_modules, .next). The Dockerfiles install deps and build
 # fresh, so none of the excluded paths are needed in the image. CI builds from a
-# clean checkout and never hit the bloat, but local `flyctl deploy` does.
+# clean checkout and never hit the bloat, but a local build does.
 #
 # Keep: packages/core/, packages/ui/, fixtures/, knowledge/, docker/ — i.e. only
 # the paths the Dockerfiles COPY. Do NOT add those here.
@@ -24,7 +24,7 @@
 **/node_modules
 packages/ui/.next
 
-# Local runtime data & vector store (live on the Fly volume at runtime)
+# Local runtime data & vector store (live on the data volume at runtime)
 **/*.db
 chroma_db
 **/chroma_db

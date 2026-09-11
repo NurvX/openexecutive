@@ -128,14 +128,19 @@ When your PR materially changes a documented topic, **re-author the affected `pr
 
 Each `prebuilt/<id>.json` has the keys `section_id`, `title`, `markdown`, `mermaid` (a Mermaid string or `null`), and `generated_at`. The Markdown must not include the section heading (the UI renders the title). Validate edits with `python -m json.tool`.
 
-## Live Hosts
+## Local Hosts
 
-- **API** — FastAPI backend, Fly app `openexec-api-dev`: https://openexec-api-dev.fly.dev
+`make dev` serves both:
+
+- **API** — FastAPI backend on http://localhost:8000
   - Sections list + availability: `GET /architecture/sections`
   - Per-section content (static, pre-authored): `GET /architecture/sections/{id}`
-  - SSH for SQLite / log inspection: `flyctl ssh console -a openexec-api-dev`
-- **UI** — Next.js frontend, Fly app `openexec-ui-dev`: https://openexec-ui-dev.fly.dev
-  - Architecture page: https://openexec-ui-dev.fly.dev/architecture
+  - SQLite inspection: `sqlite3 ./episodic_memory.db` (or `$EPISODIC_DB_PATH`)
+- **UI** — Next.js frontend on http://localhost:3000
+  - Architecture page: http://localhost:3000/architecture
+
+Deployment topology and operations live in `docs/deployment.md`. Any host URLs
+and deploy configuration for a specific environment are kept outside this repo.
 
 ## Environment Variables
 
@@ -148,6 +153,12 @@ See `.env.example`. Required: `ANTHROPIC_API_KEY`. Optional integrations: `SLACK
 > instead of their expected status. Run the suite with the var unset —
 > `env -u BACKEND_SHARED_SECRET uv run pytest tests/unit/` — to match CI (CI
 > does not set it).
+
+> **`OE_PUBLIC_DEPLOYMENT` is the same trap, harder:** `api/main.py` runs
+> `app = create_app()` at module level, and with that var set and no
+> `BACKEND_SHARED_SECRET` the guard raises at **import** time — so the failure
+> is a collection error, not a test failure. `tests/conftest.py` pops it
+> defensively; keep it unset in your shell anyway.
 
 > **Ad-hoc scripts:** `get_settings()` requires `EXEC_EMAIL_ADDRESS` (no
 > default), so a one-off `uv run python` snippet needs it exported alongside

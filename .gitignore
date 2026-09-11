@@ -78,3 +78,15 @@ evals/results/
 ~/.claude/anvil/
 *.db
 packages/ui/tsconfig.tsbuildinfo
+
+# Private deployment substrate. These describe one specific hosting setup and
+# are not part of the open-source project. Kept on disk (untracked) so existing
+# environments can still be deployed by hand; see docs/deployment.md for the
+# generic self-host path.
+fly.*.toml
+scripts/fly-secrets.sh.example
+scripts/setup-flyctl.sh
+scripts/seed-google-workspace.sh
+.github/workflows/deploy.yml
+.github/workflows/deploy-qa.yml
+.vscode/

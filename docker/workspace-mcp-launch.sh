@@ -8,7 +8,7 @@
 # See docs/deployment.md → "Google Workspace (co-located in the API)".
 #
 # Two Google-auth modes, selected per install via GWORKSPACE_AUTH_MODE (an env
-# var / Fly secret — no image rebuild to switch):
+# var — no image rebuild to switch):
 #
 #   oauth            (default) Single-user OAuth. The exec account grants consent
 #                    once; the refresh token persists under

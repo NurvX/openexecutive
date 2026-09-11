@@ -36,7 +36,7 @@ A few things worth knowing when assessing or reporting:
 
 - **Secrets** never belong in the repo. Runtime secrets (`ANTHROPIC_API_KEY`,
   `BACKEND_SHARED_SECRET`, `AUTH_*`, integration tokens) are injected via
-  environment variables / Fly secrets and are gitignored locally. If you find a
+  environment variables / platform secrets and are gitignored locally. If you find a
   committed secret, report it privately rather than opening an issue.
 - **Access control.** The deployed UI is gated by Google sign-in with an email
   allow-list, and the API is protected by a shared-secret header between the UI

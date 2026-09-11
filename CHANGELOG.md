@@ -19,7 +19,7 @@ Initial public release.
 - Next.js 15 web UI (`packages/ui`), including the static `/architecture` page.
 - Curated MBA knowledge base (`knowledge/`) and eval suite (`evals/`).
 - Optional integrations: Slack, Discord, and email.
-- Docker and Fly.io deployment configuration.
+- Docker deployment configuration.
 - Open-source project setup: Apache-2.0 license, contribution guide, code of
   conduct, security policy, issue/PR templates, and CI.
 

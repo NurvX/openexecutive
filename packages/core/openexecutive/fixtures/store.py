@@ -10,8 +10,8 @@ duplicate seeding logic.
 Summary fields (industry, stage, arr, …) are denormalized at insert time so
 the ``/fixtures`` list endpoint is a cheap SELECT and never has to parse YAML.
 
-Lives in the same ``episodic_memory.db`` as the rest of the app state (Fly
-volume at ``/data/episodic_memory.db``). Follows the per-module
+Lives in the same ``episodic_memory.db`` as the rest of the app state (the
+data volume, at ``/data/episodic_memory.db`` in a deployment). Follows the per-module
 ``_get_conn()`` + idempotent ``initialize_db()`` convention used across the
 codebase (see ``memory/episodic.py``).
 """

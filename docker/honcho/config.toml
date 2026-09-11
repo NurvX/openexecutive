@@ -2,19 +2,19 @@
 #
 # Env vars override every key in this file (e.g. `DB_CONNECTION_URI=...`
 # wins over `[db].CONNECTION_URI`), so secrets and per-environment values
-# come from Fly secrets at runtime — see docs/honcho-hosting.md.
+# come from environment variables at runtime — see README.md.
 #
 # Provider strategy:
 #   - All LLM calls (deriver, summary, dialectic levels, dream deduction)
 #     use Honcho's `openai` transport but point at OpenRouter. OpenRouter
-#     fronts Anthropic / OpenAI / Voyage / etc., so a single Fly secret
+#     fronts Anthropic / OpenAI / Voyage / etc., so a single secret
 #     (`LLM_OPENAI_API_KEY` = OE's existing OpenRouter key) drives every
 #     outbound LLM call. The `model` field uses OpenRouter slugs
 #     (`anthropic/claude-haiku-4.5`, etc.).
 #   - Embeddings come from a local fastembed sidecar (see
 #     docker/honcho/embed_server.py) — no external embedding vendor.
 #     Quality ladder + the OpenRouter fallback are documented in
-#     docs/honcho-hosting.md ("Embedding quality ladder").
+#     README.md ("Embedding quality ladder").
 
 [app]
 LOG_LEVEL = "INFO"
@@ -25,15 +25,15 @@ LOG_LEVEL = "INFO"
 EMBED_MESSAGES = true
 
 [db]
-# CONNECTION_URI is set per-environment via the DB_CONNECTION_URI Fly
-# secret (Fly Postgres attach injects DATABASE_URL; the runbook covers
+# CONNECTION_URI is set per-environment via the DB_CONNECTION_URI
+# variable (a managed Postgres usually injects DATABASE_URL; the README covers
 # the postgres:// → postgresql+psycopg:// scheme rewrite). Pool sizing
 # tuned for the 1-vCPU shared dev VM.
 POOL_SIZE = 10
 
 [auth]
-# Auth-in-depth: even on Fly's private 6PN network the API requires a
-# valid JWT. JWT_SECRET comes from a Fly secret; OE's HONCHO_API_KEY is
+# Auth-in-depth: even on a private network the API requires a
+# valid JWT. JWT_SECRET comes from the environment; OE's HONCHO_API_KEY is
 # a token derived from it via src.security.create_admin_jwt().
 USE_AUTH = true
 
@@ -95,18 +95,18 @@ base_url  = "https://openrouter.ai/api/v1"
 
 # -------------------------------------------------------------------- #
 # Embeddings — local fastembed sidecar (embed_server.py running as the
-# `embed` Fly process group). The deriver hits it over Fly's internal
+# `embed` process). The deriver hits it over the internal
 # 6PN at `embed.process.<app>.internal:8001/v1`. The base_url is set
 # via the EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL secret (Honcho's
 # nested-pydantic-settings convention — env_prefix=EMBEDDING_,
 # env_nested_delimiter=__), so the deploy can swap to OpenRouter
-# without rebuilding the image. See docs/honcho-hosting.md.
+# without rebuilding the image. See README.md.
 #
 # IMPORTANT: bge-small-en-v1.5 emits 384-dim vectors but Honcho's
 # schema defaults to Vector(1536). The runbook step "Configure vector
 # dimensions" runs `scripts/configure_embeddings.py` to ALTER the
-# column once per deploy that changes the embedding dim. The Fly
-# release_command in fly.honcho.toml runs it on every deploy
+# column once per deploy that changes the embedding dim. Run it as a
+# release step on every deploy
 # (idempotent — no-ops when current dim matches).
 # -------------------------------------------------------------------- #
 [embedding.model_config]
@@ -114,4 +114,4 @@ transport = "openai"
 model     = "BAAI/bge-small-en-v1.5"
 # overrides.base_url + overrides.api_key intentionally omitted —
 # set via EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL and
-# EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY Fly secrets.
+# EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY variables.

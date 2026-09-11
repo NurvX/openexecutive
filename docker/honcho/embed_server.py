@@ -2,19 +2,19 @@
 
 Honcho's deriver makes embedding calls through its `openai` transport. We
 serve `BAAI/bge-small-en-v1.5` locally via fastembed (ONNX, no torch)
-behind this thin shim so embeddings stay inside the Fly private network —
+behind this thin shim so embeddings stay inside the private network —
 no third-party embedding vendor, no per-call cost.
 
-Wire shape: Fly runs this as its own process group (`embed`); the deriver
-process resolves it via `embed.process.openexec-honcho-dev.internal:8001`.
-Honcho's `[embedding.model_config].base_url` points at that DNS.
+Wire shape: this runs as its own process (`embed`) and the deriver reaches it
+over the internal network on port 8001. Honcho's
+`[embedding.model_config].base_url` points at that address.
 
 The endpoint mirrors OpenAI's `/v1/embeddings` shape just enough that the
 `AsyncOpenAI` client Honcho uses (`src/embedding_client.py:175`) gets a
 response it can deserialise. `model` in the request is accepted but
 ignored — we always use the model the container was built with.
 
-Upgrade ladder is documented in `docs/honcho-hosting.md`: swap
+Upgrade ladder is documented in `README.md`: swap
 `EMBED_MODEL` env var to `BAAI/bge-base-en-v1.5` / `bge-large-en-v1.5`
 or flip `EMBEDDING_BASE_URL` on the Honcho app to OpenRouter, no code
 change here.
@@ -82,7 +82,7 @@ class _EmbedResponse(BaseModel):
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    """Liveness probe used by Fly's http_check."""
+    """Liveness probe for the platform health check."""
     return {"status": "ok", "model": EMBED_MODEL}
 
 
