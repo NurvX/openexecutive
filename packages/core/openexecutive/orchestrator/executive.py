@@ -489,6 +489,7 @@ class Executive:
         briefing_context: str = "",
         channel_context_block: str = "",
         page_context_block: str = "",
+        turn_id: str | None = None,
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Stream a response from the Executive, routing to specialists as needed.
 
@@ -557,7 +558,10 @@ class Executive:
         # Bound BEFORE prefetch so the Honcho audit row inherits the
         # turn link (otherwise it lands with session_id=NULL and is
         # invisible in the session-grouped audit view).
-        turn_id = f"t-{uuid.uuid4().hex[:12]}"
+        # A caller-supplied id wins: the SSE route binds the turn at route
+        # level and must agree with us, or one turn splits across two ids.
+        # Every other entry point passes nothing and keeps its own id.
+        turn_id = turn_id or f"t-{uuid.uuid4().hex[:12]}"
 
         t0 = time.monotonic()
         full_response = ""
@@ -659,21 +663,27 @@ class Executive:
             MIN_TURN_CHARS_FOR_EXTRACTION,
             schedule_extraction,
         )
-        if len(full_response) + len(user_message) >= MIN_TURN_CHARS_FOR_EXTRACTION:
-            schedule_extraction(user_message, full_response, session_id=session.session_id)
 
-        # Mirror the completed exchange into Honcho so its server-side
-        # extraction can update the peer card. Fire-and-forget; the
-        # wrapper no-ops when person_id is None or Honcho is disabled.
-        #
         # Re-bind the audit ContextVars for the duration of these calls so
         # the fire-and-forget tasks they schedule can snapshot the right
         # session_id/turn_id (the main `with set_turn(...)` block above
         # exited at the end of the `async for` so the ContextVars are back
-        # to None by now). Without this wrapper, every sync_turn /
-        # sync_department_turn audit row would land with session_id=NULL
-        # and be invisible in the per-session audit view.
+        # to None by now). Without this wrapper, every extraction /
+        # sync_turn / sync_department_turn audit row would land with
+        # session_id=NULL and be invisible in the per-session audit view.
         with set_turn(session_id=session.session_id, turn_id=turn_id):
+            # Inside the wrapper: schedule_extraction snapshots the vars at
+            # call time, so scheduling it out here would snapshot (None,
+            # None) and the memory_extractor's model call would record
+            # unattributed however correct the snapshot itself was.
+            if len(full_response) + len(user_message) >= MIN_TURN_CHARS_FOR_EXTRACTION:
+                schedule_extraction(
+                    user_message, full_response, session_id=session.session_id
+                )
+
+            # Mirror the completed exchange into Honcho so its server-side
+            # extraction can update the peer card. Fire-and-forget; the
+            # wrapper no-ops when person_id is None or Honcho is disabled.
             from openexecutive.memory.honcho_client import sync_turn as _honcho_sync
             _honcho_sync(
                 user_message,
@@ -710,6 +720,7 @@ class Executive:
         briefing_context: str = "",
         channel_context_block: str = "",
         page_context_block: str = "",
+        turn_id: str | None = None,
     ) -> AsyncIterator[str | dict[str, Any]]:
         """Committee-reviewed variant of stream_chat.
 
@@ -764,7 +775,10 @@ class Executive:
         # Generated and bound BEFORE the Honcho prefetch so the peer_memory
         # audit row inherits the turn link (else it lands with
         # session_id=NULL and is invisible in the session-grouped view).
-        turn_id = f"t-{uuid.uuid4().hex[:12]}"
+        # A caller-supplied id wins: the SSE route binds the turn at route
+        # level and must agree with us, or one turn splits across two ids.
+        # Every other entry point passes nothing and keeps its own id.
+        turn_id = turn_id or f"t-{uuid.uuid4().hex[:12]}"
         # Stash on the function frame so the closing audit_log("committee_review")
         # at the end of this function can carry the same turn_id.
         _committee_turn_id = turn_id

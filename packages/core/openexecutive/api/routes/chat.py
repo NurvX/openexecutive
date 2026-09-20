@@ -316,6 +316,21 @@ async def _run_chat_turn(
         timeout_s += settings.committee_extra_timeout_s
 
     async def event_generator():
+        # Bind the turn for the whole SSE body, not just its first step.
+        # `_sse_body` drives the executive with `asyncio.wait_for`, which
+        # wraps every `__anext__()` in a fresh Task that copies the context
+        # at that moment — so a binding made *inside* the executive's own
+        # generator lands in a throwaway per-step context and is gone by the
+        # next resume. Everything after step one (the whole tool-call loop
+        # and the specialist fan-out) then records with no session or turn.
+        # Bound out here, in the generator Starlette itself drives, every
+        # step inherits it. `set_turn` saves and restores rather than using
+        # Token.reset precisely so it survives that task-hopping.
+        with set_turn(session_id=session.session_id, turn_id=turn_id):
+            async for evt in _sse_body():
+                yield evt
+
+    async def _sse_body():
         from openexecutive.memory.session_store import (
             save_message,
             update_session_timestamp,
@@ -346,6 +361,7 @@ async def _run_chat_turn(
                     peer_memory_context=peer_memory_context,
                     briefing_context=briefing_context,
                     page_context_block=page_context_block,
+                    turn_id=turn_id,
                 ).__aiter__()
             else:
                 stream = executive.stream_chat(
@@ -359,6 +375,7 @@ async def _run_chat_turn(
                     peer_memory_context=peer_memory_context,
                     briefing_context=briefing_context,
                     page_context_block=page_context_block,
+                    turn_id=turn_id,
                 ).__aiter__()
 
             # Whole-turn deadline, not per-chunk: a stream that drips bytes
