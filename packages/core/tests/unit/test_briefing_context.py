@@ -99,7 +99,7 @@ def test_excludes_acked_and_dismissed(db: Path) -> None:
 def test_handled_ids_are_not_trusted_for_acking(db: Path) -> None:
     """The handled tail names ids but must not widen the ack surface.
 
-    `ack_alert` accepts only what `rendered_ids` collected; a closed row has
+    `ack_alert` accepts only what `trusted_ids` collected; a closed row has
     nothing to ack, so letting the tail feed the trusted set would hand the
     model reach it was never meant to have.
     """
@@ -116,12 +116,12 @@ def test_handled_ids_are_not_trusted_for_acking(db: Path) -> None:
     assert closed_id is not None
     _set_status(closed_id, "ack", db_path=db)
 
-    rendered: list[int] = []
-    out = format_open_alerts_for_prompt(db_path=db, rendered_ids=rendered)
+    trusted: list[int] = []
+    out = format_open_alerts_for_prompt(db_path=db, trusted_ids=trusted)
 
     assert "Since settled" in out          # named, so the model knows
-    assert rendered == [open_id]           # but never ackable
-    assert closed_id not in rendered
+    assert trusted == [open_id]            # but never ackable
+    assert closed_id not in trusted
 
 
 def test_handled_tail_is_not_starved_by_a_busy_board(db: Path) -> None:
@@ -170,12 +170,12 @@ def test_handled_tail_survives_an_empty_board(db: Path) -> None:
     assert only is not None
     _set_status(only, "dismissed", db_path=db)
 
-    rendered: list[int] = []
-    out = format_open_alerts_for_prompt(db_path=db, rendered_ids=rendered)
+    trusted: list[int] = []
+    out = format_open_alerts_for_prompt(db_path=db, trusted_ids=trusted)
 
     assert "St. Albans reconciliation gap" in out
     assert "Already handled —" in out
-    assert rendered == []
+    assert trusted == []
 
 
 def test_body_is_truncated(db: Path) -> None:
@@ -291,9 +291,9 @@ def test_a_newline_in_any_field_cannot_forge_a_trusted_line(db: Path) -> None:
     assert not any(line.startswith("[17]") for line in body_lines)
 
 
-def test_rendered_ids_reports_exactly_what_the_block_named(db: Path) -> None:
+def test_trusted_ids_reports_the_live_board(db: Path) -> None:
     """The caller records these on the session so ack_alert can refuse an id
-    the model did not get from here — prompt wording is not a control."""
+    the server did not derive — prompt wording is not a control."""
     a = insert_alert(
         source="email", external_id="m1", severity="medium",
         headline="One", body="b", db_path=db,
@@ -304,21 +304,30 @@ def test_rendered_ids_reports_exactly_what_the_block_named(db: Path) -> None:
     )
 
     ids: list[int] = []
-    format_open_alerts_for_prompt(db_path=db, rendered_ids=ids)
+    format_open_alerts_for_prompt(db_path=db, trusted_ids=ids)
 
     assert sorted(ids) == sorted([a, b])
 
 
-def test_rendered_ids_excludes_items_cut_by_the_limit(db: Path) -> None:
-    """An id the model never saw must not become ackable."""
+def test_the_render_limit_cuts_what_is_printed_not_what_is_trusted(db: Path) -> None:
+    """Deliberately the inverse of the contract this test used to assert.
+
+    It previously read "an id the model never saw must not become ackable",
+    which sounds right and was wrong in practice: `/today` renders far more
+    cards than the digest prints, every one is Discuss-able, and refusing the
+    unprinted ones sent the principal back to the page they came from to click
+    Dismiss. The render limit is a token budget, not a trust boundary — the
+    trust boundary is the live board.
+    """
     _seed(db, 7)
 
     ids: list[int] = []
-    out = format_open_alerts_for_prompt(db_path=db, limit=3, rendered_ids=ids)
+    out = format_open_alerts_for_prompt(db_path=db, limit=3, trusted_ids=ids)
 
-    assert len(ids) == 3
-    for alert_id in ids:
-        assert f"[{alert_id}]" in out
+    assert len([line for line in out.split("\n") if line.startswith("[")]) == 3
+    assert len(ids) == 7
+    unprinted = [i for i in ids if f"[{i}]" not in out]
+    assert unprinted, "expected some live ids to be cut from the printed list"
 
 
 @pytest.mark.parametrize(
@@ -377,16 +386,11 @@ def test_trust_covers_live_cards_past_the_render_cap(db: Path) -> None:
     oldest = ids[0]
     assert oldest is not None
 
-    rendered: list[int] = []
     trusted: list[int] = []
-    out = format_open_alerts_for_prompt(
-        db_path=db, rendered_ids=rendered, trusted_ids=trusted
-    )
+    out = format_open_alerts_for_prompt(db_path=db, trusted_ids=trusted)
 
-    assert f"[{oldest}]" not in out          # past the 30-row render cap
-    assert oldest not in rendered
-    assert oldest in trusted                 # but still ackable
-    assert set(rendered) <= set(trusted)
+    assert f"[{oldest}]" not in out   # past the 30-row render cap, so unprinted
+    assert oldest in trusted          # but still ackable
 
 
 def test_render_and_trust_records_the_live_board(
@@ -394,10 +398,16 @@ def test_render_and_trust_records_the_live_board(
 ) -> None:
     from openexecutive.briefing import context as ctx
 
-    open_id = insert_alert(
-        source="email", external_id="o1", severity="high",
-        headline="Needs a decision", body="b", db_path=db,
-    )
+    # Seeded past the digest's render cap on purpose: with only one open alert
+    # this test could not tell "records what it printed" from "records the live
+    # board", and its name claims the latter.
+    open_ids = [
+        insert_alert(
+            source="email", external_id=f"o{i}", severity="high",
+            headline=f"Needs a decision {i}", body="b", db_path=db,
+        )
+        for i in range(40)
+    ]
     closed_id = insert_alert(
         source="email", external_id="c1", severity="high",
         headline="Since settled", body="b", db_path=db,
@@ -408,8 +418,10 @@ def test_render_and_trust_records_the_live_board(
     session = _FakeSession()
     block = ctx.render_and_trust(session, db_path=db)
 
-    assert "Needs a decision" in block
-    assert session.trusted_alert_ids == {open_id}
+    oldest = open_ids[0]
+    assert f"[{oldest}]" not in block            # not printed
+    assert session.trusted_alert_ids == set(open_ids)  # still trusted
+    assert closed_id not in session.trusted_alert_ids
 
 
 def test_render_and_trust_clears_the_set_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -429,3 +441,21 @@ def test_render_and_trust_clears_the_set_on_failure(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(ctx, "format_open_alerts_for_prompt", _boom)
     assert ctx.render_and_trust(session) == ""
     assert session.trusted_alert_ids == set()
+
+
+def test_board_limit_is_shared_with_the_today_route() -> None:
+    """The trusted set and the card list must be the same board.
+
+    These were two separate `100` literals joined only by a comment. If they
+    drift, a card the principal can see and discuss becomes one the Executive
+    is refused permission to clear — the exact failure this work removed.
+    """
+    import inspect
+
+    from openexecutive.alerts.lifecycle import BOARD_LIMIT
+    from openexecutive.api.routes import today as today_route
+
+    src = inspect.getsource(today_route._build_today)
+    assert "BOARD_LIMIT" in src, "today.py must use the shared constant, not a literal"
+    assert "list_live_alerts(limit=100" not in src
+    assert BOARD_LIMIT == 100

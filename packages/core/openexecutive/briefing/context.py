@@ -29,12 +29,10 @@ _BODY_SNIPPET_CHARS = 200
 # unread items at once; the ceiling just bounds the per-turn token cost.
 _MAX_ALERTS = 30
 
-# How far the trusted set reaches. `/today` renders `list_live_alerts(limit=100)`
-# as cards, and every one of them is Discuss-able, so trusting only the 30 the
-# digest prints would refuse an ack on cards 31-100 — sending the principal back
-# to the page they just came from. Keep this aligned with the cap in
-# `api/routes/today.py::_build_today`.
-_MAX_TRUSTED = 100
+# How far the trusted set reaches: the whole board `/today` renders as cards.
+# Every one of them is Discuss-able, so trusting only the rows the digest prints
+# would refuse an ack on a card the principal is looking at. Imported rather
+# than restated so the two surfaces cannot drift apart.
 
 # Recently-closed items the digest names so the Executive can recognise work
 # the principal already settled. Without these, a card acked from the briefing
@@ -76,7 +74,6 @@ def _one_line(value: str | None) -> str:
 def format_open_alerts_for_prompt(
     db_path: Path | None = None,
     limit: int = _MAX_ALERTS,
-    rendered_ids: list[int] | None = None,
     trusted_ids: list[int] | None = None,
 ) -> str:
     """Render current open (unread) alerts as a compact digest, or ``""`` when none.
@@ -91,8 +88,8 @@ def format_open_alerts_for_prompt(
     can tell an item awaiting a decision from a passive monitoring signal.
 
     ``trusted_ids``, when given, is filled with every LIVE alert id — including
-    ones past the render cap. That, not ``rendered_ids``, is what `ack_alert`
-    accepts: `/today` shows up to ``_MAX_TRUSTED`` cards and all of them are
+    ones past the render cap, which is a token budget and not a trust boundary.
+    This is what `ack_alert` accepts: `/today` shows up to ``BOARD_LIMIT`` cards and all of them are
     Discuss-able, so trusting only the printed subset refuses an ack on a card
     the principal is looking at.
 
@@ -106,28 +103,23 @@ def format_open_alerts_for_prompt(
     carried server-side; it is not, so do not read this control as more than it
     is.
 
-    ``rendered_ids``, when given, is filled with the alert ids this block
-    actually names — the caller records them on the session so ``ack_alert``
-    can refuse an id the model did not get from here. Prompt wording alone is
-    not a control.
-
     Pure synchronous SQLite read — wrap in ``asyncio.to_thread`` at the call
     site. Never raises: any failure logs and returns ``""`` so a chat turn is
     never blocked by an alerts-store hiccup.
     """
-    from openexecutive.alerts.lifecycle import list_live_alerts
+    from openexecutive.alerts.lifecycle import BOARD_LIMIT, list_live_alerts
     from openexecutive.briefing.ranking import score_and_categorize
 
     now = datetime.now(UTC)
     try:
         # One read, two consumers. We fetch the whole live board (up to
-        # `_MAX_TRUSTED`, the cap `/today` renders as cards) because that is
+        # `BOARD_LIMIT`, the cap `/today` renders as cards) because that is
         # what `ack_alert` must accept; we then render only the first `limit`
         # of it. Fetching past `limit` also tells a full board from a truncated
         # one — without that the header claimed the list was everything when it
         # was the most recent `limit` of many more (#136, second symptom).
         live = list_live_alerts(
-            limit=max(_MAX_TRUSTED, limit + 1), db_path=db_path
+            limit=max(BOARD_LIMIT, limit + 1), db_path=db_path
         )
     except Exception:
         logger.exception("briefing_context.list_alerts_failed")
@@ -163,8 +155,6 @@ def format_open_alerts_for_prompt(
         if alert.occurrence_count > 1:
             line += f" | seen x{alert.occurrence_count}"
         lines.append(line)
-        if rendered_ids is not None and alert.id is not None:
-            rendered_ids.append(alert.id)
 
     if not lines:
         # An empty board is exactly when the handled block matters most: the
