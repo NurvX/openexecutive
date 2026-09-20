@@ -113,7 +113,19 @@ def test_today_departments_have_fields(client: TestClient) -> None:
 # Deprecated alias /morning-brief
 # --------------------------------------------------------------------------- #
 
-def test_morning_brief_alias_returns_same_body(client: TestClient) -> None:
+def test_morning_brief_alias_returns_same_body(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Seed a live proposal so the board is NOT quiet: otherwise both routes
+    # only ever compare the fixed quiet line and alias parity on a real
+    # synthesized narrative would go unexercised.
+    _seed_live_action_alert(episodic.DB_PATH)
+
+    async def _synth(**_kw: object) -> str:
+        return "**Bottom line:** the budget needs you."
+
+    monkeypatch.setattr(briefing_narrative, "synthesize_briefing_narrative", _synth)
+
     # Warm the narrative cache first: the very first /today hit is cold
     # (narrative null) and its background task populates the cache, so
     # comparing a cold call against a warm one would diff on `narrative`
@@ -121,6 +133,7 @@ def test_morning_brief_alias_returns_same_body(client: TestClient) -> None:
     client.get("/today")
     today = client.get("/today").json()
     legacy = client.get("/morning-brief").json()
+    assert today["narrative"] == "**Bottom line:** the budget needs you."
     assert today == legacy
 
 
@@ -520,7 +533,9 @@ def test_insight_served_from_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 def test_morning_brief_alias_unaffected_by_async_today(client: TestClient) -> None:
     """The sync /morning-brief alias must keep returning the same body as
-    the now-async /today (both serve insight=None on a cold cache)."""
+    the now-async /today (both serve insight=None on a cold INSIGHT cache;
+    the narrative cache is deliberately warmed first — see the alias test
+    above — so the two calls are compared on equal footing)."""
     client.get("/today")  # warm the narrative cache — see the alias test above
     assert client.get("/today").json() == client.get("/morning-brief").json()
 
@@ -1719,3 +1734,77 @@ def test_live_board_still_synthesizes(
     c.get("/today")
     assert c.get("/today").json()["narrative"] == "**Bottom line:** the budget needs you."
     assert calls["n"] == 1
+
+
+def test_viewer_slice_scopes_proposals_to_the_teammate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_viewer_slice` keeps only what is routed to the viewer.
+
+    Covered directly because the route-level teammate test can no longer prove
+    it: an empty slice now short-circuits before the synthesizer, so nothing
+    downstream observes the scoped proposal list.
+    """
+    db = tmp_path / "slice.db"
+    _setup_isolated_db(db, monkeypatch)
+    dan = people_store.upsert_person(
+        full_name="Dan", role="CFO", email="dan@x.com",
+        department_slugs=["finance"], db_path=db,
+    )
+    other = people_store.upsert_person(
+        full_name="Eve", role="COO", email="eve@x.com",
+        department_slugs=["operations"], db_path=db,
+    )
+    alert_store.insert_alert(
+        source="system", external_id="for-dan", severity="high",
+        headline="Dan's item", body="b", routed_to_person_id=dan, db_path=db,
+    )
+    alert_store.insert_alert(
+        source="system", external_id="for-eve", severity="high",
+        headline="Eve's item", body="b", routed_to_person_id=other, db_path=db,
+    )
+
+    snapshot = today_route._build_today()
+    viewer = next(p for p in snapshot.people if p.id == dan)
+    sliced = today_route._viewer_slice(snapshot, viewer)
+
+    assert [p["headline"] for p in sliced["proposals"]] == ["Dan's item"]
+    assert sliced["people"] == []  # the principal-only section is dropped
+
+
+def test_closed_alerts_never_reach_the_synthesizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: on a NON-quiet board the model still must not be told about
+    a dismissed alert.
+
+    The quiet short-circuit cannot be what saves us here — a live proposal
+    keeps the board active — so this proves `live_alerts_only` actually
+    survives the trip through `_regen_briefing_narrative`.
+    """
+    db = tmp_path / "e2e-live-only.db"
+    _setup_isolated_db(db, monkeypatch)
+    _seed_live_action_alert(db, headline="Approve the Q3 budget")
+    dismissed = alert_store.insert_alert(
+        source="system", external_id="dismissed-e2e", severity="urgent",
+        headline="St. Albans reconciliation gap", body="b", db_path=db,
+    )
+    assert dismissed is not None
+    alert_store.set_status(dismissed, "dismissed", db_path=db)
+
+    seen: dict[str, list[str]] = {}
+
+    async def _synth(**kw: object) -> str:
+        activity = kw.get("activity") or []
+        seen["summaries"] = [
+            str(a.get("summary", "")) for a in activity  # type: ignore[union-attr]
+        ]
+        return "**Bottom line:** the budget needs you."
+
+    monkeypatch.setattr(briefing_narrative, "synthesize_briefing_narrative", _synth)
+
+    c = _make_client()
+    c.get("/today")
+
+    assert "St. Albans reconciliation gap" not in seen["summaries"]
+    assert "Approve the Q3 budget" in seen["summaries"]

@@ -23,6 +23,17 @@ from openexecutive.alerts.lifecycle import parse_aware
 
 logger = logging.getLogger(__name__)
 
+# The quiet-day lines. Single-sourced here, in the module that owns the
+# prompts, because three different code paths must emit text identical to what
+# the model is told to emit on a quiet day: this module's prompts, `today`'s
+# empty-board short-circuit (which skips the model entirely), and
+# `morning_brief`'s empty fallback. They were five separate literals across
+# three files, matching only by convention — a prompt reword would have
+# silently desynced the short-circuit from the model's own wording.
+# `test_briefing_narrative.py` asserts each prompt still carries its line.
+QUIET_PRINCIPAL = "Quiet right now — nothing pressing."
+QUIET_VIEWER = "Quiet right now — nothing needs you."
+
 # Standalone morning-brief DM prompt. Unlike the /today header, this is
 # delivered as a DM with NO cards beside it — so it MUST enumerate what needs
 # the principal's attention (it's the only thing they see). Whole-company,
@@ -55,7 +66,7 @@ STANDALONE_BRIEF_SYSTEM = (
     "  6. **At risk** — departments / goals trending off-track the principal "
     "hasn't already been briefed on.\n\n"
     "Skip headers entirely for sections with no content. If everything is "
-    "genuinely quiet, output one line: 'Quiet right now — nothing pressing.'"
+    "genuinely quiet, output one line: '" + QUIET_PRINCIPAL + "'"
 )
 
 
@@ -94,7 +105,7 @@ BRIEFING_NARRATIVE_SYSTEM = (
     "though: a smart reader should get every line on the FIRST read — short "
     "sentences, plain words over jargon, and when a domain term is unavoidable "
     "state its consequence plainly. Reference specifics by name. If it's "
-    "genuinely quiet, output one line: 'Quiet right now — nothing pressing.'"
+    "genuinely quiet, output one line: '" + QUIET_PRINCIPAL + "'"
 )
 
 
@@ -121,7 +132,7 @@ def _viewer_system_prompt(name: str, role: str) -> str:
         "report. But clarity first: they should get every line on the first "
         "read — short sentences, plain words over jargon. Address them directly "
         "('you'); the context is already scoped to them. If nothing is on their "
-        "plate, output one line: 'Quiet right now — nothing needs you.'"
+        "plate, output one line: '" + QUIET_VIEWER + "'"
     )
 
 
@@ -305,6 +316,8 @@ async def synthesize_briefing_narrative(
 
 __all__ = [
     "BRIEFING_NARRATIVE_SYSTEM",
+    "QUIET_PRINCIPAL",
+    "QUIET_VIEWER",
     "STANDALONE_BRIEF_SYSTEM",
     "render_briefing_context",
     "synthesize_briefing_narrative",

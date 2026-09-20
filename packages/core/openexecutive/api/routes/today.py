@@ -945,6 +945,7 @@ def _build_activity(
     Items are merged, sorted by timestamp DESC, and capped at `limit`.
     The caller is expected to clamp `limit` (the route does this).
     """
+    from openexecutive.alerts import lifecycle as alert_lifecycle
     from openexecutive.alerts import store as alerts_store
     from openexecutive.memory import decision_ledger
     from openexecutive.memory.episodic import (
@@ -1079,8 +1080,6 @@ def _build_activity(
     # alert for a gated booking, already represented by the `decision_resolved`
     # rows above (and as a live proposal while pending), so surfacing them here
     # would double-count.
-    from openexecutive.alerts import lifecycle as alert_lifecycle
-
     now_for_alerts = datetime.now(UTC)
     for alert in alerts_store.recent_alerts(
         limit=pool, exclude_source=decision_ledger.DECISION_ALERT_SOURCE,
@@ -1228,14 +1227,9 @@ def _narrative_inputs(
     )
 
 
-# Quiet-day lines, one per narrative scope. They match the wording the
-# synthesis prompts tell the model to emit on a quiet day, so a short-circuited
-# narrative is indistinguishable from a model-produced one.
-_QUIET_PRINCIPAL = "Quiet right now — nothing pressing."
-_QUIET_VIEWER = "Quiet right now — nothing needs you."
-
-
-def _narrative_activity(viewer: PersonBriefItem | None, scoped: bool) -> list[dict[str, Any]]:
+def _narrative_activity(
+    viewer: PersonBriefItem | None, viewer_desc: dict[str, str] | None
+) -> list[dict[str, Any]]:
     """The activity list the narrative reasons over, for BOTH the hash and the
     synthesis.
 
@@ -1246,12 +1240,17 @@ def _narrative_activity(viewer: PersonBriefItem | None, scoped: bool) -> list[di
 
     Closed alerts are dropped (`live_alerts_only`) — the narrative describes
     what is live, not what once was.
+
+    ``viewer_desc`` is `_narrative_inputs`' third element: non-None only for a
+    non-principal teammate, whose feed is narrowed to their own departments.
+    Taken as-is rather than as a bool so both call sites pass what they already
+    hold instead of each re-deriving the same condition.
     """
     activity = [
         item.model_dump()
         for item in _build_activity(20, live_alerts_only=True).items
     ]
-    if scoped and viewer is not None:
+    if viewer_desc is not None and viewer is not None:
         # Teammate view: keep only activity in their departments.
         vdepts = set(viewer.department_slugs)
         activity = [a for a in activity if a.get("department") in vdepts]
@@ -1293,7 +1292,7 @@ def _attach_narrative(
         nhash = narrative_cache.build_narrative_input_hash(
             today_data,
             scope=scope,
-            activity=_narrative_activity(viewer, desc is not None),
+            activity=_narrative_activity(viewer, desc),
         )
         cached = narrative_cache.get(scope)
         if cached is not None:
@@ -1322,7 +1321,11 @@ async def _regen_briefing_narrative(
     different scope's cache entry.
     """
     from openexecutive.briefing import narrative_cache
-    from openexecutive.briefing.narrative import synthesize_briefing_narrative
+    from openexecutive.briefing.narrative import (
+        QUIET_PRINCIPAL,
+        QUIET_VIEWER,
+        synthesize_briefing_narrative,
+    )
 
     try:
         snapshot = _build_today()
@@ -1335,12 +1338,12 @@ async def _regen_briefing_narrative(
                 "regen; skipping write", expected_scope, scope,
             )
             return
-        activity = _narrative_activity(viewer, viewer_desc is not None)
+        activity = _narrative_activity(viewer, viewer_desc)
         if _nothing_needs_attention(today_data):
             # Nothing awaits a decision — skip the model call entirely and
             # write the fixed quiet line. Still cached (below) so the hot path
             # sees a fresh hash instead of re-scheduling this task forever.
-            text = _QUIET_VIEWER if viewer_desc is not None else _QUIET_PRINCIPAL
+            text = QUIET_VIEWER if viewer_desc is not None else QUIET_PRINCIPAL
         else:
             period_label = datetime.now(UTC).strftime("%Y-%m-%d")
             text = await asyncio.wait_for(
