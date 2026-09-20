@@ -217,6 +217,60 @@ The built-in knowledge base is **trusted by default** — the Executive can use 
 | **Google Chat** | Mention the app in a space |
 | **Discord** | DM the bot, `@mention` it in a channel, or use `/ask` / `/today` slash commands |
 | **CLI** | `openexecutive chat` |
+| **MCP** | Point any MCP client at `http://localhost:8000/mcp` (see [Connect as an MCP Server](#connect-as-an-mcp-server)) |
+
+## Connect as an MCP Server
+
+Open Executive exposes its company context and specialist council to external
+MCP clients (Claude Code, Claude Desktop, Cursor, or any other agent), so they
+can ground themselves in your company without being re-briefed. There is no
+separate server process to start: the server is mounted into the FastAPI app at
+`/mcp` over Streamable HTTP, so running the API is running the MCP server.
+
+The endpoint is `http://localhost:8000/mcp`, or `https://<your-host>/mcp` once
+deployed. Authentication is the same shared-secret gate as every other route,
+so clients send `x-api-key: $BACKEND_SHARED_SECRET`. With that variable unset
+locally the gate is off and the header can be omitted.
+
+On any internet-reachable instance set both `BACKEND_SHARED_SECRET` and
+`OE_PUBLIC_DEPLOYMENT=1`, which makes the API refuse to start without a
+secret rather than serving `/mcp` unauthenticated. See
+[Deployment](#deployment).
+
+```json
+{
+  "mcpServers": {
+    "open-executive": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "x-api-key": "YOUR_BACKEND_SHARED_SECRET"
+      }
+    }
+  }
+}
+```
+
+Claude Code can write that entry for you:
+
+```bash
+claude mcp add --transport http open-executive http://localhost:8000/mcp \
+  --header "x-api-key: YOUR_BACKEND_SHARED_SECRET"
+```
+
+Connected clients get eight read-only resources (company profile, today's
+briefing and activity, people roster, department state, and episodic memory for
+decisions, initiatives and advice) and four tools, of which `consult_specialist`
+is the primary one: domain analysis from any of the nine specialists, each
+grounded in your company's knowledge base. The full inventory is on the **MCP
+Server** section of the `/architecture` page.
+
+This is the inverse of the `MCP_ENABLED` and `MCP_SERVERS_CONFIG_PATH` settings
+under [Configuration](#configuration), which configure the MCP *gateway*: Open
+Executive consuming other servers' tools. The server side needs no configuration
+beyond `BACKEND_SHARED_SECRET`. If a client errors on connect, try `/mcp/` with
+the trailing slash, since the endpoint 307-redirects and not every client
+follows the redirect.
 
 ## Document Upload
 
