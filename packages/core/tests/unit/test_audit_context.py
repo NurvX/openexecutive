@@ -202,3 +202,65 @@ def test_direct_extraction_does_not_clobber_an_ambient_turn() -> None:
 
     asyncio.run(_go())
     assert seen == [("s-amb", "t-amb")]
+
+
+def test_thread_fallback_carries_the_turn() -> None:
+    """The branch the snapshot parameters actually exist for.
+
+    In the event-loop branch `loop.create_task` copies the context at
+    creation, so the child already inherits the ids and the re-bind is
+    belt-and-braces. A thread started by the no-running-loop fallback gets
+    a FRESH, EMPTY context and inherits nothing — so without the explicit
+    snapshot its model call records unattributed. Asserting only on the
+    task branch would pass with the whole mechanism removed.
+    """
+    import threading
+
+    from openexecutive.audit.context import get_active_ids, set_turn
+    from openexecutive.memory import episodic
+
+    seen: list[tuple[str | None, str | None]] = []
+    done = threading.Event()
+
+    async def _fake_extract(*_a: object, **_k: object) -> None:
+        seen.append(get_active_ids())
+        done.set()
+
+    # No running loop here, so schedule_extraction takes the thread branch.
+    with (
+        mock.patch.object(episodic, "_extract_and_store", _fake_extract),
+        set_turn(session_id="s-thread", turn_id="t-thread"),
+    ):
+        episodic.schedule_extraction("u", "a", session_id="s-thread")
+        assert done.wait(timeout=5), "extraction thread never ran"
+
+    assert seen == [("s-thread", "t-thread")]
+
+
+def test_partial_snapshot_does_not_erase_the_ambient_counterpart() -> None:
+    """A half-empty snapshot must not null out the other field.
+
+    Binding (session, None) over a live turn yields a row that shows up in
+    the session view attached to no turn — worse than both binding both and
+    leaving the ambient pair alone.
+    """
+    from openexecutive.audit.context import get_active_ids, set_turn
+    from openexecutive.memory import episodic
+
+    seen: list[tuple[str | None, str | None]] = []
+
+    async def _fake_extract(*_a: object, **_k: object) -> None:
+        seen.append(get_active_ids())
+
+    async def _go() -> None:
+        with (
+            mock.patch.object(episodic, "_extract_and_store", _fake_extract),
+            set_turn(session_id="s-live", turn_id="t-live"),
+        ):
+            # Session supplied, turn omitted — the ambient turn must survive.
+            await episodic.extract_and_store(
+                "u", "a", audit_session_id="s-other"
+            )
+
+    asyncio.run(_go())
+    assert seen == [("s-other", "t-live")]

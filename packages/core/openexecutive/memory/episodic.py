@@ -1861,19 +1861,25 @@ async def extract_and_store(
     caller's `with set_turn(...)` has already exited, so without them this
     function's model call records unattributed.
     """
-    from openexecutive.audit.context import set_turn
+    from openexecutive.audit.context import get_active_ids, set_turn
 
-    if audit_session_id is None and audit_turn_id is None:
-        # Nothing to restore. Binding (None, None) here would CLOBBER an
-        # ambient turn for a caller that awaits this directly from inside
-        # its own `with set_turn(...)` — the exact opposite of the bug this
-        # parameter exists to fix.
+    # Fall back per field, not as a pair. Binding a half-empty snapshot
+    # would erase the ambient counterpart — a row under a session with no
+    # turn, or a turn that joins to nothing — which is worse than either
+    # binding both or leaving the ambient values alone. With nothing to
+    # restore at all this is a plain no-op, so a caller that awaits this
+    # directly from inside its own `with set_turn(...)` keeps its binding.
+    ambient_session, ambient_turn = get_active_ids()
+    effective_session = audit_session_id if audit_session_id is not None else ambient_session
+    effective_turn = audit_turn_id if audit_turn_id is not None else ambient_turn
+
+    if (effective_session, effective_turn) == (ambient_session, ambient_turn):
         await _extract_and_store(
             user_message, assistant_response, db_path, session_id
         )
         return
 
-    with set_turn(session_id=audit_session_id, turn_id=audit_turn_id):
+    with set_turn(session_id=effective_session, turn_id=effective_turn):
         await _extract_and_store(
             user_message, assistant_response, db_path, session_id
         )

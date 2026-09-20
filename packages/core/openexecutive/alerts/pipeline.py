@@ -272,13 +272,17 @@ async def _evaluate_in_turn(
     audit_turn_id: str | None,
 ) -> None:
     """Re-bind the scheduling caller's audit ids, then evaluate."""
-    from openexecutive.audit.context import set_turn
+    from openexecutive.audit.context import get_active_ids, set_turn
 
-    if audit_session_id is None and audit_turn_id is None:
-        # Nothing to restore — and binding (None, None) would clobber any
-        # ambient turn rather than preserve it.
+    # Per-field fallback — see memory.episodic.extract_and_store for why a
+    # half-empty snapshot must not erase the ambient counterpart.
+    ambient_session, ambient_turn = get_active_ids()
+    effective_session = audit_session_id if audit_session_id is not None else ambient_session
+    effective_turn = audit_turn_id if audit_turn_id is not None else ambient_turn
+
+    if (effective_session, effective_turn) == (ambient_session, ambient_turn):
         await evaluate_and_dispatch(event)
         return
 
-    with set_turn(session_id=audit_session_id, turn_id=audit_turn_id):
+    with set_turn(session_id=effective_session, turn_id=effective_turn):
         await evaluate_and_dispatch(event)

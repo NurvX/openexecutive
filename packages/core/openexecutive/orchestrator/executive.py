@@ -561,7 +561,9 @@ class Executive:
         # A caller-supplied id wins: the SSE route binds the turn at route
         # level and must agree with us, or one turn splits across two ids.
         # Every other entry point passes nothing and keeps its own id.
-        turn_id = turn_id or f"t-{uuid.uuid4().hex[:12]}"
+        # `is None`, not `or`: an explicitly-passed empty string would
+        # otherwise silently mint a second id and split one turn in two.
+        turn_id = f"t-{uuid.uuid4().hex[:12]}" if turn_id is None else turn_id
 
         t0 = time.monotonic()
         full_response = ""
@@ -778,7 +780,9 @@ class Executive:
         # A caller-supplied id wins: the SSE route binds the turn at route
         # level and must agree with us, or one turn splits across two ids.
         # Every other entry point passes nothing and keeps its own id.
-        turn_id = turn_id or f"t-{uuid.uuid4().hex[:12]}"
+        # `is None`, not `or`: an explicitly-passed empty string would
+        # otherwise silently mint a second id and split one turn in two.
+        turn_id = f"t-{uuid.uuid4().hex[:12]}" if turn_id is None else turn_id
         # Stash on the function frame so the closing audit_log("committee_review")
         # at the end of this function can carry the same turn_id.
         _committee_turn_id = turn_id

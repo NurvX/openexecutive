@@ -23,10 +23,12 @@ The contract pinned here:
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -200,3 +202,90 @@ def test_turn_id_is_generated_when_the_caller_supplies_none() -> None:
     for fn in (Executive.stream_chat, Executive.stream_chat_with_committee):
         param = inspect.signature(fn).parameters["turn_id"]
         assert param.default is None, f"{fn.__name__} must not require turn_id"
+
+
+# --------------------------------------------------------------------- #
+# Isolation: the binding is held across an async generator
+# --------------------------------------------------------------------- #
+
+
+def test_concurrent_turns_do_not_cross_contaminate(
+    temp_db: Path, patched_deps: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two turns in flight at once must not see each other's identity.
+
+    The binding is now held across an async generator for the whole
+    response body, so this pins the property that makes that safe: each
+    request's ASGI task owns its own context. A leak here would mean audit
+    rows attributed to the wrong session.
+    """
+    from openexecutive.audit.context import get_active_ids
+    from openexecutive.orchestrator import executive as exec_mod
+
+    # message -> list of (session_id, turn_id) observed on each step
+    observed: dict[str, list[tuple[str | None, str | None]]] = {}
+
+    class _Interleaving:
+        _THINKING = exec_mod.Executive._THINKING
+
+        def __init__(self, **_k: Any) -> None:
+            pass
+
+        async def stream_chat(self, *, user_message: str = "", **_k: Any) -> AsyncIterator[str]:
+            for _ in range(5):
+                observed.setdefault(user_message, []).append(get_active_ids())
+                # Yield control so the two requests genuinely interleave.
+                await asyncio.sleep(0)
+                yield "x "
+
+    monkeypatch.setattr(exec_mod, "Executive", _Interleaving)
+
+    app = FastAPI()
+    app.include_router(chat_route.router)
+
+    async def _go() -> None:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            await asyncio.gather(
+                c.post("/chat", json={"message": "alpha"}),
+                c.post("/chat", json={"message": "bravo"}),
+            )
+
+    asyncio.run(_go())
+
+    assert set(observed) == {"alpha", "bravo"}, observed
+    for msg, ids in observed.items():
+        assert len(set(ids)) == 1, f"{msg} saw shifting ids: {ids}"
+        assert ids[0][0] is not None and ids[0][1] is not None, f"{msg} unbound: {ids}"
+    a = observed["alpha"][0]
+    b = observed["bravo"][0]
+    assert a != b, f"two concurrent turns shared identity: {a} == {b}"
+
+
+def test_binding_is_restored_after_the_response(
+    temp_db: Path, patched_deps: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No leak to unrelated work on the same task after the turn ends."""
+    from openexecutive.audit.context import get_active_ids
+    from openexecutive.orchestrator import executive as exec_mod
+
+    class _Tiny:
+        _THINKING = exec_mod.Executive._THINKING
+
+        def __init__(self, **_k: Any) -> None:
+            pass
+
+        async def stream_chat(self, **_k: Any) -> AsyncIterator[str]:
+            yield "done "
+
+    monkeypatch.setattr(exec_mod, "Executive", _Tiny)
+    app = FastAPI()
+    app.include_router(chat_route.router)
+
+    async def _go() -> tuple[str | None, str | None]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            await c.post("/chat", json={"message": "leak check"})
+        return get_active_ids()
+
+    assert asyncio.run(_go()) == (None, None)
