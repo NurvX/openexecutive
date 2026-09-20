@@ -10,7 +10,7 @@ is for running your own.
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Builds Honcho, pinned via `ARG HONCHO_VERSION` (currently `v3.0.7`), with the embedding model baked into the image |
+| `Dockerfile` | Builds Honcho, pinned via `ARG HONCHO_VERSION` (currently `v3.2.0`), with the embedding model baked into the image |
 | `config.toml` | Honcho's model configuration — which LLM serves each slot, and the embedding setup |
 | `embed_server.py` | A small OpenAI-compatible embeddings server (`fastembed` + `BAAI/bge-small-en-v1.5`), so embeddings need no external vendor |
 
@@ -78,3 +78,7 @@ Honcho ships breaking schema changes between minor versions. Read the
 [release notes](https://github.com/plastic-labs/honcho/releases), bump
 `ARG HONCHO_VERSION` in the `Dockerfile`, redeploy with the release steps above,
 and smoke a peer-memory round trip before considering it done.
+
+The base image tracks Honcho's `requires-python` (`>= 3.13` since v3.1.1). The
+build installs into the system interpreter, so a release that raises the
+floor needs the `FROM` line bumped in the same change.
