@@ -1833,12 +1833,79 @@ def _is_valid_user_commitment(quote: str, user_message: str) -> bool:
 
 _MAX_INPUT_CHARS = 20_000  # cap each side to avoid runaway cost
 
-# Minimum combined chars (user + assistant) required to schedule extraction.
-# Below this floor, the turn is a clarifying question or small-talk exchange
-# and the LLM gate's cost isn't justified. Both stream_chat and the committee
-# path use this constant — keeping them symmetric prevents the committee path
-# from firing 2.5x more often than streaming, which it used to.
-MIN_TURN_CHARS_FOR_EXTRACTION = 1500
+# Minimum chars in the USER's message required to schedule extraction.
+#
+# This was a combined user+assistant floor of 1500, and measured against real
+# traffic it selected almost exactly the wrong turns. On one tenant it blocked
+# 9 of 16 exchanges, and the 9 included every substantive instruction the
+# principal gave — "It's a mistake on the lp purchased properties worksheet.
+# Correct it there. And record this as fixed." (1312 combined), "This is not
+# relevant for us. Don't track this" (910), "The briefing is incorrect. We are
+# not under water 2.9m" (1032) — while the 7 it admitted were long analytical
+# exchanges containing no user commitment at all. The extractor ran 13 times
+# and stored nothing, because it only ever saw the turns with nothing in them.
+#
+# The combined length was the wrong axis. A decision lives in what the
+# PRINCIPAL said, which is also the only text `_is_valid_user_commitment` will
+# accept a quote from; the Executive's analysis around it can run to thousands
+# of characters without containing a single commitment. Decisive instructions
+# are short by nature ("Correct it there", "Don't track this"), so a floor that
+# scales with the assistant's verbosity systematically discards them.
+#
+# The floor now only has to separate a real instruction from a bare
+# acknowledgement — "No", "Done", "Who am I?" — which is what the old comment
+# meant by small talk. Both stream_chat and the committee path use this
+# constant; keeping them symmetric prevents the committee path from firing more
+# often than streaming, which it used to.
+MIN_USER_CHARS_FOR_EXTRACTION = 40
+
+# Back-compat alias. External callers (and older tests) may still import the
+# old name; it no longer reflects what is measured, so nothing new should use
+# it.
+MIN_TURN_CHARS_FOR_EXTRACTION = MIN_USER_CHARS_FOR_EXTRACTION
+
+
+def _audit_extraction(
+    proposed: dict[str, int],
+    stored: dict[str, int],
+    dropped: list[str],
+    *,
+    session_id: str,
+) -> None:
+    """One `memory_extraction` audit row per extraction pass.
+
+    The point is that "the model proposed nothing" and "the model proposed
+    things and every one was rejected" are different failures with different
+    fixes, and until this row existed they were indistinguishable outside a
+    SQLite session on the tenant. A pass that proposes and stores nothing is
+    normal on most turns, so this is deliberately not a warning — the signal
+    is the RATIO over time, which a `proposed>0, stored=0` streak makes
+    obvious.
+
+    Never raises: auditing an extraction must not be able to break the turn
+    that produced it.
+    """
+    total_proposed = sum(proposed.values())
+    total_stored = sum(stored.values())
+    try:
+        from openexecutive.audit import log_event
+
+        log_event(
+            "memory_extraction",
+            f"proposed={total_proposed} stored={total_stored} dropped={len(dropped)}",
+            session_id=session_id or None,
+            actor="memory_extractor",
+            details={
+                "proposed": proposed,
+                "stored": stored,
+                "dropped_count": len(dropped),
+                # Reasons, not content: enough to tell a validator rejection
+                # from an empty pass without copying company data into the log.
+                "dropped": dropped[:10],
+            },
+        )
+    except Exception:
+        logger.debug("memory extraction audit failed", exc_info=True)
 
 
 async def extract_and_store(
@@ -1936,6 +2003,16 @@ async def _extract_and_store(
 
         log_model_usage(response, model=routing_model, actor="memory_extractor")
 
+        # Extraction outcome, per turn. Without this a working extractor and a
+        # broken one look identical from the outside: drops were `logger.debug`
+        # and a successful store wrote no row either, so the only symptom of a
+        # total failure was an empty `decisions` table nobody was watching. It
+        # took reading a tenant's SQLite to find that the turn gate had been
+        # discarding every commitment for the whole life of the install.
+        proposed = {"decisions": 0, "initiatives": 0, "advice": 0}
+        stored = {"decisions": 0, "initiatives": 0, "advice": 0}
+        dropped: list[str] = []
+
         for block in response.content:
             if block.type != "tool_use" or block.name != "store_memories":
                 continue
@@ -1950,18 +2027,21 @@ async def _extract_and_store(
             # hard gate that catches that pattern; the prompt is now just
             # the soft instruction layer.
             for d in inp.get("decisions", []):
+                proposed["decisions"] += 1
                 domain = d.get("domain", "general")
                 summary = d.get("summary", "")
                 quote = d.get("user_commitment_quote", "")
                 if not summary:
                     continue
                 if not _is_valid_user_commitment(quote, user_message):
+                    dropped.append(f"decision:bad_quote:{summary[:60]}")
                     logger.debug(
                         "Dropping decision — invalid user_commitment_quote %r (summary=%r)",
                         quote[:120],
                         summary[:80],
                     )
                     continue
+                stored["decisions"] += 1
                 store_decision(
                     domain=domain,
                     summary=summary,
@@ -1970,6 +2050,7 @@ async def _extract_and_store(
                     db_path=db_path,
                 )
             for i in inp.get("initiatives", []):
+                proposed["initiatives"] += 1
                 title = i.get("title", "")
                 status = i.get("status", "active")
                 summary = i.get("summary", "")
@@ -1977,14 +2058,17 @@ async def _extract_and_store(
                 if not (title and summary):
                     continue
                 if not _is_valid_user_commitment(quote, user_message):
+                    dropped.append(f"initiative:bad_quote:{title[:60]}")
                     logger.debug(
                         "Dropping initiative — invalid user_commitment_quote %r (title=%r)",
                         quote[:120],
                         title[:80],
                     )
                     continue
+                stored["initiatives"] += 1
                 store_initiative(title=title, status=status, summary=summary, db_path=db_path)
             for a in inp.get("advice", []):
+                proposed["advice"] += 1
                 domain = a.get("domain", "general")
                 query_summary = a.get("query_summary", "")
                 advice_summary = a.get("advice_summary", "")
@@ -1992,12 +2076,14 @@ async def _extract_and_store(
                 if not (query_summary and advice_summary):
                     continue
                 if not _is_valid_user_commitment(quote, user_message):
+                    dropped.append(f"advice:bad_quote:{query_summary[:60]}")
                     logger.debug(
                         "Dropping advice — invalid user_commitment_quote %r (query=%r)",
                         quote[:120],
                         query_summary[:80],
                     )
                     continue
+                stored["advice"] += 1
                 store_advice(
                     domain=domain,
                     query_summary=query_summary,
@@ -2005,6 +2091,8 @@ async def _extract_and_store(
                     session_id=session_id,
                     db_path=db_path,
                 )
+
+        _audit_extraction(proposed, stored, dropped, session_id=session_id)
 
     except Exception:
         logger.exception("Episodic memory extraction failed — skipping silently")

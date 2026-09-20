@@ -792,7 +792,7 @@ class Executive:
             )
 
         from openexecutive.memory.episodic import (
-            MIN_TURN_CHARS_FOR_EXTRACTION,
+            MIN_USER_CHARS_FOR_EXTRACTION,
             schedule_extraction,
         )
 
@@ -808,7 +808,7 @@ class Executive:
             # call time, so scheduling it out here would snapshot (None,
             # None) and the memory_extractor's model call would record
             # unattributed however correct the snapshot itself was.
-            if len(full_response) + len(user_message) >= MIN_TURN_CHARS_FOR_EXTRACTION:
+            if len(user_message.strip()) >= MIN_USER_CHARS_FOR_EXTRACTION:
                 schedule_extraction(
                     user_message, full_response, session_id=session.session_id
                 )
@@ -1220,10 +1220,10 @@ class Executive:
         )
 
         from openexecutive.memory.episodic import (
-            MIN_TURN_CHARS_FOR_EXTRACTION,
+            MIN_USER_CHARS_FOR_EXTRACTION,
             schedule_extraction,
         )
-        if len(final_response) + len(user_message) >= MIN_TURN_CHARS_FOR_EXTRACTION:
+        if len(user_message.strip()) >= MIN_USER_CHARS_FOR_EXTRACTION:
             schedule_extraction(user_message, final_response, session_id=session.session_id)
 
         # Mirror the completed exchange into Honcho (see stream_chat for

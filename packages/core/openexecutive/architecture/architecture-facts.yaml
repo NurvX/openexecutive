@@ -915,6 +915,17 @@ memory:
     populates `domain` but not `department`, so today the mirror only
     fires for explicit dept-scoped writers; falling back to `domain`
     is a deliberate follow-up decision, not silent drift.
+    Extraction is gated on MIN_USER_CHARS_FOR_EXTRACTION, measured on the
+    USER's message only. It was a combined user+assistant floor of 1500,
+    which on a live tenant blocked 9 of 16 turns — every instruction the
+    principal gave — while admitting the 7 long analytical exchanges that
+    contained no commitment; the extractor ran 13 times and stored nothing.
+    Decisive instructions are short and the analysis around them is long, so
+    a combined floor discards what it exists to capture, and the user's own
+    words are the only text `_is_valid_user_commitment` accepts a quote from.
+    Every pass now writes a `memory_extraction` audit row (proposed / stored /
+    dropped-with-reason) — before it, an extractor storing nothing looked
+    identical to one with nothing to store.
 
 peer_memory:
   what: |

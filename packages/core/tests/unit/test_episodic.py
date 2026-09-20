@@ -443,17 +443,34 @@ def test_extraction_prompt_includes_source_attribution_rule() -> None:
         )
 
 
-def test_min_turn_chars_for_extraction_is_exported_and_sane() -> None:
-    """The threshold is the single floor that gates extraction in both
-    stream_chat and the committee path. If it disappears or drops back into
-    the low-hundreds, extraction starts firing on trivial Q&A again.
-    """
-    from openexecutive.memory.episodic import MIN_TURN_CHARS_FOR_EXTRACTION
+def test_extraction_floor_admits_instructions_and_blocks_acknowledgements() -> None:
+    """The floor gates extraction in both stream_chat and the committee path.
 
-    assert isinstance(MIN_TURN_CHARS_FOR_EXTRACTION, int)
-    # Anything under 1000 would re-create the bug — clarifying questions
-    # are commonly ~500-800 chars combined.
-    assert MIN_TURN_CHARS_FOR_EXTRACTION >= 1000
+    This asserted `>= 1000` on a COMBINED user+assistant length, to stop
+    extraction firing on trivial Q&A. The cost concern was real; the axis was
+    not. Measured on a live tenant, that floor blocked 9 of 16 exchanges and
+    the 9 contained every instruction the principal gave, because decisive
+    instructions are short and the Executive's analysis around them is long.
+    The extractor ran 13 times and stored nothing.
+
+    The floor now measures the user's own message — the only text a commitment
+    can come from, and the only text the quote validator will accept. Pinned to
+    real messages rather than a magic number, so a future change is judged on
+    what it admits and blocks, not on whether a constant looks big enough.
+    """
+    from openexecutive.memory.episodic import MIN_USER_CHARS_FOR_EXTRACTION
+
+    assert isinstance(MIN_USER_CHARS_FOR_EXTRACTION, int)
+    # Real instructions from the tenant that the old floor discarded.
+    for instruction in (
+        "This is not relevant for us.  Don't track this",
+        "Well remember you fixed it or something. So we don't keep getting. Notified.",
+    ):
+        assert len(instruction.strip()) >= MIN_USER_CHARS_FOR_EXTRACTION
+
+    # Bare acknowledgements still buy nothing — this is what the floor is for.
+    for noise in ("No", "Done", "ok", "yes", "Nope."):
+        assert len(noise.strip()) < MIN_USER_CHARS_FOR_EXTRACTION
 
 
 def test_executive_call_sites_use_min_turn_chars_constant() -> None:
@@ -469,10 +486,15 @@ def test_executive_call_sites_use_min_turn_chars_constant() -> None:
 
     src = inspect.getsource(executive)
     # The constant must be referenced at least twice (once per call site).
-    assert src.count("MIN_TURN_CHARS_FOR_EXTRACTION") >= 2, (
-        "executive.py must reference MIN_TURN_CHARS_FOR_EXTRACTION in both "
+    assert src.count("MIN_USER_CHARS_FOR_EXTRACTION") >= 2, (
+        "executive.py must reference MIN_USER_CHARS_FOR_EXTRACTION in both "
         "the stream_chat and stream_chat_with_committee extraction guards"
     )
+    # And they must measure the USER's message. Summing in the assistant's
+    # length is the original defect: it let a verbose reply drag a trivial turn
+    # in, and discarded a one-line instruction answered concisely.
+    assert "len(full_response) + len(user_message)" not in src
+    assert "len(final_response) + len(user_message)" not in src
     # And the old hard-coded thresholds must be gone — guard against a
     # partial revert that wires the constant in one place but leaves the
     # other path on the old number.
