@@ -2,7 +2,7 @@
 #
 # Mirrors plastic-labs/honcho's official Dockerfile (Python 3.13-slim,
 # uv 0.9.24) but pins the Honcho source to a specific release tag, bakes
-# in OE's config.toml (OpenRouter routes every LLM call, dreaming on,
+# in OE's config.toml (Anthropic direct for every LLM slot, dreaming on,
 # AUTH_USE_AUTH=true), and bundles an embeddings sidecar
 # (`docker/honcho/embed_server.py`) that runs as the `embed` process
 # serving `BAAI/bge-small-en-v1.5` locally via fastembed/ONNX so
