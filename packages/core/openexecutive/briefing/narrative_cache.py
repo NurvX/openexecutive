@@ -22,7 +22,6 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel
 
@@ -90,62 +89,55 @@ def initialize_db(db_path: Path | None = None) -> None:
 NARRATIVE_PROMPT_VERSION = "4"
 
 
+# Stands in for the rendered context when nothing on the viewer's board wants
+# a decision. The narrative is then a fixed line and no model call happens, so
+# the key must NOT depend on anything volatile: hashing the real context there
+# would re-key on every activity row and re-write the identical quiet line
+# forever.
+QUIET_CONTEXT = "<nothing-needs-attention>"
+
+
 def build_narrative_input_hash(
-    today_data: dict[str, Any], scope: str = DEFAULT_SCOPE
+    rendered_context: str, scope: str = DEFAULT_SCOPE
 ) -> str:
-    """Stable hash of the briefing state the narrative is derived from.
+    """Hash of the EXACT user-turn context the model will be given.
 
-    Keyed on the signals that should trigger a re-write — each proposal's
-    headline, category AND the review fields that change what the narrative
-    would say about it, at-risk department counts, and who's awaiting — plus
-    the UTC date so the narrative refreshes at least daily even if nothing
-    structural changed, plus the viewer `scope` so two viewers whose slices
-    happen to coincide still cache under distinct keys, plus
-    NARRATIVE_PROMPT_VERSION so a prompt rewrite invalidates the cache.
-    Deliberately ignores volatile fields (timestamps, ids) so identical
-    content doesn't churn the cache.
+    The one invariant that keeps this cache honest: **the key is a function of
+    the model's input.** Anything the prompt renders is covered; anything it
+    does not render cannot trigger a regeneration. Both properties are free,
+    and they survive future edits to `render_briefing_context` without anyone
+    remembering to update a field list here.
 
-    The review fields matter because the alert review rewrites an open alert's
-    note, why-now, recommended move or deadline IN PLACE, keeping the headline:
-    on headline alone the header kept describing the pre-rewrite situation.
+    Two earlier designs each broke one half of that, in opposite directions:
 
-    Activity is deliberately NOT hashed. It looked like the fix for a frozen
-    header, but the 20-row window moves on almost every DM, decision, advice
-    row and completed workflow, so hashing it regenerates every viewer's
-    narrative — a real model call each — on nearly any Executive action, with
-    no floor. `today._nothing_needs_attention` is what keeps a frozen header
-    from recurring: the state that froze it (nothing on the board) is now
-    answered by a deterministic quiet line instead of a model call.
+    * Keying on proposal headlines alone left the rendered activity block
+      uncovered, so the header could describe a rail that had moved on.
+    * Keying on the proposals' review fields (`review_verdict`, `review_note`,
+      `why_now`, `recommended_move`, `due_at`) covered data the /today header
+      never renders at all — it prints `headline[:160]` and nothing else — while
+      `alerts.review` rewrites those fields with fresh LLM prose on EVERY pass,
+      including its "still relevant, nothing changed" path. That regenerated
+      every viewer's narrative several times a day to re-synthesize byte-
+      identical input.
+
+    ``scope`` keeps two viewers whose contexts coincide under distinct keys,
+    ``NARRATIVE_PROMPT_VERSION`` invalidates every entry when a prompt is
+    reworded, and the UTC date gives a daily floor (it is also inside the
+    rendered context's PERIOD line, but the quiet sentinel has no such line).
     """
-    proposals = [
-        (
-            p.get("headline", ""),
-            p.get("category", ""),
-            p.get("review_verdict", ""),
-            str(p.get("review_note", ""))[:120],
-            str(p.get("why_now", ""))[:120],
-            p.get("recommended_move", ""),
-            p.get("due_at", "") or "",
+    if not isinstance(rendered_context, str):
+        # This used to take the `today_data` dict. A dict is JSON-serialisable,
+        # so a stale caller would hash silently and key the entry on something
+        # the model never saw — a wrong cache that looks like a working one.
+        raise TypeError(
+            "build_narrative_input_hash takes the RENDERED context string "
+            f"(see today._narrative_context), not {type(rendered_context).__name__}"
         )
-        for p in today_data.get("proposals", [])
-    ]
-    depts = [
-        (d.get("slug", ""), d.get("at_risk_count", 0), d.get("off_track_count", 0))
-        for d in today_data.get("departments", [])
-        if d.get("at_risk_count", 0) or d.get("off_track_count", 0)
-    ]
-    awaiting = sorted(
-        p.get("id", 0)
-        for p in today_data.get("people", [])
-        if p.get("awaiting_count", 0)
-    )
     payload = {
         "scope": scope,
         "prompt_version": NARRATIVE_PROMPT_VERSION,
         "date": datetime.now(UTC).strftime("%Y-%m-%d"),
-        "proposals": proposals,
-        "depts": depts,
-        "awaiting": awaiting,
+        "context": rendered_context,
     }
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -197,6 +189,7 @@ def utc_now_iso() -> str:
 
 __all__ = [
     "DEFAULT_SCOPE",
+    "QUIET_CONTEXT",
     "BriefingNarrative",
     "build_narrative_input_hash",
     "get",

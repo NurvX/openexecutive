@@ -273,10 +273,13 @@ async def synthesize_briefing_narrative(
     since: datetime | None = None,
     handled: list[dict[str, Any]] | None = None,
     pending_watch_suggestions: int = 0,
+    rendered_context: str | None = None,
 ) -> str:
     """Synthesize the briefing narrative. Returns Markdown, or "" when empty.
 
     Prompt selection:
+    ``rendered_context`` overrides the context render (see below).
+
       - ``standalone=True`` → the enumerated whole-company DM brief
         (morning_brief): a self-contained message with no cards beside it, so
         it lists what needs attention. (`viewer` is ignored.)
@@ -298,7 +301,11 @@ async def synthesize_briefing_narrative(
         system = _viewer_system_prompt(viewer["name"], viewer["role"])
     else:
         system = BRIEFING_NARRATIVE_SYSTEM
-    user_content = render_briefing_context(
+    # `rendered_context` lets a caller hand in the exact block it already
+    # rendered. The /today header path does, because it hashes that string as
+    # its cache key — re-rendering here could quietly drift from what was
+    # hashed and leave the cache keyed on something the model never saw.
+    user_content = rendered_context if rendered_context is not None else render_briefing_context(
         period_label=period_label, today_data=today_data, activity=activity,
         since=since, handled=handled,
         pending_watch_suggestions=pending_watch_suggestions,

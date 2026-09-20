@@ -1278,6 +1278,35 @@ def _nothing_needs_attention(today_data: dict[str, Any]) -> bool:
     return not any(p.get("awaiting_count", 0) for p in today_data.get("people", []))
 
 
+def _narrative_context(
+    today_data: dict[str, Any],
+    viewer: PersonBriefItem | None,
+    viewer_desc: dict[str, str] | None,
+) -> tuple[str, list[dict[str, Any]] | None]:
+    """``(context, activity)`` — the exact user turn the model would receive.
+
+    The single source both the cache key and the model call come from, so the
+    key can never be computed over something the model did not see.
+
+    On a quiet board it returns `narrative_cache.QUIET_CONTEXT` and no
+    activity: the narrative is a fixed line there, so the key must not depend
+    on the rail, and building the rail would be wasted work (it is a
+    seven-source SQL union) on a request whose answer is a constant.
+    """
+    from openexecutive.briefing import narrative_cache
+    from openexecutive.briefing.narrative import render_briefing_context
+
+    if _nothing_needs_attention(today_data):
+        return narrative_cache.QUIET_CONTEXT, None
+    activity = _narrative_activity(viewer, viewer_desc)
+    context = render_briefing_context(
+        period_label=datetime.now(UTC).strftime("%Y-%m-%d"),
+        today_data=today_data,
+        activity=activity,
+    )
+    return context, activity
+
+
 def _attach_narrative(
     response: TodayResponse,
     *,
@@ -1291,7 +1320,8 @@ def _attach_narrative(
 
     scope, today_data, desc, viewer = _narrative_inputs(response, caller_person_id)
     try:
-        nhash = narrative_cache.build_narrative_input_hash(today_data, scope=scope)
+        context, _activity = _narrative_context(today_data, viewer, desc)
+        nhash = narrative_cache.build_narrative_input_hash(context, scope=scope)
         cached = narrative_cache.get(scope)
         if cached is not None:
             response.narrative = cached.narrative_text
@@ -1336,18 +1366,20 @@ async def _regen_briefing_narrative(
                 "regen; skipping write", expected_scope, scope,
             )
             return
-        activity = _narrative_activity(viewer, viewer_desc)
-        if _nothing_needs_attention(today_data):
+        context, activity = _narrative_context(today_data, viewer, viewer_desc)
+        if context == narrative_cache.QUIET_CONTEXT:
             # Nothing awaits a decision — skip the model call entirely and
             # write the fixed quiet line. Still cached (below) so the hot path
             # sees a fresh hash instead of re-scheduling this task forever.
             text = QUIET_VIEWER if viewer_desc is not None else QUIET_PRINCIPAL
         else:
-            period_label = datetime.now(UTC).strftime("%Y-%m-%d")
             text = await asyncio.wait_for(
                 synthesize_briefing_narrative(
-                    today_data=today_data, activity=activity,
-                    period_label=period_label, viewer=viewer_desc,
+                    today_data=today_data, activity=activity or [],
+                    period_label=datetime.now(UTC).strftime("%Y-%m-%d"),
+                    viewer=viewer_desc,
+                    # Hand the model the very string that was hashed.
+                    rendered_context=context,
                 ),
                 timeout=25.0,
             )
@@ -1357,7 +1389,7 @@ async def _regen_briefing_narrative(
 
     if not text:
         return
-    input_hash = narrative_cache.build_narrative_input_hash(today_data, scope=scope)
+    input_hash = narrative_cache.build_narrative_input_hash(context, scope=scope)
     narrative_cache.put(narrative_cache.BriefingNarrative(
         scope=scope,
         input_hash=input_hash,

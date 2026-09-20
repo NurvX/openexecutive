@@ -59,6 +59,19 @@ def _seed_live_action_alert(db: Path, headline: str = "Approve the Q3 budget") -
     )
 
 
+def _current_narrative_hash() -> str:
+    """The principal-scope key exactly as `_attach_narrative` computes it.
+
+    Derived through `_narrative_context` rather than rebuilt by hand: the key
+    is a hash of the rendered model input, so a test that assembled it another
+    way would drift from production the moment the renderer changed.
+    """
+    snapshot = today_route._build_today()
+    scope, data, desc, viewer = today_route._narrative_inputs(snapshot, None)
+    context, _ = today_route._narrative_context(data, viewer, desc)
+    return narrative_cache.build_narrative_input_hash(context, scope=scope)
+
+
 def _make_client() -> TestClient:
     app = FastAPI()
     app.include_router(today_route.router)
@@ -901,8 +914,7 @@ def test_narrative_served_from_cache(
     db = tmp_path / "narr.db"
     _setup_isolated_db(db, monkeypatch)
 
-    snapshot = today_route._build_today()
-    nhash = narrative_cache.build_narrative_input_hash(snapshot.model_dump())
+    nhash = _current_narrative_hash()
     narrative_cache.put(
         narrative_cache.BriefingNarrative(
             scope=narrative_cache.DEFAULT_SCOPE,
@@ -959,8 +971,7 @@ def test_fresh_cache_does_not_trigger_regen(
     db = tmp_path / "fresh.db"
     _setup_isolated_db(db, monkeypatch)
 
-    snapshot = today_route._build_today()
-    nhash = narrative_cache.build_narrative_input_hash(snapshot.model_dump())
+    nhash = _current_narrative_hash()
     narrative_cache.put(
         narrative_cache.BriefingNarrative(
             scope=narrative_cache.DEFAULT_SCOPE, input_hash=nhash,
@@ -1665,49 +1676,109 @@ def test_activity_drops_the_alert_source_for_the_narrative(
     assert "Cut burn to 400k" in summaries  # other sources survive
 
 
-def test_narrative_hash_moves_when_a_proposal_is_rewritten_in_place() -> None:
-    """The alert review rewrites an open alert's note / why-now / move / due
-    date while KEEPING its headline. On headline alone the header went on
-    describing the pre-rewrite situation until the UTC date rolled over."""
-    def board(**review: object) -> dict[str, object]:
-        return {
-            "proposals": [{"headline": "Vendor renewal", "category": "action", **review}],
-            "departments": [], "people": [],
-        }
+def _ctx(today_data: dict, activity: list | None = None) -> str:
+    from openexecutive.briefing.narrative import render_briefing_context
 
-    base = narrative_cache.build_narrative_input_hash(board())
+    return render_briefing_context(
+        period_label="2026-09-20", today_data=today_data, activity=activity or [],
+    )
+
+
+def test_narrative_hash_covers_everything_the_prompt_renders() -> None:
+    """The invariant: the cache key is a hash of the MODEL'S INPUT.
+
+    So anything `render_briefing_context` emits must move the key — including
+    the activity block, which is rendered and was previously uncovered.
+    """
+    base = {
+        "proposals": [{"headline": "Vendor renewal", "category": "action"}],
+        "departments": [], "people": [],
+    }
+    h = narrative_cache.build_narrative_input_hash(_ctx(base))
+
+    moved = {**base, "proposals": [{"headline": "Vendor renewal II", "category": "action"}]}
+    assert narrative_cache.build_narrative_input_hash(_ctx(moved)) != h
+
+    with_dept = {**base, "departments": [
+        {"title": "Finance", "slug": "finance", "at_risk_count": 1,
+         "off_track_count": 0, "awaiting_count": 0},
+    ]}
+    assert narrative_cache.build_narrative_input_hash(_ctx(with_dept)) != h
+
+    # The activity block is rendered, so it must be covered.
+    with_activity = narrative_cache.build_narrative_input_hash(
+        _ctx(base, [{"at": "2026-09-20", "kind": "dm_sent", "summary": "Nudged Dana"}])
+    )
+    assert with_activity != h
+
+
+def test_narrative_hash_ignores_what_the_prompt_never_renders() -> None:
+    """The other half of the invariant, and the expensive half.
+
+    The /today header renders `headline[:160]` and nothing else per proposal.
+    `alerts.review` rewrites review_note / why_now / recommended_move with
+    fresh LLM prose on EVERY pass — including its "still relevant, nothing
+    changed" path — several times a day. Keying on those regenerated every
+    viewer's narrative just to re-synthesize byte-identical input.
+    """
+    def board(**review: object) -> dict:
+        proposal = today_route.ProposalItem(
+            alert_id=1, headline="Vendor renewal", body="b",
+            routed_to_person_id=None, suggested_action="",
+            created_at="2026-09-20T00:00:00Z", topic_tags=[], category="action",
+            **review,  # type: ignore[arg-type]
+        )
+        return {"proposals": [proposal.model_dump()], "departments": [], "people": []}
+
+    base = narrative_cache.build_narrative_input_hash(_ctx(board()))
     for field, value in (
-        ("review_verdict", "changed"),
-        ("review_note", "two offers now expire Friday"),
+        ("review_verdict", "relevant"),
+        ("review_note", "reworded by the review, same situation"),
         ("why_now", "counterparty deadline"),
         ("recommended_move", "escalate"),
         ("due_at", "2026-09-21T00:00:00Z"),
     ):
-        assert narrative_cache.build_narrative_input_hash(board(**{field: value})) != base, field
+        assert narrative_cache.build_narrative_input_hash(
+            _ctx(board(**{field: value}))
+        ) == base, field
 
 
-def test_narrative_hash_is_stable_across_activity_churn(
+def test_quiet_board_hash_is_stable_across_activity_churn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Activity is deliberately NOT hashed.
+    """On a quiet board the text is a constant, so the key must be too.
 
-    The 20-row rail moves on almost every DM, decision, advice row and
-    completed workflow. Hashing it would regenerate every viewer's narrative —
-    a real model call each — on nearly any Executive action, and on a quiet
-    board it would re-write the identical quiet line forever.
+    Otherwise every rail movement re-keys an entry whose content cannot
+    change, and each GET /today schedules a background task to rewrite the
+    identical quiet line — forever.
     """
     db = tmp_path / "hash-stable.db"
     _setup_isolated_db(db, monkeypatch)
 
-    snapshot = today_route._build_today()
-    before = narrative_cache.build_narrative_input_hash(snapshot.model_dump())
+    def rail() -> list[tuple[str, str]]:
+        return [(i.kind, i.summary) for i in today_route._build_activity(20).items]
+
+    def key() -> str:
+        snap = today_route._build_today()
+        scope, data, desc, viewer = today_route._narrative_inputs(snap, None)
+        ctx, _ = today_route._narrative_context(data, viewer, desc)
+        assert ctx == narrative_cache.QUIET_CONTEXT
+        return narrative_cache.build_narrative_input_hash(ctx, scope=scope)
+
+    before, rail_before = key(), rail()
 
     episodic.store_decision("finance", "Cut burn to 400k", db_path=db)
     episodic.store_advice("hr", "Hire?", "Slowly", db_path=db)
 
-    after_snapshot = today_route._build_today()
-    assert [i.kind for i in today_route._build_activity(20).items]  # rail did move
-    assert narrative_cache.build_narrative_input_hash(after_snapshot.model_dump()) == before
+    # The rail genuinely moved — asserted by diffing it and by naming the rows
+    # just written. A bare "is non-empty" check would pass even if both writes
+    # silently failed.
+    rail_after = rail()
+    assert rail_after != rail_before
+    assert ("decision_logged", "Cut burn to 400k") in rail_after
+    assert ("advice_given", "Slowly") in rail_after
+
+    assert key() == before
 
 
 def test_empty_board_skips_the_model_call(
