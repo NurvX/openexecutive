@@ -44,7 +44,7 @@ deriver fail every embed call with a dimension mismatch.
 |---|---|
 | `DATABASE_URL` | Postgres connection string |
 | `AUTH_JWT_SECRET` | Every issued `HONCHO_API_KEY` derives from this — store it in a password manager; rotating it invalidates all keys |
-| `LLM_OPENAI_API_KEY` | Honcho's `openai` transport accepts any OpenAI-format endpoint, so this can be an OpenRouter key with `base_url` set per slot in `config.toml` |
+| `LLM_OPENAI_API_KEY` | Honcho's `openai` transport accepts any OpenAI-format endpoint, so this can be an OpenRouter key with `base_url` set per slot under `[…model_config.overrides]` in `config.toml` |
 | `EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL` | Point at the `embed` process, e.g. `http://embed:8001/v1` |
 | `EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY` | The sidecar needs no auth, but the OpenAI client requires some string |
 | `EMBEDDING_VECTOR_DIMENSIONS` | `384` for `bge-small-en-v1.5`. Honcho's default schema is `Vector(1536)` |

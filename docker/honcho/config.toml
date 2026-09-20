@@ -39,44 +39,55 @@ USE_AUTH = true
 
 # -------------------------------------------------------------------- #
 # LLM routing — everything via OpenRouter using the openai transport.
+# The endpoint goes under each slot's `[…model_config.overrides]`: Honcho
+# ≥ 3.1 reads `base_url` only from there (a `base_url` directly under
+# `model_config` is silently ignored and calls fall through to
+# api.openai.com).
 # Cheap-tier work (deriver, summary, low-tier dialectic) → Haiku for
-# cost; medium+ dialectic and dream deduction → Sonnet for quality.
+# cost; medium+ dialectic and both dream passes → Sonnet for quality.
 # -------------------------------------------------------------------- #
 
 [deriver.model_config]
 transport = "openai"
 model     = "anthropic/claude-haiku-4.5"
-base_url  = "https://openrouter.ai/api/v1"
+[deriver.model_config.overrides]
+base_url = "https://openrouter.ai/api/v1"
 
 [summary.model_config]
 transport = "openai"
 model     = "anthropic/claude-haiku-4.5"
-base_url  = "https://openrouter.ai/api/v1"
+[summary.model_config.overrides]
+base_url = "https://openrouter.ai/api/v1"
 
 [dialectic.levels.minimal.model_config]
 transport = "openai"
 model     = "anthropic/claude-haiku-4.5"
-base_url  = "https://openrouter.ai/api/v1"
+[dialectic.levels.minimal.model_config.overrides]
+base_url = "https://openrouter.ai/api/v1"
 
 [dialectic.levels.low.model_config]
 transport = "openai"
 model     = "anthropic/claude-haiku-4.5"
-base_url  = "https://openrouter.ai/api/v1"
+[dialectic.levels.low.model_config.overrides]
+base_url = "https://openrouter.ai/api/v1"
 
 [dialectic.levels.medium.model_config]
 transport = "openai"
 model     = "anthropic/claude-sonnet-4.6"
-base_url  = "https://openrouter.ai/api/v1"
+[dialectic.levels.medium.model_config.overrides]
+base_url = "https://openrouter.ai/api/v1"
 
 [dialectic.levels.high.model_config]
 transport = "openai"
 model     = "anthropic/claude-sonnet-4.6"
-base_url  = "https://openrouter.ai/api/v1"
+[dialectic.levels.high.model_config.overrides]
+base_url = "https://openrouter.ai/api/v1"
 
 [dialectic.levels.max.model_config]
 transport = "openai"
 model     = "anthropic/claude-sonnet-4.6"
-base_url  = "https://openrouter.ai/api/v1"
+[dialectic.levels.max.model_config.overrides]
+base_url = "https://openrouter.ai/api/v1"
 
 [dream]
 # Dreaming ON. This is Honcho's offline reflection pass — it synthesizes
@@ -88,10 +99,21 @@ base_url  = "https://openrouter.ai/api/v1"
 # section before going to prod.
 ENABLED = true
 
-[dream.deduction.model_config]
+# Both dream passes. The table names are `deduction_model_config` and
+# `induction_model_config` (Honcho ≥ 3.1); the older
+# `[dream.deduction.model_config]` spelling is ignored, which left both
+# passes on Honcho's default OpenAI model name.
+[dream.deduction_model_config]
 transport = "openai"
 model     = "anthropic/claude-sonnet-4.6"
-base_url  = "https://openrouter.ai/api/v1"
+[dream.deduction_model_config.overrides]
+base_url = "https://openrouter.ai/api/v1"
+
+[dream.induction_model_config]
+transport = "openai"
+model     = "anthropic/claude-sonnet-4.6"
+[dream.induction_model_config.overrides]
+base_url = "https://openrouter.ai/api/v1"
 
 # -------------------------------------------------------------------- #
 # Embeddings — local fastembed sidecar (embed_server.py running as the
