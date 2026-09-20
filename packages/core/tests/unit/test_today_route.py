@@ -1634,11 +1634,15 @@ def test_activity_keeps_closed_alerts_for_the_rail(
     assert "Since-settled thing" in headlines
 
 
-def test_activity_drops_closed_alerts_for_the_narrative(
+def test_activity_drops_the_alert_source_for_the_narrative(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`live_alerts_only` drops them, so the narrative cannot re-report a
-    settled item as live. Live alerts are kept."""
+    """`include_alert_raised=False` drops the whole source.
+
+    Closed alerts would be re-reported as live work; LIVE ones are already
+    proposal cards (`is_live` is the `list_live_alerts` predicate) and the
+    header prompt forbids re-listing cards. Other sources are untouched.
+    """
     db = tmp_path / "narr-activity.db"
     _setup_isolated_db(db, monkeypatch)
     closed = alert_store.insert_alert(
@@ -1651,37 +1655,59 @@ def test_activity_drops_closed_alerts_for_the_narrative(
         source="system", external_id="open-2", severity="high",
         headline="Still open", body="b", db_path=db,
     )
+    episodic.store_decision("finance", "Cut burn to 400k", db_path=db)
 
-    live = [i.summary for i in today_route._build_activity(20, live_alerts_only=True).items]
-    assert "Already handled" not in live
-    assert "Still open" in live
-
-
-def test_narrative_hash_moves_when_only_activity_changes() -> None:
-    """The hash must cover activity. Without this, a board with no proposals,
-    no at-risk department and nobody awaiting produced a constant hash, so the
-    narrative could never regenerate inside a UTC day."""
-    empty_board: dict[str, object] = {"proposals": [], "departments": [], "people": []}
-    before = narrative_cache.build_narrative_input_hash(
-        empty_board, activity=[{"kind": "alert_raised", "summary": "one"}]
-    )
-    after = narrative_cache.build_narrative_input_hash(
-        empty_board, activity=[{"kind": "alert_raised", "summary": "two"}]
-    )
-    assert before != after
+    items = today_route._build_activity(20, include_alert_raised=False).items
+    summaries = [i.summary for i in items]
+    assert "Already handled" not in summaries
+    assert "Still open" not in summaries
+    assert "alert_raised" not in [i.kind for i in items]
+    assert "Cut burn to 400k" in summaries  # other sources survive
 
 
-def test_narrative_hash_ignores_activity_timestamps() -> None:
-    """Keyed on kind + summary, never the stamp — an unchanged rail must not
-    churn the cache (and burn a model call) on every poll."""
-    board: dict[str, object] = {"proposals": [], "departments": [], "people": []}
-    a = narrative_cache.build_narrative_input_hash(
-        board, activity=[{"kind": "dm_sent", "summary": "s", "at": "2026-01-01T00:00:00Z"}]
-    )
-    b = narrative_cache.build_narrative_input_hash(
-        board, activity=[{"kind": "dm_sent", "summary": "s", "at": "2026-06-30T12:00:00Z"}]
-    )
-    assert a == b
+def test_narrative_hash_moves_when_a_proposal_is_rewritten_in_place() -> None:
+    """The alert review rewrites an open alert's note / why-now / move / due
+    date while KEEPING its headline. On headline alone the header went on
+    describing the pre-rewrite situation until the UTC date rolled over."""
+    def board(**review: object) -> dict[str, object]:
+        return {
+            "proposals": [{"headline": "Vendor renewal", "category": "action", **review}],
+            "departments": [], "people": [],
+        }
+
+    base = narrative_cache.build_narrative_input_hash(board())
+    for field, value in (
+        ("review_verdict", "changed"),
+        ("review_note", "two offers now expire Friday"),
+        ("why_now", "counterparty deadline"),
+        ("recommended_move", "escalate"),
+        ("due_at", "2026-09-21T00:00:00Z"),
+    ):
+        assert narrative_cache.build_narrative_input_hash(board(**{field: value})) != base, field
+
+
+def test_narrative_hash_is_stable_across_activity_churn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Activity is deliberately NOT hashed.
+
+    The 20-row rail moves on almost every DM, decision, advice row and
+    completed workflow. Hashing it would regenerate every viewer's narrative —
+    a real model call each — on nearly any Executive action, and on a quiet
+    board it would re-write the identical quiet line forever.
+    """
+    db = tmp_path / "hash-stable.db"
+    _setup_isolated_db(db, monkeypatch)
+
+    snapshot = today_route._build_today()
+    before = narrative_cache.build_narrative_input_hash(snapshot.model_dump())
+
+    episodic.store_decision("finance", "Cut burn to 400k", db_path=db)
+    episodic.store_advice("hr", "Hire?", "Slowly", db_path=db)
+
+    after_snapshot = today_route._build_today()
+    assert [i.kind for i in today_route._build_activity(20).items]  # rail did move
+    assert narrative_cache.build_narrative_input_hash(after_snapshot.model_dump()) == before
 
 
 def test_empty_board_skips_the_model_call(
@@ -1772,15 +1798,17 @@ def test_viewer_slice_scopes_proposals_to_the_teammate(
     assert sliced["people"] == []  # the principal-only section is dropped
 
 
-def test_closed_alerts_never_reach_the_synthesizer(
+def test_alert_raises_never_reach_the_synthesizer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """End-to-end: on a NON-quiet board the model still must not be told about
-    a dismissed alert.
+    """End-to-end on a NON-quiet board: no `alert_raised` row reaches the model.
 
-    The quiet short-circuit cannot be what saves us here — a live proposal
-    keeps the board active — so this proves `live_alerts_only` actually
-    survives the trip through `_regen_briefing_narrative`.
+    Closed alerts are settled work. LIVE ones are worse than redundant —
+    `lifecycle.is_live` is the predicate behind `list_live_alerts`, so a live
+    raise IS a proposal card, and the header prompt forbids re-listing cards.
+    The quiet short-circuit cannot be what saves us here: a live proposal keeps
+    the board active, so this proves the exclusion survives the trip through
+    `_regen_briefing_narrative`.
     """
     db = tmp_path / "e2e-live-only.db"
     _setup_isolated_db(db, monkeypatch)
@@ -1791,6 +1819,9 @@ def test_closed_alerts_never_reach_the_synthesizer(
     )
     assert dismissed is not None
     alert_store.set_status(dismissed, "dismissed", db_path=db)
+    # A non-alert activity row, so "no alert_raised" is proved against a
+    # non-empty feed rather than passing vacuously on an empty one.
+    episodic.store_decision("finance", "Cut burn to 400k", db_path=db)
 
     seen: dict[str, list[str]] = {}
 
@@ -1799,6 +1830,7 @@ def test_closed_alerts_never_reach_the_synthesizer(
         seen["summaries"] = [
             str(a.get("summary", "")) for a in activity  # type: ignore[union-attr]
         ]
+        seen["kinds"] = [str(a.get("kind", "")) for a in activity]  # type: ignore[union-attr]
         return "**Bottom line:** the budget needs you."
 
     monkeypatch.setattr(briefing_narrative, "synthesize_briefing_narrative", _synth)
@@ -1807,4 +1839,7 @@ def test_closed_alerts_never_reach_the_synthesizer(
     c.get("/today")
 
     assert "St. Albans reconciliation gap" not in seen["summaries"]
-    assert "Approve the Q3 budget" in seen["summaries"]
+    # The live one is excluded too — it is already a card below the header.
+    assert "Approve the Q3 budget" not in seen["summaries"]
+    assert "decision_logged" in seen["kinds"]  # feed is non-empty
+    assert "alert_raised" not in seen["kinds"]

@@ -91,30 +91,42 @@ NARRATIVE_PROMPT_VERSION = "4"
 
 
 def build_narrative_input_hash(
-    today_data: dict[str, Any],
-    scope: str = DEFAULT_SCOPE,
-    activity: list[dict[str, Any]] | None = None,
+    today_data: dict[str, Any], scope: str = DEFAULT_SCOPE
 ) -> str:
     """Stable hash of the briefing state the narrative is derived from.
 
-    Keyed on the signals that should trigger a re-write — proposal
-    headlines, at-risk department counts, who's awaiting, and the activity
-    rows the narrative reasons over — plus the UTC date so the narrative
-    refreshes at least daily even if nothing structural changed, plus the
-    viewer `scope` so two viewers whose slices happen to coincide still cache
-    under distinct keys, plus NARRATIVE_PROMPT_VERSION so a prompt rewrite
-    invalidates the cache. Deliberately ignores volatile fields (timestamps,
-    ids) so identical content doesn't churn the cache.
+    Keyed on the signals that should trigger a re-write — each proposal's
+    headline, category AND the review fields that change what the narrative
+    would say about it, at-risk department counts, and who's awaiting — plus
+    the UTC date so the narrative refreshes at least daily even if nothing
+    structural changed, plus the viewer `scope` so two viewers whose slices
+    happen to coincide still cache under distinct keys, plus
+    NARRATIVE_PROMPT_VERSION so a prompt rewrite invalidates the cache.
+    Deliberately ignores volatile fields (timestamps, ids) so identical
+    content doesn't churn the cache.
 
-    ``activity`` must be the SAME list the synthesis is fed — callers get both
-    from ``today._narrative_activity``. Omitting it was a silent staleness bug:
-    on a board with no proposals, no at-risk department and nobody awaiting,
-    every remaining input lived in ``activity``, so the hash was constant and
-    the narrative could never regenerate within a UTC day no matter what the
-    Executive did.
+    The review fields matter because the alert review rewrites an open alert's
+    note, why-now, recommended move or deadline IN PLACE, keeping the headline:
+    on headline alone the header kept describing the pre-rewrite situation.
+
+    Activity is deliberately NOT hashed. It looked like the fix for a frozen
+    header, but the 20-row window moves on almost every DM, decision, advice
+    row and completed workflow, so hashing it regenerates every viewer's
+    narrative — a real model call each — on nearly any Executive action, with
+    no floor. `today._nothing_needs_attention` is what keeps a frozen header
+    from recurring: the state that froze it (nothing on the board) is now
+    answered by a deterministic quiet line instead of a model call.
     """
     proposals = [
-        (p.get("headline", ""), p.get("category", ""))
+        (
+            p.get("headline", ""),
+            p.get("category", ""),
+            p.get("review_verdict", ""),
+            str(p.get("review_note", ""))[:120],
+            str(p.get("why_now", ""))[:120],
+            p.get("recommended_move", ""),
+            p.get("due_at", "") or "",
+        )
         for p in today_data.get("proposals", [])
     ]
     depts = [
@@ -127,12 +139,6 @@ def build_narrative_input_hash(
         for p in today_data.get("people", [])
         if p.get("awaiting_count", 0)
     )
-    # Keyed by kind + summary, never by timestamp, so an unchanged rail does
-    # not churn the cache the way a stamp would.
-    activity_key = sorted(
-        (str(a.get("kind", "")), str(a.get("summary", ""))[:120])
-        for a in (activity or [])
-    )
     payload = {
         "scope": scope,
         "prompt_version": NARRATIVE_PROMPT_VERSION,
@@ -140,7 +146,6 @@ def build_narrative_input_hash(
         "proposals": proposals,
         "depts": depts,
         "awaiting": awaiting,
-        "activity": activity_key,
     }
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
