@@ -808,7 +808,11 @@ class Executive:
             # call time, so scheduling it out here would snapshot (None,
             # None) and the memory_extractor's model call would record
             # unattributed however correct the snapshot itself was.
-            if should_extract(user_message):
+            if should_extract(
+                user_message,
+                origin_channel=session.origin_channel,
+                person_id=person_id,
+            ):
                 schedule_extraction(
                     user_message, full_response, session_id=session.session_id
                 )
@@ -1223,8 +1227,14 @@ class Executive:
             schedule_extraction,
             should_extract,
         )
-        if should_extract(user_message):
-            schedule_extraction(user_message, final_response, session_id=session.session_id)
+        if should_extract(
+            user_message,
+            origin_channel=session.origin_channel,
+            person_id=person_id,
+        ):
+            schedule_extraction(
+                user_message, final_response, session_id=session.session_id
+            )
 
         # Mirror the completed exchange into Honcho (see stream_chat for
         # rationale). Fire-and-forget; no-ops when person_id is None.

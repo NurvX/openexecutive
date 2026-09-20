@@ -9,7 +9,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from pydantic import BaseModel
 
@@ -1833,46 +1833,119 @@ def _is_valid_user_commitment(quote: str, user_message: str) -> bool:
 
 _MAX_INPUT_CHARS = 20_000  # cap each side to avoid runaway cost
 
-def should_extract(user_message: str) -> bool:
+# How many individual drop records ride along in the audit row's `details`.
+# `dropped_count` is always exact; this caps only the itemised list, because a
+# model that returns fifty malformed items would otherwise put fifty records
+# in one audit row. Ten is enough to see the pattern — and the pattern is what
+# an operator reads this field for, since the counts above it already say how
+# bad it is.
+_MAX_DROPPED_IN_AUDIT = 10
+
+def should_extract(
+    user_message: str,
+    *,
+    origin_channel: str = "",
+    person_id: int | None = None,
+) -> bool:
     """True when this turn is worth an extraction pass.
 
-    There is deliberately no length floor. There used to be one on the
-    combined user+assistant length, which discarded short instructions
-    answered at length — on a live tenant it blocked every commitment the
-    principal made while admitting only the long analytical exchanges that
-    had none, and the extractor ran 13 times storing nothing.
+    **No length floor.** There used to be one on the combined user+assistant
+    length, which discarded short instructions answered at length — on a live
+    tenant it blocked every commitment the principal made while admitting only
+    the long analytical exchanges that had none, and the extractor ran 13
+    times storing nothing.
 
     Moving that floor to the user's side does not fix it, it relocates it: the
     canonical executive decision is a long analysis answered with "Approve
     option B." (17 chars) or "Do B." (5), and any floor high enough to skip
     "Done" (4) also skips those. Length cannot separate a decision from an
     acknowledgement — "Do B." and "Done" differ by one character and mean
-    opposite things.
+    opposite things. A pass over an acknowledgement costs one utility-fast
+    call and stores nothing, which is the right trade against losing
+    approvals. If per-turn cost ever becomes the binding constraint, the lever
+    is a semantic prefilter or a per-session cap — not a length proxy for a
+    property it cannot measure.
 
-    `_is_valid_user_commitment` is the gate that actually tests for a
-    commitment: it requires a verbatim quote from the user's own words. A pass
-    over an acknowledgement costs one utility-fast call (~$0.005 observed) and
-    stores nothing, which is the right trade against losing approvals. If
-    per-turn cost ever becomes the binding constraint, the lever is a semantic
-    prefilter or a per-session cap — not a length proxy for a property it
-    cannot measure.
+    **Only the principal's own words.** `_is_valid_user_commitment` is the
+    gate that tests for a commitment, and it does so by requiring a verbatim
+    quote from `user_message`. That is only meaningful when `user_message`
+    actually holds the principal's words. On a chat channel it does not: a
+    teammate's Slack line would be stored in `decisions` with no speaker
+    attached, indistinguishable from the principal's own; an inbound email
+    body is text the sender chose, and a self-quote is free.
 
-    The single decision point for both call sites in
-    `orchestrator.executive`, so the rule is testable directly and the two
-    paths cannot drift apart.
+    Removing the length floor is what makes this matter — short channel
+    traffic used to fall under it incidentally — so the speaker check lands
+    with it. A turn with no `origin_channel` came from the web app, the CLI or
+    the API, all of which are the principal's own authenticated surfaces, and
+    `person_id` is legitimately None there in a single-user install. A turn
+    that names a channel must resolve to a person marked `is_principal`.
+
+    The single decision point for both call sites in `orchestrator.executive`,
+    so the rule is testable directly and the two paths cannot drift apart.
     """
-    return bool(user_message.strip())
+    if not user_message.strip():
+        return False
+    if not origin_channel:
+        return True
+    if person_id is None:
+        return False
+    try:
+        from openexecutive.people.store import get_person
+
+        person = get_person(person_id)
+    except Exception:
+        # Fail closed: an unresolvable speaker is not the principal.
+        logger.warning(
+            "extraction_speaker_lookup_failed person_id=%s channel=%s",
+            person_id,
+            origin_channel,
+            exc_info=True,
+        )
+        return False
+    return bool(person is not None and person.is_principal)
 
 
-# Payload key -> the `kind` a drop is recorded under. The per-item drops below
-# are singular, so grouping the audit rows by `kind` has to see one spelling.
-_ITEM_KINDS = {"decisions": "decision", "initiatives": "initiative", "advice": "advice"}
+# Drop reasons for a payload SHAPE the model got wrong, as opposed to an item
+# it proposed and that was then rejected. Kept apart in the audit row so the
+# `proposed == stored + item drops` arithmetic stays true.
+_SHAPE_REASONS = frozenset({"not_a_list", "item_not_a_dict", "payload_not_a_dict"})
+
+
+class _ItemSpec(NamedTuple):
+    """How one kind of extracted item is read out of the model's payload.
+
+    The three kinds differ only in their field names, so this is the one place
+    those names live. Spelling them once keeps a drop recorded by
+    `_iter_items` and a drop recorded by `_accept` under the same `kind`,
+    which is what makes "bad-quote drops on decisions this week" a single
+    query rather than a union over spellings that have drifted apart.
+    """
+
+    key: str
+    """The payload key the model writes, e.g. `decisions`."""
+
+    kind: str
+    """Singular name every drop record for this kind is filed under."""
+
+    required: tuple[str, ...]
+    """Fields that must be non-empty for the item to be worth storing."""
+
+    label: str
+    """The field echoed (truncated) into a drop so a human can identify it."""
+
+
+_DECISIONS = _ItemSpec("decisions", "decision", ("summary",), "summary")
+_INITIATIVES = _ItemSpec("initiatives", "initiative", ("title", "summary"), "title")
+_ADVICE = _ItemSpec(
+    "advice", "advice", ("query_summary", "advice_summary"), "query_summary"
+)
 
 
 def _iter_items(
-    payload: dict[str, Any], key: str, dropped: list[dict[str, str]]
+    payload: dict[str, Any], spec: _ItemSpec, dropped: list[dict[str, str]]
 ) -> list[dict[str, Any]]:
-    """The dict-shaped items under ``key``, skipping anything malformed.
+    """The dict-shaped items for ``spec``, skipping anything malformed.
 
     The model's tool payload is not schema-checked, so `{"decisions": "..."}`
     or `{"decisions": ["text"]}` used to raise out of the whole pass — taking
@@ -1883,20 +1956,64 @@ def _iter_items(
     A missing key or an explicit `null` is not a drop: the model omitting a
     kind it found nothing for is the normal case.
     """
-    kind = _ITEM_KINDS[key]
-    raw = payload.get(key)
+    raw = payload.get(spec.key)
     if raw is None:
         return []
     if not isinstance(raw, list):
-        dropped.append({"kind": kind, "reason": "not_a_list"})
+        dropped.append({"kind": spec.kind, "reason": "not_a_list"})
         return []
     out: list[dict[str, Any]] = []
     for item in raw:
         if isinstance(item, dict):
             out.append(item)
         else:
-            dropped.append({"kind": kind, "reason": "item_not_a_dict"})
+            dropped.append({"kind": spec.kind, "reason": "item_not_a_dict"})
     return out
+
+
+def _accept(
+    item: dict[str, Any],
+    spec: _ItemSpec,
+    user_message: str,
+    dropped: list[dict[str, str]],
+) -> bool:
+    """True when ``item`` is complete and genuinely the user's own commitment.
+
+    Shared by all three kinds so a drop is recorded on every rejecting path.
+    Counting an item as proposed and then returning without a drop record is
+    the bug this centralises away: it broke `proposed == stored + dropped`,
+    which is the arithmetic an operator uses to tell "the model found nothing"
+    from "the model found things and every one was rejected".
+
+    The quote check is the hard gate. The model has repeatedly proven willing
+    to log the Executive's *recommendations* as if the user had committed to
+    them — the May 27 incident turned the question "Should we scope as fixed
+    POC or hourly?" into the decision "First $30K deal will be structured as
+    fixed POC". Requiring a verbatim quote from the user's own message is what
+    catches that; the prompt is only the soft instruction layer.
+    """
+    missing = [field for field in spec.required if not item.get(field)]
+    if missing:
+        dropped.append(
+            {"kind": spec.kind, "reason": "missing_field", "field": missing[0]}
+        )
+        return False
+
+    quote = str(item.get("user_commitment_quote", ""))
+    label = str(item.get(spec.label, ""))
+    if not _is_valid_user_commitment(quote, user_message):
+        dropped.append(
+            {"kind": spec.kind, "reason": "bad_quote", "label": label[:60]}
+        )
+        logger.debug(
+            "Dropping %s — invalid user_commitment_quote %r (%s=%r)",
+            spec.kind,
+            quote[:120],
+            spec.label,
+            label[:80],
+        )
+        return False
+    return True
 
 
 def _audit_extraction(
@@ -1917,11 +2034,22 @@ def _audit_extraction(
     is the RATIO over time, which a `proposed>0, stored=0` streak makes
     obvious.
 
+    `proposed` counts items the model actually emitted as objects, so every
+    proposed item is either stored or dropped and
+    `proposed == stored + (dropped - malformed)` holds. A malformed SHAPE was
+    never a usable item, so it is counted separately rather than folded into
+    `proposed` — otherwise `dropped > proposed` on a payload that was nothing
+    but garbage. `malformed` is broken out for the same reason the rest of
+    this row exists: without it a pass where the model returned only garbage
+    reads `proposed=0 stored=0`, which is what "the model found nothing"
+    looks like.
+
     Never raises: auditing an extraction must not be able to break the turn
     that produced it.
     """
     total_proposed = sum(proposed.values())
     total_stored = sum(stored.values())
+    malformed = sum(1 for d in dropped if d["reason"] in _SHAPE_REASONS)
     prefix = f"FAILED({failure}) " if failure else ""
     try:
         from openexecutive.audit import log_event
@@ -1929,18 +2057,19 @@ def _audit_extraction(
         log_event(
             "memory_extraction",
             f"{prefix}proposed={total_proposed} stored={total_stored} "
-            f"dropped={len(dropped)}",
+            f"dropped={len(dropped)} malformed={malformed}",
             session_id=session_id or None,
             actor="memory_extractor",
             details={
                 "proposed": proposed,
                 "stored": stored,
                 "dropped_count": len(dropped),
+                "malformed_count": malformed,
                 "failure": failure,
                 # Structured like `proposed`/`stored` so "how many bad-quote
                 # drops on decisions this week" is a query, not a string split
                 # over a field that can itself contain colons.
-                "dropped": dropped[:10],
+                "dropped": dropped[:_MAX_DROPPED_IN_AUDIT],
             },
         )
     except Exception:
@@ -2061,82 +2190,45 @@ async def _extract_and_store(
             if not isinstance(inp, dict):
                 dropped.append({"kind": "pass", "reason": "payload_not_a_dict"})
                 continue
-            # Validate every item against the user's actual text. The LLM has
-            # repeatedly proven willing to log the executive's recommendations
-            # as if the user had committed to them — see the May 27 incident
-            # where "Should we scope as fixed POC or hourly?" produced a
-            # decision "First $30K deal will be structured as fixed POC".
-            # The user_commitment_quote field + this validator are the
-            # hard gate that catches that pattern; the prompt is now just
-            # the soft instruction layer.
-            for d in _iter_items(inp, "decisions", dropped):
+            # Each loop is read → count → validate → store. The counting and
+            # validation are identical across the three kinds and live in
+            # `_accept`; only the store call differs, because the three store
+            # functions take different fields.
+            for d in _iter_items(inp, _DECISIONS, dropped):
                 proposed["decisions"] += 1
-                domain = d.get("domain", "general")
-                summary = d.get("summary", "")
-                quote = d.get("user_commitment_quote", "")
-                if not summary:
-                    dropped.append({"kind": "decision", "reason": "missing_summary"})
+                if not _accept(d, _DECISIONS, user_message, dropped):
                     continue
-                if not _is_valid_user_commitment(quote, user_message):
-                    dropped.append({"kind": "decision", "reason": "bad_quote", "summary": summary[:60]})
-                    logger.debug(
-                        "Dropping decision — invalid user_commitment_quote %r (summary=%r)",
-                        quote[:120],
-                        summary[:80],
-                    )
-                    continue
-                stored["decisions"] += 1
                 store_decision(
-                    domain=domain,
-                    summary=summary,
+                    domain=d.get("domain", "general"),
+                    summary=d["summary"],
                     rationale=d.get("rationale", ""),
                     session_id=session_id,
                     db_path=db_path,
                 )
-            for i in _iter_items(inp, "initiatives", dropped):
+                stored["decisions"] += 1
+            for i in _iter_items(inp, _INITIATIVES, dropped):
                 proposed["initiatives"] += 1
-                title = i.get("title", "")
-                status = i.get("status", "active")
-                summary = i.get("summary", "")
-                quote = i.get("user_commitment_quote", "")
-                if not (title and summary):
-                    dropped.append({"kind": "initiative", "reason": "missing_field"})
+                if not _accept(i, _INITIATIVES, user_message, dropped):
                     continue
-                if not _is_valid_user_commitment(quote, user_message):
-                    dropped.append({"kind": "initiative", "reason": "bad_quote", "title": title[:60]})
-                    logger.debug(
-                        "Dropping initiative — invalid user_commitment_quote %r (title=%r)",
-                        quote[:120],
-                        title[:80],
-                    )
-                    continue
+                store_initiative(
+                    title=i["title"],
+                    status=i.get("status", "active"),
+                    summary=i["summary"],
+                    db_path=db_path,
+                )
                 stored["initiatives"] += 1
-                store_initiative(title=title, status=status, summary=summary, db_path=db_path)
-            for a in _iter_items(inp, "advice", dropped):
+            for a in _iter_items(inp, _ADVICE, dropped):
                 proposed["advice"] += 1
-                domain = a.get("domain", "general")
-                query_summary = a.get("query_summary", "")
-                advice_summary = a.get("advice_summary", "")
-                quote = a.get("user_commitment_quote", "")
-                if not (query_summary and advice_summary):
-                    dropped.append({"kind": "advice", "reason": "missing_field"})
+                if not _accept(a, _ADVICE, user_message, dropped):
                     continue
-                if not _is_valid_user_commitment(quote, user_message):
-                    dropped.append({"kind": "advice", "reason": "bad_quote", "query_summary": query_summary[:60]})
-                    logger.debug(
-                        "Dropping advice — invalid user_commitment_quote %r (query=%r)",
-                        quote[:120],
-                        query_summary[:80],
-                    )
-                    continue
-                stored["advice"] += 1
                 store_advice(
-                    domain=domain,
-                    query_summary=query_summary,
-                    advice_summary=advice_summary,
+                    domain=a.get("domain", "general"),
+                    query_summary=a["query_summary"],
+                    advice_summary=a["advice_summary"],
                     session_id=session_id,
                     db_path=db_path,
                 )
+                stored["advice"] += 1
 
     except Exception as exc:
         # Recorded so the audit row can say the pass FAILED. Without it a
@@ -2145,6 +2237,15 @@ async def _extract_and_store(
         # state this row exists to eliminate.
         failure = type(exc).__name__
         logger.exception("Episodic memory extraction failed — skipping silently")
+    except BaseException as exc:
+        # `CancelledError` is a BaseException, so the clause above misses it
+        # while the `finally` still writes a row. A pass cancelled at shutdown
+        # would then be logged as `proposed=0 stored=0 failure=''` — byte for
+        # byte what "the model proposed nothing" looks like, which is the one
+        # ambiguity this row exists to remove. Labelled and re-raised, never
+        # swallowed: cancellation still has to propagate.
+        failure = type(exc).__name__
+        raise
     finally:
         # In `finally`, not the happy path: a pass that crashed is exactly the
         # one an operator needs to see.

@@ -35,6 +35,21 @@ def db(tmp_path: Path) -> Path:
     return db_path
 
 
+@pytest.fixture(autouse=True)
+def _no_audit_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep `memory_extraction` rows out of the default `./episodic_memory.db`.
+
+    `_audit_extraction` calls `openexecutive.audit.log_event`, which targets
+    the default DB regardless of the `db_path` the extraction was given. The
+    tests below that drive `extract_and_store` therefore leak rows that other
+    modules read back as real data — visible only in a full-suite run, which
+    is the audit-log pollution trap in CLAUDE.md.
+    """
+    monkeypatch.setattr(
+        "openexecutive.audit.log_event", lambda *a, **kw: None, raising=False
+    )
+
+
 def test_decision_update_and_delete(db: Path) -> None:
     store_decision("strategy", "Expand to EU", rationale="Larger market", db_path=db)
     items = list_decisions(db_path=db)
@@ -464,33 +479,71 @@ def test_extraction_gate_has_no_length_floor() -> None:
 
 
 def test_executive_call_sites_use_the_shared_gate() -> None:
-    """Both extraction trigger sites in executive.py must call the shared
-    predicate, not inline a length comparison. Previously they were 300
-    (committee) and 800 (stream) — asymmetric, low, and easy to drift further.
-    Pin via source inspection because the call sites live inside long async
-    streaming methods that aren't unit-testable end-to-end.
+    """Every `schedule_extraction` in executive.py must be guarded by a bare
+    `should_extract(...)` call and nothing else.
+
+    Checked against the parsed syntax tree rather than the source text. A
+    string search pins yesterday's spelling: `if should_extract(user_message)
+    and len(user_message) >= 200:` re-introduces the exact defect this work
+    removed — a length floor at the call site — while still containing the
+    substring a `count(...)` assertion looks for. The AST sees the extra
+    condition.
+
+    The call sites live inside long async streaming methods that are not
+    unit-testable end-to-end, which is why the guard is pinned structurally
+    rather than by driving it.
     """
+    import ast
     import inspect
 
     from openexecutive.orchestrator import executive
 
-    src = inspect.getsource(executive)
-    # Each call site contributes an import AND a call, so >= 2 would be
-    # satisfied by a single surviving site — a partial revert would pass.
-    assert src.count("should_extract(user_message)") == 2, (
-        "both the stream_chat and stream_chat_with_committee extraction "
-        "guards must call should_extract(user_message)"
+    tree = ast.parse(inspect.getsource(executive))
+
+    def _calls_schedule(node: ast.AST) -> bool:
+        return any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "schedule_extraction"
+            for n in ast.walk(node)
+        )
+
+    guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If) and _calls_schedule(node)
+    ]
+    assert len(guards) == 2, (
+        "expected exactly two guarded extraction sites (stream_chat and "
+        f"stream_chat_with_committee), found {len(guards)}"
     )
-    # And they must measure the USER's message. Summing in the assistant's
-    # length is the original defect: it let a verbose reply drag a trivial turn
-    # in, and discarded a one-line instruction answered concisely.
-    assert "len(full_response) + len(user_message)" not in src
-    assert "len(final_response) + len(user_message)" not in src
-    # And the old hard-coded thresholds must be gone — guard against a
-    # partial revert that wires the constant in one place but leaves the
-    # other path on the old number.
-    assert "len(user_message) >= 800" not in src
-    assert "len(user_message) >= 300" not in src
+
+    for guard in guards:
+        test = guard.test
+        assert isinstance(test, ast.Call), (
+            f"line {guard.lineno}: the guard must be a bare should_extract(...) "
+            f"call, not {type(test).__name__} — an `and len(...) >= N` clause "
+            "is the length floor coming back"
+        )
+        assert isinstance(test.func, ast.Name) and test.func.id == "should_extract", (
+            f"line {guard.lineno}: guard must call should_extract"
+        )
+        assert [a.id for a in test.args if isinstance(a, ast.Name)] == ["user_message"]
+        # The speaker check is not optional: a channel turn carries someone
+        # else's words, and the quote validator cannot tell whose they are.
+        assert {kw.arg for kw in test.keywords} == {"origin_channel", "person_id"}, (
+            f"line {guard.lineno}: guard must pass the speaker's channel and id"
+        )
+
+    # No extraction may be scheduled outside a guard.
+    guarded = {id(n) for g in guards for n in ast.walk(g)}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "schedule_extraction"
+        ):
+            assert id(node) in guarded, f"line {node.lineno}: unguarded extraction"
 
 
 # ---------------------------------------------------------------------------

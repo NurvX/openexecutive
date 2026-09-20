@@ -927,13 +927,29 @@ memory:
     also skips those. "Do B." and "Done" differ by one character and mean
     opposite things, so length cannot separate a decision from an
     acknowledgement. `_is_valid_user_commitment` — the verbatim-quote check
-    against the user's own words — is the only gate that can, and it is the
-    one that runs. The cost of admitting acknowledgements is one utility-fast
+    against the user's own words — is the gate that can, and it is the one
+    that runs. The cost of admitting acknowledgements is one utility-fast
     call per turn that proposes nothing.
+    That quote check presumes `user_message` holds the PRINCIPAL's words, and
+    on a chat channel it does not: `Executive.chat()` is reached from Slack,
+    Discord, Telegram, Google Chat and the email poller, so a teammate's line
+    would be stored in `decisions` with no speaker attached, and an inbound
+    email body is text the sender chose (a self-quote is free). Removing the
+    length floor is what makes this bite — short channel traffic used to fall
+    under it incidentally — so `should_extract` also takes `origin_channel`
+    and `person_id`. Empty channel = web / CLI / API, the principal's own
+    authenticated surfaces, where person_id is legitimately None in a
+    single-user install. A named channel must resolve to `is_principal`;
+    an unresolvable speaker fails closed.
     Every pass writes a `memory_extraction` audit row (proposed / stored /
-    dropped-with-reason, plus a `failure` reason when the pass raises) —
-    before it, an extractor storing nothing looked identical to one with
-    nothing to store. A `proposed>0, stored=0` streak is the signal to watch.
+    dropped-with-reason / malformed, plus a `failure` reason when the pass
+    raises — the handler catches BaseException too, so a CancelledError at
+    shutdown is not logged as a clean empty pass). Before it, an extractor
+    storing nothing looked identical to one with nothing to store. A
+    `proposed>0, stored=0` streak is the signal to watch; `malformed` keeps a
+    pass that got only garbage from reading as one that found nothing.
+    `stored` is incremented AFTER the write, so a locked database reports
+    `stored=0` rather than a healthy-looking pass that wrote no rows.
 
 peer_memory:
   what: |
