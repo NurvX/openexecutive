@@ -684,13 +684,14 @@ def _build_today(
     # Attention-worthy people first; stable name order within a priority band.
     person_items.sort(key=lambda p: (-p.priority, p.full_name))
 
+    from openexecutive.alerts import lifecycle as lifecycle_module
     from openexecutive.alerts.lifecycle import list_live_alerts
     from openexecutive.alerts.store import count_superseded_by
     from openexecutive.briefing.ranking import score_and_categorize
 
     # Live = unread AND inside its TTL AND not snoozed — the read-side twin of
     # the scheduler's expiry sweep, so the page is right before the sweep runs.
-    raw_alerts = list_live_alerts(limit=100, now=now)
+    raw_alerts = list_live_alerts(limit=lifecycle_module.BOARD_LIMIT, now=now)
     superseded_counts = count_superseded_by()
     trust_by_slug = _watch_trust_by_slug(raw_alerts)
     proposal_items = []

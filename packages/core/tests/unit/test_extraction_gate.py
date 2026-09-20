@@ -517,7 +517,11 @@ async def test_a_cancelled_pass_is_not_logged_as_an_empty_one(db: Path) -> None:
     rows: list[dict[str, Any]] = []
 
     async def _hang(*args: Any, **kwargs: Any) -> Any:
-        await asyncio.sleep(3600)
+        # Long enough to still be awaiting when the cancel lands, short enough
+        # that a cancel which does NOT land fails this test in seconds rather
+        # than hanging the CI job until its own timeout.
+        await asyncio.sleep(5)
+        raise AssertionError("the pass was never cancelled")
 
     with (
         mock.patch(
