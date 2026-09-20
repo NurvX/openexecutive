@@ -915,17 +915,25 @@ memory:
     populates `domain` but not `department`, so today the mirror only
     fires for explicit dept-scoped writers; falling back to `domain`
     is a deliberate follow-up decision, not silent drift.
-    Extraction is gated on MIN_USER_CHARS_FOR_EXTRACTION, measured on the
-    USER's message only. It was a combined user+assistant floor of 1500,
-    which on a live tenant blocked 9 of 16 turns — every instruction the
-    principal gave — while admitting the 7 long analytical exchanges that
-    contained no commitment; the extractor ran 13 times and stored nothing.
-    Decisive instructions are short and the analysis around them is long, so
-    a combined floor discards what it exists to capture, and the user's own
-    words are the only text `_is_valid_user_commitment` accepts a quote from.
-    Every pass now writes a `memory_extraction` audit row (proposed / stored /
-    dropped-with-reason) — before it, an extractor storing nothing looked
-    identical to one with nothing to store.
+    Extraction is gated by `should_extract(user_message)`, which has NO
+    length floor — it admits any non-blank user message. There used to be a
+    combined user+assistant floor of 1500 chars, which on a live tenant
+    blocked 9 of 16 turns — every instruction the principal gave — while
+    admitting the 7 long analytical exchanges that contained no commitment;
+    the extractor ran 13 times and stored nothing. Moving that floor to the
+    user's side relocates the bug rather than fixing it: the canonical
+    executive decision is a long analysis answered with "Approve option B."
+    (17 chars) or "Do B." (5), and any floor high enough to skip "Done" (4)
+    also skips those. "Do B." and "Done" differ by one character and mean
+    opposite things, so length cannot separate a decision from an
+    acknowledgement. `_is_valid_user_commitment` — the verbatim-quote check
+    against the user's own words — is the only gate that can, and it is the
+    one that runs. The cost of admitting acknowledgements is one utility-fast
+    call per turn that proposes nothing.
+    Every pass writes a `memory_extraction` audit row (proposed / stored /
+    dropped-with-reason, plus a `failure` reason when the pass raises) —
+    before it, an extractor storing nothing looked identical to one with
+    nothing to store. A `proposed>0, stored=0` streak is the signal to watch.
 
 peer_memory:
   what: |

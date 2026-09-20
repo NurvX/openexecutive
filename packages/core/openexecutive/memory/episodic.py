@@ -1833,44 +1833,79 @@ def _is_valid_user_commitment(quote: str, user_message: str) -> bool:
 
 _MAX_INPUT_CHARS = 20_000  # cap each side to avoid runaway cost
 
-# Minimum chars in the USER's message required to schedule extraction.
-#
-# This was a combined user+assistant floor of 1500, and measured against real
-# traffic it selected almost exactly the wrong turns. On one tenant it blocked
-# 9 of 16 exchanges, and the 9 included every substantive instruction the
-# principal gave — "It's a mistake on the lp purchased properties worksheet.
-# Correct it there. And record this as fixed." (1312 combined), "This is not
-# relevant for us. Don't track this" (910), "The briefing is incorrect. We are
-# not under water 2.9m" (1032) — while the 7 it admitted were long analytical
-# exchanges containing no user commitment at all. The extractor ran 13 times
-# and stored nothing, because it only ever saw the turns with nothing in them.
-#
-# The combined length was the wrong axis. A decision lives in what the
-# PRINCIPAL said, which is also the only text `_is_valid_user_commitment` will
-# accept a quote from; the Executive's analysis around it can run to thousands
-# of characters without containing a single commitment. Decisive instructions
-# are short by nature ("Correct it there", "Don't track this"), so a floor that
-# scales with the assistant's verbosity systematically discards them.
-#
-# The floor now only has to separate a real instruction from a bare
-# acknowledgement — "No", "Done", "Who am I?" — which is what the old comment
-# meant by small talk. Both stream_chat and the committee path use this
-# constant; keeping them symmetric prevents the committee path from firing more
-# often than streaming, which it used to.
-MIN_USER_CHARS_FOR_EXTRACTION = 40
+def should_extract(user_message: str) -> bool:
+    """True when this turn is worth an extraction pass.
 
-# Back-compat alias. External callers (and older tests) may still import the
-# old name; it no longer reflects what is measured, so nothing new should use
-# it.
-MIN_TURN_CHARS_FOR_EXTRACTION = MIN_USER_CHARS_FOR_EXTRACTION
+    There is deliberately no length floor. There used to be one on the
+    combined user+assistant length, which discarded short instructions
+    answered at length — on a live tenant it blocked every commitment the
+    principal made while admitting only the long analytical exchanges that
+    had none, and the extractor ran 13 times storing nothing.
+
+    Moving that floor to the user's side does not fix it, it relocates it: the
+    canonical executive decision is a long analysis answered with "Approve
+    option B." (17 chars) or "Do B." (5), and any floor high enough to skip
+    "Done" (4) also skips those. Length cannot separate a decision from an
+    acknowledgement — "Do B." and "Done" differ by one character and mean
+    opposite things.
+
+    `_is_valid_user_commitment` is the gate that actually tests for a
+    commitment: it requires a verbatim quote from the user's own words. A pass
+    over an acknowledgement costs one utility-fast call (~$0.005 observed) and
+    stores nothing, which is the right trade against losing approvals. If
+    per-turn cost ever becomes the binding constraint, the lever is a semantic
+    prefilter or a per-session cap — not a length proxy for a property it
+    cannot measure.
+
+    The single decision point for both call sites in
+    `orchestrator.executive`, so the rule is testable directly and the two
+    paths cannot drift apart.
+    """
+    return bool(user_message.strip())
+
+
+# Payload key -> the `kind` a drop is recorded under. The per-item drops below
+# are singular, so grouping the audit rows by `kind` has to see one spelling.
+_ITEM_KINDS = {"decisions": "decision", "initiatives": "initiative", "advice": "advice"}
+
+
+def _iter_items(
+    payload: dict[str, Any], key: str, dropped: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    """The dict-shaped items under ``key``, skipping anything malformed.
+
+    The model's tool payload is not schema-checked, so `{"decisions": "..."}`
+    or `{"decisions": ["text"]}` used to raise out of the whole pass — taking
+    the other two kinds with it AND suppressing the audit row, which left the
+    log looking exactly like "extraction never ran". Malformed shapes are now
+    counted as drops and the pass continues.
+
+    A missing key or an explicit `null` is not a drop: the model omitting a
+    kind it found nothing for is the normal case.
+    """
+    kind = _ITEM_KINDS[key]
+    raw = payload.get(key)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        dropped.append({"kind": kind, "reason": "not_a_list"})
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            out.append(item)
+        else:
+            dropped.append({"kind": kind, "reason": "item_not_a_dict"})
+    return out
 
 
 def _audit_extraction(
     proposed: dict[str, int],
     stored: dict[str, int],
-    dropped: list[str],
+    dropped: list[dict[str, str]],
     *,
     session_id: str,
+    failure: str = "",
 ) -> None:
     """One `memory_extraction` audit row per extraction pass.
 
@@ -1887,20 +1922,24 @@ def _audit_extraction(
     """
     total_proposed = sum(proposed.values())
     total_stored = sum(stored.values())
+    prefix = f"FAILED({failure}) " if failure else ""
     try:
         from openexecutive.audit import log_event
 
         log_event(
             "memory_extraction",
-            f"proposed={total_proposed} stored={total_stored} dropped={len(dropped)}",
+            f"{prefix}proposed={total_proposed} stored={total_stored} "
+            f"dropped={len(dropped)}",
             session_id=session_id or None,
             actor="memory_extractor",
             details={
                 "proposed": proposed,
                 "stored": stored,
                 "dropped_count": len(dropped),
-                # Reasons, not content: enough to tell a validator rejection
-                # from an empty pass without copying company data into the log.
+                "failure": failure,
+                # Structured like `proposed`/`stored` so "how many bad-quote
+                # drops on decisions this week" is a query, not a string split
+                # over a field that can itself contain colons.
                 "dropped": dropped[:10],
             },
         )
@@ -1958,6 +1997,10 @@ async def _extract_and_store(
     db_path: Path,
     session_id: str,
 ) -> None:
+    proposed = {"decisions": 0, "initiatives": 0, "advice": 0}
+    stored = {"decisions": 0, "initiatives": 0, "advice": 0}
+    dropped: list[dict[str, str]] = []
+    failure = ""
     try:
         from openexecutive.audit.usage import log_model_usage
         from openexecutive.config import get_settings
@@ -2009,15 +2052,15 @@ async def _extract_and_store(
         # total failure was an empty `decisions` table nobody was watching. It
         # took reading a tenant's SQLite to find that the turn gate had been
         # discarding every commitment for the whole life of the install.
-        proposed = {"decisions": 0, "initiatives": 0, "advice": 0}
-        stored = {"decisions": 0, "initiatives": 0, "advice": 0}
-        dropped: list[str] = []
 
         for block in response.content:
             if block.type != "tool_use" or block.name != "store_memories":
                 continue
 
             inp = block.input
+            if not isinstance(inp, dict):
+                dropped.append({"kind": "pass", "reason": "payload_not_a_dict"})
+                continue
             # Validate every item against the user's actual text. The LLM has
             # repeatedly proven willing to log the executive's recommendations
             # as if the user had committed to them — see the May 27 incident
@@ -2026,15 +2069,16 @@ async def _extract_and_store(
             # The user_commitment_quote field + this validator are the
             # hard gate that catches that pattern; the prompt is now just
             # the soft instruction layer.
-            for d in inp.get("decisions", []):
+            for d in _iter_items(inp, "decisions", dropped):
                 proposed["decisions"] += 1
                 domain = d.get("domain", "general")
                 summary = d.get("summary", "")
                 quote = d.get("user_commitment_quote", "")
                 if not summary:
+                    dropped.append({"kind": "decision", "reason": "missing_summary"})
                     continue
                 if not _is_valid_user_commitment(quote, user_message):
-                    dropped.append(f"decision:bad_quote:{summary[:60]}")
+                    dropped.append({"kind": "decision", "reason": "bad_quote", "summary": summary[:60]})
                     logger.debug(
                         "Dropping decision — invalid user_commitment_quote %r (summary=%r)",
                         quote[:120],
@@ -2049,16 +2093,17 @@ async def _extract_and_store(
                     session_id=session_id,
                     db_path=db_path,
                 )
-            for i in inp.get("initiatives", []):
+            for i in _iter_items(inp, "initiatives", dropped):
                 proposed["initiatives"] += 1
                 title = i.get("title", "")
                 status = i.get("status", "active")
                 summary = i.get("summary", "")
                 quote = i.get("user_commitment_quote", "")
                 if not (title and summary):
+                    dropped.append({"kind": "initiative", "reason": "missing_field"})
                     continue
                 if not _is_valid_user_commitment(quote, user_message):
-                    dropped.append(f"initiative:bad_quote:{title[:60]}")
+                    dropped.append({"kind": "initiative", "reason": "bad_quote", "title": title[:60]})
                     logger.debug(
                         "Dropping initiative — invalid user_commitment_quote %r (title=%r)",
                         quote[:120],
@@ -2067,16 +2112,17 @@ async def _extract_and_store(
                     continue
                 stored["initiatives"] += 1
                 store_initiative(title=title, status=status, summary=summary, db_path=db_path)
-            for a in inp.get("advice", []):
+            for a in _iter_items(inp, "advice", dropped):
                 proposed["advice"] += 1
                 domain = a.get("domain", "general")
                 query_summary = a.get("query_summary", "")
                 advice_summary = a.get("advice_summary", "")
                 quote = a.get("user_commitment_quote", "")
                 if not (query_summary and advice_summary):
+                    dropped.append({"kind": "advice", "reason": "missing_field"})
                     continue
                 if not _is_valid_user_commitment(quote, user_message):
-                    dropped.append(f"advice:bad_quote:{query_summary[:60]}")
+                    dropped.append({"kind": "advice", "reason": "bad_quote", "query_summary": query_summary[:60]})
                     logger.debug(
                         "Dropping advice — invalid user_commitment_quote %r (query=%r)",
                         quote[:120],
@@ -2092,10 +2138,19 @@ async def _extract_and_store(
                     db_path=db_path,
                 )
 
-        _audit_extraction(proposed, stored, dropped, session_id=session_id)
-
-    except Exception:
+    except Exception as exc:
+        # Recorded so the audit row can say the pass FAILED. Without it a
+        # provider outage writes no rows at all, which reads identically to
+        # "extraction was never scheduled" — the indistinguishable-failure
+        # state this row exists to eliminate.
+        failure = type(exc).__name__
         logger.exception("Episodic memory extraction failed — skipping silently")
+    finally:
+        # In `finally`, not the happy path: a pass that crashed is exactly the
+        # one an operator needs to see.
+        _audit_extraction(
+            proposed, stored, dropped, session_id=session_id, failure=failure
+        )
 
 
 def schedule_extraction(

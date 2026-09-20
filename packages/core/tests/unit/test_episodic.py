@@ -443,52 +443,43 @@ def test_extraction_prompt_includes_source_attribution_rule() -> None:
         )
 
 
-def test_extraction_floor_admits_instructions_and_blocks_acknowledgements() -> None:
-    """The floor gates extraction in both stream_chat and the committee path.
+def test_extraction_gate_has_no_length_floor() -> None:
+    """The floor was removed, not moved.
 
-    This asserted `>= 1000` on a COMBINED user+assistant length, to stop
-    extraction firing on trivial Q&A. The cost concern was real; the axis was
-    not. Measured on a live tenant, that floor blocked 9 of 16 exchanges and
-    the 9 contained every instruction the principal gave, because decisive
-    instructions are short and the Executive's analysis around them is long.
-    The extractor ran 13 times and stored nothing.
-
-    The floor now measures the user's own message — the only text a commitment
-    can come from, and the only text the quote validator will accept. Pinned to
-    real messages rather than a magic number, so a future change is judged on
-    what it admits and blocks, not on whether a constant looks big enough.
+    It began as a combined user+assistant length and discarded short
+    instructions answered at length. Relocating it to the user's side only
+    relocates the bug: "Do B." (5 chars) and "Done" (4) differ by one
+    character and mean opposite things, so no threshold separates them.
+    `_is_valid_user_commitment` is the gate that actually tests for a
+    commitment.
     """
-    from openexecutive.memory.episodic import MIN_USER_CHARS_FOR_EXTRACTION
+    from openexecutive.memory import episodic
 
-    assert isinstance(MIN_USER_CHARS_FOR_EXTRACTION, int)
-    # Real instructions from the tenant that the old floor discarded.
-    for instruction in (
-        "This is not relevant for us.  Don't track this",
-        "Well remember you fixed it or something. So we don't keep getting. Notified.",
-    ):
-        assert len(instruction.strip()) >= MIN_USER_CHARS_FOR_EXTRACTION
-
-    # Bare acknowledgements still buy nothing — this is what the floor is for.
-    for noise in ("No", "Done", "ok", "yes", "Nope."):
-        assert len(noise.strip()) < MIN_USER_CHARS_FOR_EXTRACTION
+    for decision in ("Do B.", "Approve option B.", "Kill it.", "no, drop that"):
+        assert episodic.should_extract(decision)
+    for blank in ("", "  "):
+        assert not episodic.should_extract(blank)
+    assert not hasattr(episodic, "MIN_USER_CHARS_FOR_EXTRACTION")
+    assert not hasattr(episodic, "MIN_TURN_CHARS_FOR_EXTRACTION")
 
 
-def test_executive_call_sites_use_min_turn_chars_constant() -> None:
-    """Both extraction trigger sites in executive.py must reference the
-    constant, not a hard-coded number. Previously they were 300 (committee)
-    and 800 (stream) — asymmetric, low, and easy to drift further. Pin via
-    source inspection because the call sites live inside long async streaming
-    methods that aren't unit-testable end-to-end.
+def test_executive_call_sites_use_the_shared_gate() -> None:
+    """Both extraction trigger sites in executive.py must call the shared
+    predicate, not inline a length comparison. Previously they were 300
+    (committee) and 800 (stream) — asymmetric, low, and easy to drift further.
+    Pin via source inspection because the call sites live inside long async
+    streaming methods that aren't unit-testable end-to-end.
     """
     import inspect
 
     from openexecutive.orchestrator import executive
 
     src = inspect.getsource(executive)
-    # The constant must be referenced at least twice (once per call site).
-    assert src.count("MIN_USER_CHARS_FOR_EXTRACTION") >= 2, (
-        "executive.py must reference MIN_USER_CHARS_FOR_EXTRACTION in both "
-        "the stream_chat and stream_chat_with_committee extraction guards"
+    # Each call site contributes an import AND a call, so >= 2 would be
+    # satisfied by a single surviving site — a partial revert would pass.
+    assert src.count("should_extract(user_message)") == 2, (
+        "both the stream_chat and stream_chat_with_committee extraction "
+        "guards must call should_extract(user_message)"
     )
     # And they must measure the USER's message. Summing in the assistant's
     # length is the original defect: it let a verbose reply drag a trivial turn
