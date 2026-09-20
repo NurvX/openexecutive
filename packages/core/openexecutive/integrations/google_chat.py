@@ -180,12 +180,13 @@ async def _process_and_reply(
         session = Session(
             session_id=session_id,
             company_profile=profile if not profile.is_empty() else None,
-            # Declared so `ack_alert`'s server-side trust check applies here.
-            # This adapter has no roster gate (the webhook authenticates
-            # Google, not the sender) and never populates trusted_alert_ids,
-            # so the effect is that alerts cannot be acked from Google Chat at
-            # all — which matches what the channel block already tells the
-            # model about this surface.
+            # Names the surface for logging and the `<channel>` block. It no
+            # longer arms `ack_alert`'s trust check — that runs on every
+            # session now — but the outcome here is unchanged: this adapter
+            # has no roster gate (the webhook authenticates Google, not the
+            # sender) and never populates trusted_alert_ids, so alerts cannot
+            # be acked from Google Chat at all, which matches what the channel
+            # block already tells the model about this surface.
             origin_channel="google_chat",
         )
         retrieved_context = retrieve(query=message_text)

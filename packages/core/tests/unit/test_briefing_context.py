@@ -80,9 +80,71 @@ def test_excludes_acked_and_dismissed(db: Path) -> None:
     set_status(dismissed, "dismissed", db_path=db)
 
     out = format_open_alerts_for_prompt(db_path=db)
-    assert f"[{keep}]" in out
-    assert "Already handled" not in out
-    assert "Not interested" not in out
+    open_block, _, handled_block = out.partition("Already handled —")
+
+    # Closed rows are never in the OPEN list — that is the original contract
+    # and it still holds.
+    assert f"[{keep}]" in open_block
+    assert "Already handled" not in open_block
+    assert "Not interested" not in open_block
+
+    # They now appear in a separate, explicitly-labelled tail so the Executive
+    # can recognise work the principal already settled instead of sending them
+    # back to the page to dismiss a card that is already gone.
+    assert handled_block
+    assert "Already handled" in handled_block
+    assert "Not interested" in handled_block
+
+
+def test_handled_ids_are_not_trusted_for_acking(db: Path) -> None:
+    """The handled tail names ids but must not widen the ack surface.
+
+    `ack_alert` accepts only what `rendered_ids` collected; a closed row has
+    nothing to ack, so letting the tail feed the trusted set would hand the
+    model reach it was never meant to have.
+    """
+    from openexecutive.alerts.store import set_status as _set_status
+
+    open_id = insert_alert(
+        source="email", external_id="open-1", severity="medium",
+        headline="Still open", body="b", db_path=db,
+    )
+    closed_id = insert_alert(
+        source="email", external_id="closed-1", severity="medium",
+        headline="Since settled", body="b", db_path=db,
+    )
+    assert closed_id is not None
+    _set_status(closed_id, "ack", db_path=db)
+
+    rendered: list[int] = []
+    out = format_open_alerts_for_prompt(db_path=db, rendered_ids=rendered)
+
+    assert "Since settled" in out          # named, so the model knows
+    assert rendered == [open_id]           # but never ackable
+    assert closed_id not in rendered
+
+
+def test_handled_tail_survives_an_empty_board(db: Path) -> None:
+    """The case that produced the bug: everything dismissed.
+
+    The digest used to return "" the moment no rows were open, which is
+    exactly when the principal is still talking about what they just cleared.
+    """
+    from openexecutive.alerts.store import set_status as _set_status
+
+    only = insert_alert(
+        source="email", external_id="only-1", severity="high",
+        headline="St. Albans reconciliation gap", body="b", db_path=db,
+    )
+    assert only is not None
+    _set_status(only, "dismissed", db_path=db)
+
+    rendered: list[int] = []
+    out = format_open_alerts_for_prompt(db_path=db, rendered_ids=rendered)
+
+    assert "St. Albans reconciliation gap" in out
+    assert "Already handled —" in out
+    assert rendered == []
 
 
 def test_body_is_truncated(db: Path) -> None:
@@ -255,3 +317,56 @@ def test_no_unicode_line_separator_can_forge_a_line(db: Path, sep: str) -> None:
     assert len(body_lines) == 1, body_lines
     assert not any(line.startswith("[17]") for line in out.split("\n"))
     assert sep not in body_lines[0]
+
+
+# --------------------------------------------------------------------- #
+# render_and_trust — the block shown and the ids ack_alert will accept
+# must be produced together, or ack_alert is either unusable or unguarded.
+# --------------------------------------------------------------------- #
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.trusted_alert_ids: set[int] = set()
+
+
+def test_render_and_trust_records_exactly_the_ids_it_rendered(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.briefing import context as ctx
+
+    open_id = insert_alert(
+        source="email", external_id="o1", severity="high",
+        headline="Needs a decision", body="b", db_path=db,
+    )
+    closed_id = insert_alert(
+        source="email", external_id="c1", severity="high",
+        headline="Since settled", body="b", db_path=db,
+    )
+    assert closed_id is not None
+    set_status(closed_id, "dismissed", db_path=db)
+
+    session = _FakeSession()
+    block = ctx.render_and_trust(session, db_path=db)
+
+    assert "Needs a decision" in block
+    assert session.trusted_alert_ids == {open_id}
+
+
+def test_render_and_trust_clears_the_set_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale trusted set would outlive the block it came from.
+
+    If the digest cannot be built this turn, the model was shown nothing, so
+    it must be able to ack nothing — not whatever the previous turn left.
+    """
+    from openexecutive.briefing import context as ctx
+
+    session = _FakeSession()
+    session.trusted_alert_ids = {41, 42}
+
+    def _boom(**_kw: object) -> str:
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(ctx, "format_open_alerts_for_prompt", _boom)
+    assert ctx.render_and_trust(session) == ""
+    assert session.trusted_alert_ids == set()

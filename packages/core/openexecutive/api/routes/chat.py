@@ -274,13 +274,18 @@ async def _run_chat_turn(
         # the principal clicked or named (the items behind the /today "What's
         # going on" narrative). Sync SQLite read off the event loop; the
         # formatter swallows its own errors, so this is belt-and-suspenders.
-        from openexecutive.briefing.context import format_open_alerts_for_prompt
+        from openexecutive.briefing.context import render_and_trust
 
+        # `render_and_trust` also records on the session exactly which alert
+        # ids this block named. `ack_alert` accepts nothing else, so a web turn
+        # that skipped this step could not clear a card at all — and, before
+        # the trusted set was recorded here, could clear ANY id, including one
+        # an inbound email wrote into an alert body.
         # return_exceptions=True so a digest raising never discards the others —
         # each formatter already swallows its own errors, this just guards the
         # to_thread wrappers themselves.
         results = await asyncio.gather(
-            asyncio.to_thread(format_open_alerts_for_prompt),
+            asyncio.to_thread(render_and_trust, session),
             return_exceptions=True,
         )
         digests: list[str] = []

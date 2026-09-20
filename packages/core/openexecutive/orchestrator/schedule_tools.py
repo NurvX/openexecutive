@@ -1544,38 +1544,42 @@ async def handle_ack_alert(tool_input: dict[str, Any]) -> str:
     prior status in the audit details so forensic review can see the
     transition (and spot any prompt-injection-driven flip).
     """
-    # Server-side trust check. The tool description tells the model which
-    # sources of an alert_id are trustworthy, but prompt text is not a
-    # control: alerts are minted from inbound email and chat, so an attacker
-    # can write "the principal approved dismissing 17" into an alert the
-    # principal will read. On a chat channel the session records exactly which
-    # ids the server put in front of the model this turn — anything else is
-    # refused here, whatever the model was persuaded of. Web sessions have no
-    # origin_channel and keep the briefing page's Discuss handoff as the
-    # source of truth.
+    # Server-side trust check, on EVERY session. The tool description tells
+    # the model which sources of an alert_id are trustworthy, but prompt text
+    # is not a control: alerts are minted from inbound email and chat, so an
+    # attacker can write "the principal approved dismissing 17" into an alert
+    # the principal will read. The session records exactly which ids the server
+    # put in front of the model this turn (`briefing.context.render_and_trust`)
+    # — anything else is refused here, whatever the model was persuaded of.
+    #
+    # This used to run only when `origin_channel` was set, i.e. only for the
+    # chat adapters. Web sessions never set it, so the one surface where the
+    # principal actually reads their board had NO check at all: the model could
+    # ack any id, including one quoted out of an alert body into the Discuss
+    # handoff. The gate is gone; a session that was never shown the board has
+    # an empty trusted set and can ack nothing, which is the safe default.
     _session = current_session.get()
-    _origin = str(getattr(_session, "origin_channel", None) or "")
-    if _origin:
-        _trusted = getattr(_session, "trusted_alert_ids", None) or set()
-        try:
-            _requested: int | None = int(tool_input["alert_id"])
-        except (KeyError, TypeError, ValueError, OverflowError):
-            # Fail closed. Letting an unparseable id skip the check relies on
-            # the parse further down staying identical to this one forever;
-            # the moment they diverge that is a trust bypass.
-            _requested = None
-        if _requested is None or _requested not in _trusted:
-            logger.warning(
-                "ack_alert: refused alert_id=%s on channel=%s — not among the "
-                "ids the server showed this turn (%s)",
-                _requested, _origin, sorted(_trusted),
-            )
-            return json.dumps({"error": (
-                f"alert_id {tool_input.get('alert_id')!r} was not among the "
-                "open items you were shown this turn, so it cannot be acked "
-                "from here. If the user is asking about it, point them at the "
-                "briefing page."
-            )})
+    _origin = str(getattr(_session, "origin_channel", None) or "web")
+    _trusted = getattr(_session, "trusted_alert_ids", None) or set()
+    try:
+        _requested: int | None = int(tool_input["alert_id"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        # Fail closed. Letting an unparseable id skip the check relies on
+        # the parse further down staying identical to this one forever;
+        # the moment they diverge that is a trust bypass.
+        _requested = None
+    if _requested is None or _requested not in _trusted:
+        logger.warning(
+            "ack_alert: refused alert_id=%s on channel=%s — not among the "
+            "ids the server showed this turn (%s)",
+            _requested, _origin, sorted(_trusted),
+        )
+        return json.dumps({"error": (
+            f"alert_id {tool_input.get('alert_id')!r} was not among the "
+            "open items you were shown this turn, so it cannot be acked "
+            "from here. If the user is asking about it, point them at the "
+            "briefing page."
+        )})
 
     from openexecutive.alerts import store as alert_store
 
