@@ -29,6 +29,13 @@ _BODY_SNIPPET_CHARS = 200
 # unread items at once; the ceiling just bounds the per-turn token cost.
 _MAX_ALERTS = 30
 
+# How far the trusted set reaches. `/today` renders `list_live_alerts(limit=100)`
+# as cards, and every one of them is Discuss-able, so trusting only the 30 the
+# digest prints would refuse an ack on cards 31-100 — sending the principal back
+# to the page they just came from. Keep this aligned with the cap in
+# `api/routes/today.py::_build_today`.
+_MAX_TRUSTED = 100
+
 # Recently-closed items the digest names so the Executive can recognise work
 # the principal already settled. Without these, a card acked from the briefing
 # page a few minutes ago is simply absent from chat: asked to "record that as
@@ -39,9 +46,16 @@ _MAX_ALERTS = 30
 # Bounded by both a count and an age. `alerts` has no closed-at column, so the
 # window is on `created_at` — an old alert closed today will not appear. That
 # is the conservative direction: the block can omit a handled item, never
-# invent one.
+# invent one. The window matches the ACTION alert TTL (`alerts.lifecycle`
+# `_ttl_settings` → 14 days): an action item may sit unread that long, so a
+# shorter window would miss most of the lifetime during which the principal can
+# clear one. `_MAX_HANDLED` bounds each status's query and then the merged list,
+# so the block is at most that many lines however the statuses split. The merge
+# is ordered by `created_at`, not by when the row was closed — there is no
+# closed-at column — so on a busy day the cap can drop a just-dismissed older
+# alert in favour of newer ones.
 _MAX_HANDLED = 8
-_HANDLED_WINDOW = timedelta(days=3)
+_HANDLED_WINDOW = timedelta(days=14)
 _HANDLED_STATUSES = frozenset({"ack", "dismissed", "resolved"})
 
 
@@ -63,6 +77,7 @@ def format_open_alerts_for_prompt(
     db_path: Path | None = None,
     limit: int = _MAX_ALERTS,
     rendered_ids: list[int] | None = None,
+    trusted_ids: list[int] | None = None,
 ) -> str:
     """Render current open (unread) alerts as a compact digest, or ``""`` when none.
 
@@ -74,6 +89,22 @@ def format_open_alerts_for_prompt(
     proposal build. ``category`` (``action``/``monitoring``) comes from
     :func:`openexecutive.briefing.ranking.score_and_categorize` so the Executive
     can tell an item awaiting a decision from a passive monitoring signal.
+
+    ``trusted_ids``, when given, is filled with every LIVE alert id — including
+    ones past the render cap. That, not ``rendered_ids``, is what `ack_alert`
+    accepts: `/today` shows up to ``_MAX_TRUSTED`` cards and all of them are
+    Discuss-able, so trusting only the printed subset refuses an ack on a card
+    the principal is looking at.
+
+    What the trust boundary does and does not do: it confines the model to ids
+    the SERVER derived from the live board, so an id invented by the model, or
+    quoted out of an alert body for a row that is closed, snoozed, expired or
+    nonexistent, is refused. It does NOT make the model immune to being talked
+    into acking the wrong LIVE card — one alert's attacker-controlled body can
+    still argue for clearing another id that is genuinely on the board. Scoping
+    trust to the single item under discussion would need the Discuss primer id
+    carried server-side; it is not, so do not read this control as more than it
+    is.
 
     ``rendered_ids``, when given, is filled with the alert ids this block
     actually names — the caller records them on the session so ``ack_alert``
@@ -89,18 +120,24 @@ def format_open_alerts_for_prompt(
 
     now = datetime.now(UTC)
     try:
-        # Fetch one more than we render so we can tell a full board from a
-        # truncated one. Without this the header below claims the list is the
-        # whole board even when it is the most recent `limit` of many more —
-        # the Executive then tells the principal a partial set is everything
-        # (#136, second symptom).
-        alerts = list_live_alerts(limit=limit + 1, db_path=db_path)
+        # One read, two consumers. We fetch the whole live board (up to
+        # `_MAX_TRUSTED`, the cap `/today` renders as cards) because that is
+        # what `ack_alert` must accept; we then render only the first `limit`
+        # of it. Fetching past `limit` also tells a full board from a truncated
+        # one — without that the header claimed the list was everything when it
+        # was the most recent `limit` of many more (#136, second symptom).
+        live = list_live_alerts(
+            limit=max(_MAX_TRUSTED, limit + 1), db_path=db_path
+        )
     except Exception:
         logger.exception("briefing_context.list_alerts_failed")
         return ""
 
-    truncated = len(alerts) > limit
-    alerts = alerts[:limit]
+    if trusted_ids is not None:
+        trusted_ids.extend(a.id for a in live if a.id is not None)
+
+    truncated = len(live) > limit
+    alerts = live[:limit]
 
     lines: list[str] = []
     for alert in alerts:
@@ -132,7 +169,11 @@ def format_open_alerts_for_prompt(
     if not lines:
         # An empty board is exactly when the handled block matters most: the
         # principal just cleared everything and is still talking about it.
-        return _handled_block(db_path, now)
+        try:
+            return _handled_block(db_path, now)
+        except Exception:
+            logger.exception("briefing_context.handled_block_failed")
+            return ""
 
     header = (
         "Open items currently on the briefing board — the principal sees these "
@@ -148,7 +189,14 @@ def format_open_alerts_for_prompt(
             "the principal at the briefing page for the rest."
         )
     out = header + "\n" + "\n".join(lines)
-    handled = _handled_block(db_path, now)
+    # The tail is strictly additive: a failure building it must never discard
+    # the open board we already rendered (this function promises never to
+    # raise, and `_handled_block` reaches the store).
+    try:
+        handled = _handled_block(db_path, now)
+    except Exception:
+        logger.exception("briefing_context.handled_block_failed")
+        handled = ""
     return out + "\n\n" + handled if handled else out
 
 
@@ -160,34 +208,44 @@ def _handled_block(db_path: Path | None, now: datetime) -> str:
     is the opposite of what this block is for.
     """
     from openexecutive.alerts.lifecycle import parse_aware
-    from openexecutive.alerts.store import recent_alerts
+    from openexecutive.alerts.store import list_alerts
 
+    # One query per closed status, with the filter pushed into SQL. Pulling a
+    # mixed page and dropping the open rows afterwards would let a board with
+    # many open alerts starve the closed ones out of the page entirely — the
+    # same starvation `list_alerts` documents for `exclude_source`.
+    rows = []
     try:
-        pool = recent_alerts(limit=_MAX_ALERTS + _MAX_HANDLED * 4, db_path=db_path)
+        for status in sorted(_HANDLED_STATUSES):
+            rows.extend(
+                list_alerts(status=status, limit=_MAX_HANDLED, db_path=db_path)
+            )
     except Exception:
         logger.exception("briefing_context.handled_lookup_failed")
         return ""
 
-    lines: list[str] = []
-    for alert in pool:
-        if alert.status not in _HANDLED_STATUSES:
-            continue
-        created = parse_aware(alert.created_at)
-        if created is None or now - created > _HANDLED_WINDOW:
-            continue
-        lines.append(
-            f"[{alert.id}] ({alert.status}) {_one_line(alert.headline)}"
-        )
-        if len(lines) >= _MAX_HANDLED:
-            break
+    # Each per-status page is newest-first; the merge is not, so re-sort before
+    # capping or the cap would favour whichever status sorts first by name.
+    fresh = [
+        alert for alert in rows
+        if (created := parse_aware(alert.created_at)) is not None
+        and now - created <= _HANDLED_WINDOW
+    ]
+    fresh.sort(key=lambda a: a.created_at, reverse=True)
+
+    lines = [
+        f"[{alert.id}] ({_one_line(alert.status)}) {_one_line(alert.headline)}"
+        for alert in fresh[:_MAX_HANDLED]
+    ]
     if not lines:
         return ""
     return (
         "Already handled — these came off the board recently (the principal "
-        "approved, dismissed or you resolved them). They are NOT open and NOT "
-        "in the list above. If the user refers to one, say it is already "
-        "cleared; never send them to the briefing page to dismiss it again, "
-        "and never ack it.\n" + "\n".join(lines)
+        "approved, dismissed or you resolved them). They are NOT open. If the "
+        "user refers to one, say it is already cleared; never send them to the "
+        "briefing page to dismiss it again, and never ack it — these ids are "
+        "not acceptable to `ack_alert` and it will refuse them.\n"
+        + "\n".join(lines)
     )
 
 
@@ -205,16 +263,16 @@ def render_and_trust(session: object, *, db_path: Path | None = None) -> str:
     the trusted set is emptied rather than left stale, so a turn that could not
     be shown the board cannot ack anything from it either.
     """
-    rendered: list[int] = []
+    trusted: list[int] = []
     try:
-        block = format_open_alerts_for_prompt(db_path=db_path, rendered_ids=rendered)
+        block = format_open_alerts_for_prompt(db_path=db_path, trusted_ids=trusted)
     except Exception:
         logger.exception("briefing_context.render_and_trust_failed")
-        rendered = []
+        trusted = []
         block = ""
     if session is not None:
         try:
-            session.trusted_alert_ids = set(rendered)  # type: ignore[attr-defined]
+            session.trusted_alert_ids = set(trusted)  # type: ignore[attr-defined]
         except Exception:
             logger.exception("briefing_context.trust_record_failed")
     return block

@@ -124,6 +124,37 @@ def test_handled_ids_are_not_trusted_for_acking(db: Path) -> None:
     assert closed_id not in rendered
 
 
+def test_handled_tail_is_not_starved_by_a_busy_board(db: Path) -> None:
+    """A wall of open alerts must not push the closed ones off the page.
+
+    The first version pulled one mixed page newest-first and dropped the open
+    rows afterwards, so a board with enough open items returned no handled
+    lines at all — the exact starvation `list_alerts` documents for
+    `exclude_source`. The status filter is now pushed into SQL.
+    """
+    from openexecutive.alerts.store import set_status as _set_status
+
+    settled = insert_alert(
+        source="email", external_id="settled-early", severity="high",
+        headline="Cleared this morning", body="b", db_path=db,
+    )
+    assert settled is not None
+    _set_status(settled, "ack", db_path=db)
+
+    # More open rows than the old mixed page held (_MAX_ALERTS + _MAX_HANDLED*4
+    # = 62), inserted AFTER the closed one so newest-first ordering pushes it
+    # off that page entirely. Seeded generously so the test does not sit one
+    # row from the boundary.
+    for i in range(120):
+        insert_alert(
+            source="email", external_id=f"noise-{i}", severity="medium",
+            headline=f"Open item {i}", body="b", db_path=db,
+        )
+
+    out = format_open_alerts_for_prompt(db_path=db)
+    assert "Cleared this morning" in out
+
+
 def test_handled_tail_survives_an_empty_board(db: Path) -> None:
     """The case that produced the bug: everything dismissed.
 
@@ -330,7 +361,35 @@ class _FakeSession:
         self.trusted_alert_ids: set[int] = set()
 
 
-def test_render_and_trust_records_exactly_the_ids_it_rendered(
+def test_trust_covers_live_cards_past_the_render_cap(db: Path) -> None:
+    """`/today` renders 100 cards; the digest prints 30. All 100 are
+    Discuss-able, so trusting only the printed subset refused an ack on a card
+    the principal was looking at — sending them back to the page they came
+    from, which is the exact failure this work set out to remove.
+    """
+    ids = [
+        insert_alert(
+            source="email", external_id=f"a-{i}", severity="medium",
+            headline=f"Item {i}", body="b", db_path=db,
+        )
+        for i in range(40)
+    ]
+    oldest = ids[0]
+    assert oldest is not None
+
+    rendered: list[int] = []
+    trusted: list[int] = []
+    out = format_open_alerts_for_prompt(
+        db_path=db, rendered_ids=rendered, trusted_ids=trusted
+    )
+
+    assert f"[{oldest}]" not in out          # past the 30-row render cap
+    assert oldest not in rendered
+    assert oldest in trusted                 # but still ackable
+    assert set(rendered) <= set(trusted)
+
+
+def test_render_and_trust_records_the_live_board(
     db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from openexecutive.briefing import context as ctx

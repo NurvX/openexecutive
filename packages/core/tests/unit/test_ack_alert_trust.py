@@ -164,11 +164,10 @@ def test_web_session_can_ack_an_id_the_digest_named() -> None:
 def test_no_session_at_all_is_refused() -> None:
     """No session means nothing was shown, so nothing may be acked.
 
-    The old test allowed this for "CLI / scheduler callers". No such caller
-    exists: `handle_ack_alert` is reachable only through
-    `SCHEDULE_TOOL_HANDLERS` from the orchestrator's tool loop, which always
-    binds a session. Fail closed rather than keep an unreachable exemption
-    that a future session-less caller would silently inherit.
+    The old test allowed this, for "CLI / scheduler callers". Fail closed
+    instead: a caller that reaches this handler without a bound session was
+    shown no board, so it has no basis for clearing one. That is the safe
+    default whether or not such a caller exists today.
     """
     with (
         patch("openexecutive.alerts.store.get_alert", return_value=_alert(5)),

@@ -319,6 +319,15 @@ async def _run_chat_turn(
                 logger.exception("chat.honcho_prefetch_failed turn_id=%s", turn_id)
                 return ""
 
+    # Clear the trusted alert ids BEFORE the gather, unconditionally. Web
+    # sessions are long-lived (`_sessions`), so if `render_and_trust` never
+    # runs this turn — the to_thread wrapper fails to schedule, the gather is
+    # cancelled, a future code path skips the digest — the previous turn's set
+    # would otherwise still be sitting there and `ack_alert` would accept it.
+    # Clearing here makes "shown nothing, can ack nothing" hold on every path
+    # instead of only the ones that reach the recorder.
+    session.trusted_alert_ids = set()
+
     retrieved_context, episodic_context, peer_memory_context, briefing_context = await asyncio.gather(
         asyncio.to_thread(
             retrieve,

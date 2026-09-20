@@ -123,3 +123,40 @@ def test_web_turn_with_no_alerts_trusts_nothing(env: Path) -> None:
     _post()
 
     assert _only_session().trusted_alert_ids == set()
+
+
+def test_turn_start_clears_a_stale_trusted_set(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A turn that never reaches the recorder must not inherit the last one's set.
+
+    Web sessions are long-lived, so if `render_and_trust` is skipped — the
+    to_thread wrapper fails to schedule, the gather is cancelled — the previous
+    turn's ids would still be sitting on the session and `ack_alert` would
+    accept them. The clear happens before the gather, so it holds regardless.
+    """
+    people_store.upsert_person(full_name="Alex", is_principal=True)
+    live = alert_store.insert_alert(
+        source="email", external_id="live-1", severity="high",
+        headline="Approve the Q3 budget", body="b", db_path=env / "alerts.db",
+    )
+    assert live is not None
+
+    _post()
+    assert _only_session().trusted_alert_ids == {live}
+
+    # Same session, next turn, digest unavailable.
+    from openexecutive.briefing import context as ctx
+
+    def _boom(*_a: object, **_kw: object) -> str:
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(ctx, "render_and_trust", _boom)
+    session_id = _only_session().session_id
+
+    app = FastAPI()
+    app.include_router(chat_route.router)
+    client = TestClient(app)
+    resp = client.post("/chat", json={"message": "and now?", "session_id": session_id})
+    assert resp.status_code == 200
+    _ = resp.text
+
+    assert _only_session().trusted_alert_ids == set()
