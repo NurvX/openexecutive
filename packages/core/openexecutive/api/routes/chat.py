@@ -274,13 +274,18 @@ async def _run_chat_turn(
         # the principal clicked or named (the items behind the /today "What's
         # going on" narrative). Sync SQLite read off the event loop; the
         # formatter swallows its own errors, so this is belt-and-suspenders.
-        from openexecutive.briefing.context import format_open_alerts_for_prompt
+        from openexecutive.briefing.context import render_and_trust
 
+        # `render_and_trust` also records on the session exactly which alert
+        # ids this block named. `ack_alert` accepts nothing else, so a web turn
+        # that skipped this step could not clear a card at all — and, before
+        # the trusted set was recorded here, could clear ANY id, including one
+        # an inbound email wrote into an alert body.
         # return_exceptions=True so a digest raising never discards the others —
         # each formatter already swallows its own errors, this just guards the
         # to_thread wrappers themselves.
         results = await asyncio.gather(
-            asyncio.to_thread(format_open_alerts_for_prompt),
+            asyncio.to_thread(render_and_trust, session),
             return_exceptions=True,
         )
         digests: list[str] = []
@@ -313,6 +318,15 @@ async def _run_chat_turn(
                 # the helper raises, don't sink the whole gather() with it.
                 logger.exception("chat.honcho_prefetch_failed turn_id=%s", turn_id)
                 return ""
+
+    # Clear the trusted alert ids BEFORE the gather, unconditionally. Web
+    # sessions are long-lived (`_sessions`), so if `render_and_trust` never
+    # runs this turn — the to_thread wrapper fails to schedule, the gather is
+    # cancelled, a future code path skips the digest — the previous turn's set
+    # would otherwise still be sitting there and `ack_alert` would accept it.
+    # Clearing here makes "shown nothing, can ack nothing" hold on every path
+    # instead of only the ones that reach the recorder.
+    session.trusted_alert_ids = set()
 
     retrieved_context, episodic_context, peer_memory_context, briefing_context = await asyncio.gather(
         asyncio.to_thread(

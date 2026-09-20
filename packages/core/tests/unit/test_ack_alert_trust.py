@@ -109,11 +109,45 @@ def test_chat_turn_with_no_trusted_ids_can_ack_nothing() -> None:
     set_status.assert_not_called()
 
 
-def test_web_session_is_unaffected() -> None:
-    """The briefing page acks over HTTP before the chat handoff, so the
-    discussed alert is no longer unread and would not be in a briefing block.
-    Enforcing there would break the Discuss flow."""
+def test_web_session_is_enforced_too() -> None:
+    """The web session is the one that most needs the check, not the exception.
+
+    The guard used to run only when `origin_channel` was set, i.e. only for the
+    chat adapters. The browser never sets it, so the single surface where the
+    principal actually reads their board had no check at all and the model
+    could ack any id — including one an inbound email wrote into an alert body
+    that the Discuss handoff then quoted into the turn.
+
+    The old test asserted the opposite on the premise that the briefing page
+    acks over HTTP first, leaving the alert absent from the digest. That path
+    is unaffected: the HTTP route (`api/routes/alerts.py`) calls `set_status`
+    directly and never reaches this handler, and its Discuss seed tells the
+    model the alert is already acked and not to call this tool.
+    """
     current_session.set(Session(session_id="web-1", caller_person_id=7))
+
+    with (
+        patch("openexecutive.alerts.store.get_alert", return_value=_alert(99)),
+        patch("openexecutive.alerts.store.set_status", return_value=True),
+        patch("openexecutive.alerts.lifecycle.record_ack_feedback"),
+        patch("openexecutive.audit.log_event"),
+    ):
+        out = _call(99)
+
+    assert "error" in out
+    assert "not among the open items" in out["error"]
+
+
+def test_web_session_can_ack_an_id_the_digest_named() -> None:
+    """The flip side: a web turn that WAS shown the board can still clear it.
+
+    This is what `briefing.context.render_and_trust` records, and without it
+    the change above would simply break acking on the web instead of securing
+    it.
+    """
+    session = Session(session_id="web-2", caller_person_id=7)
+    session.trusted_alert_ids = {99}
+    current_session.set(session)
 
     with (
         patch("openexecutive.alerts.store.get_alert", return_value=_alert(99)),
@@ -127,8 +161,14 @@ def test_web_session_is_unaffected() -> None:
     assert "error" not in out
 
 
-def test_no_session_at_all_is_unaffected() -> None:
-    """CLI / scheduler callers have no session; the guard must not fire."""
+def test_no_session_at_all_is_refused() -> None:
+    """No session means nothing was shown, so nothing may be acked.
+
+    The old test allowed this, for "CLI / scheduler callers". Fail closed
+    instead: a caller that reaches this handler without a bound session was
+    shown no board, so it has no basis for clearing one. That is the safe
+    default whether or not such a caller exists today.
+    """
     with (
         patch("openexecutive.alerts.store.get_alert", return_value=_alert(5)),
         patch("openexecutive.alerts.store.set_status", return_value=True),
@@ -137,4 +177,4 @@ def test_no_session_at_all_is_unaffected() -> None:
     ):
         out = _call(5)
 
-    assert out["alert_id"] == 5
+    assert "error" in out

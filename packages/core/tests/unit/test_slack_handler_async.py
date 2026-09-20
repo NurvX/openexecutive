@@ -803,15 +803,20 @@ async def test_at_mention_inside_a_dm_is_handled_once() -> None:
 
 @pytest.mark.asyncio
 async def test_session_records_the_alert_ids_the_briefing_block_named() -> None:
-    """Server-side counterpart to ack_alert's trust rule: only ids this block
-    actually named can be acked from the channel."""
+    """Server-side counterpart to ack_alert's trust rule: only ids the server
+    derived from the live board can be acked from the channel.
+
+    The digest reports that set through `trusted_ids` (the whole live board),
+    not merely the subset it printed — a card past the render cap is
+    still on the page and must stay ackable.
+    """
     async with _listeners() as listeners:
         with _Harness() as h:
             h.person.is_principal = True
 
-            def _fake_digest(rendered_ids: list[int] | None = None, **_kw: Any) -> str:
-                if rendered_ids is not None:
-                    rendered_ids.extend([11, 12])
+            def _fake_digest(trusted_ids: list[int] | None = None, **_kw: Any) -> str:
+                if trusted_ids is not None:
+                    trusted_ids.extend([11, 12])
                 return "[11] (action) A\n[12] (action) B"
 
             with patch(

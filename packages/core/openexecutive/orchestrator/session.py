@@ -30,12 +30,14 @@ class Session:
     # on the session too lets tool handlers running mid-turn tell "the approver
     # is the person I'm already talking to" from "the approver is someone else".
     caller_person_id: int | None = None
-    # Alert ids the server itself put in front of the model this turn (the
-    # `<briefing>` block). `ack_alert` refuses anything else on a chat channel,
-    # so an id quoted inside an alert's own body — alerts are minted from
-    # inbound mail and chat, so that text is attacker-controlled — cannot be
-    # acted on even if the model is talked into believing it. Empty on the web
-    # path, where the briefing page's Discuss handoff supplies the id instead.
+    # The live alert board as the server derived it this turn, recorded by
+    # `briefing.context.render_and_trust`. `ack_alert` refuses anything else on
+    # EVERY session, web included, so an id quoted inside an alert's own body —
+    # alerts are minted from inbound mail and chat, so that text is
+    # attacker-controlled — cannot clear a row that is closed, snoozed or
+    # invented. It does not stop the model being argued into acking the wrong
+    # LIVE card; see `format_open_alerts_for_prompt` for the limits of this
+    # control. Empty means the turn was shown no board and can ack nothing.
     trusted_alert_ids: set[int] = field(default_factory=set)
 
     def add_user_message(self, content: str) -> None:
