@@ -232,6 +232,11 @@ deployed. Authentication is the same shared-secret gate as every other route,
 so clients send `x-api-key: $BACKEND_SHARED_SECRET`. With that variable unset
 locally the gate is off and the header can be omitted.
 
+On any internet-reachable instance set both `BACKEND_SHARED_SECRET` and
+`OE_PUBLIC_DEPLOYMENT=1`, which makes the API refuse to start without a
+secret rather than serving `/mcp` unauthenticated. See
+[Deployment](#deployment).
+
 ```json
 {
   "mcpServers": {
