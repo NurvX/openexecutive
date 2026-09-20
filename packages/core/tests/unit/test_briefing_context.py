@@ -320,14 +320,32 @@ def test_the_render_limit_cuts_what_is_printed_not_what_is_trusted(db: Path) -> 
     trust boundary is the live board.
     """
     _seed(db, 7)
+    # A closed row too: handled-tail lines also start with "[", so a naive
+    # count over the whole block would read 4 here and fail as if the render
+    # cap had regressed.
+    closed = insert_alert(
+        source="email", external_id="closed-for-count", severity="medium",
+        headline="Since settled", body="b", db_path=db,
+    )
+    assert closed is not None
+    set_status(closed, "dismissed", db_path=db)
 
     ids: list[int] = []
     out = format_open_alerts_for_prompt(db_path=db, limit=3, trusted_ids=ids)
 
-    assert len([line for line in out.split("\n") if line.startswith("[")]) == 3
-    assert len(ids) == 7
-    unprinted = [i for i in ids if f"[{i}]" not in out]
-    assert unprinted, "expected some live ids to be cut from the printed list"
+    open_block = out.partition("Already handled —")[0]
+    printed = [
+        int(line[1:line.index("]")])
+        for line in open_block.split("\n")
+        if line.startswith("[")
+    ]
+
+    assert len(printed) == 3                     # the render cap holds
+    assert len(ids) == 7                         # trust is the whole live board
+    assert set(printed) < set(ids)               # printed is a strict subset
+    assert closed not in ids                     # and closed rows never join it
+    # The cut ids are the oldest, which is what "newest-first, then cap" means.
+    assert set(ids) - set(printed) == set(sorted(ids)[:4])
 
 
 @pytest.mark.parametrize(
@@ -459,3 +477,50 @@ def test_board_limit_is_shared_with_the_today_route() -> None:
     assert "BOARD_LIMIT" in src, "today.py must use the shared constant, not a literal"
     assert "list_live_alerts(limit=100" not in src
     assert BOARD_LIMIT == 100
+
+
+def test_limit_cannot_widen_the_trusted_set_past_the_board(db: Path) -> None:
+    """`limit` is a token budget; it must not be able to enlarge the ack surface.
+
+    The trusted slice is clamped to BOARD_LIMIT, so a caller asking for a
+    bigger printed list cannot trust ids past any board `/today` renders.
+    Seeded above BOARD_LIMIT so the clamp is the only thing that can hold.
+    """
+    from openexecutive.alerts.lifecycle import BOARD_LIMIT
+
+    for i in range(BOARD_LIMIT + 25):
+        insert_alert(
+            source="email", external_id=f"wide-{i}", severity="medium",
+            headline=f"Item {i}", body="b", db_path=db,
+        )
+
+    ids: list[int] = []
+    format_open_alerts_for_prompt(db_path=db, limit=BOARD_LIMIT + 50, trusted_ids=ids)
+
+    assert len(ids) == BOARD_LIMIT
+
+
+def test_limit_cannot_widen_what_is_printed_past_the_board(db: Path) -> None:
+    """The render cap is clamped to the board as well as the trusted set.
+
+    The header tells the model "the principal sees these as cards on /today".
+    `_build_today` renders BOARD_LIMIT cards, so printing more than that under
+    the same header states something false about every extra row — and the
+    clamp added for the trusted set alone did not fix this half.
+    """
+    from openexecutive.alerts.lifecycle import BOARD_LIMIT
+
+    for i in range(BOARD_LIMIT + 30):
+        insert_alert(
+            source="email", external_id=f"wide-{i}", severity="medium",
+            headline=f"Item {i}", body="b", db_path=db,
+        )
+
+    ids: list[int] = []
+    out = format_open_alerts_for_prompt(
+        db_path=db, limit=BOARD_LIMIT + 20, trusted_ids=ids
+    )
+    printed = [line for line in out.split("\n") if line.startswith("[")]
+
+    assert len(printed) == BOARD_LIMIT
+    assert len(ids) == BOARD_LIMIT

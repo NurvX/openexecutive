@@ -807,7 +807,7 @@ async def test_session_records_the_alert_ids_the_briefing_block_named() -> None:
     derived from the live board can be acked from the channel.
 
     The digest reports that set through `trusted_ids` (the whole live board),
-    not `rendered_ids` (the subset it printed) — a card past the render cap is
+    not merely the subset it printed — a card past the render cap is
     still on the page and must stay ackable.
     """
     async with _listeners() as listeners:

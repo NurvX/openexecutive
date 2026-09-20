@@ -109,9 +109,10 @@ def attach_briefing_context(session: object, *, is_dm: bool, person: object) -> 
 
     Gated to the principal's DMs on every channel: the board is company-wide,
     so pulling it into a shared channel would leak every open item to everyone
-    in it. The ids the block named are recorded on the session, which is what
-    lets `ack_alert` refuse any other id from a chat channel — prompt wording
-    alone is not a control.
+    in it. The live board the server derived is recorded on the session, which
+    is what lets `ack_alert` refuse any id outside it — prompt wording alone is
+    not a control. Note that is the whole live board, not only the ids this
+    block printed; an unprinted live card is still ackable.
 
     Shared rather than repeated per adapter: `ack_alert`'s guard trips on
     EVERY session, so an adapter that renders this block without populating the

@@ -64,9 +64,9 @@ def _one_line(value: str | None) -> str:
     actions, tags and review notes all originate in inbound email and chat, so
     they are attacker-controlled; a newline in any of them lets the sender
     forge an extra line in this block. That matters because a line starting
-    `[N]` is one of only two sources `ack_alert` is told to trust, so a forged
-    line is a forged instruction to clear somebody else's alert. Only `body`
-    was being stripped.
+    `[N]` is the source `ack_alert` is told to trust, so a forged line is a
+    forged instruction to clear somebody else's alert. Only `body` was being
+    stripped.
     """
     return " ".join((value or "").split())
 
@@ -126,10 +126,22 @@ def format_open_alerts_for_prompt(
         return ""
 
     if trusted_ids is not None:
-        trusted_ids.extend(a.id for a in live if a.id is not None)
+        # Clamped to BOARD_LIMIT, never to `limit`. `limit` only decides how
+        # much gets printed; letting it size the trusted set would mean a
+        # caller passing limit=500 could trust ids past any board `/today`
+        # renders — widening the ack surface through what is meant to be a
+        # token budget.
+        trusted_ids.extend(
+            a.id for a in live[:BOARD_LIMIT] if a.id is not None
+        )
 
-    truncated = len(live) > limit
-    alerts = live[:limit]
+    # The board caps BOTH halves. `limit` can only narrow what is printed, never
+    # widen it past the cards `/today` actually renders: the header tells the
+    # model "the principal sees these as cards", which would be false for any
+    # row beyond the board.
+    render_cap = min(limit, BOARD_LIMIT)
+    truncated = len(live) > render_cap
+    alerts = live[:render_cap]
 
     lines: list[str] = []
     for alert in alerts:
@@ -240,7 +252,12 @@ def _handled_block(db_path: Path | None, now: datetime) -> str:
 
 
 def render_and_trust(session: object, *, db_path: Path | None = None) -> str:
-    """Render the digest and record on ``session`` exactly which ids it named.
+    """Render the digest and record the live board on ``session``.
+
+    What is recorded is the whole live board (up to ``BOARD_LIMIT``), not only
+    the ids this block printed — `/today` renders more cards than the digest
+    lists and every one of them is Discuss-able, so trusting only the printed
+    subset refuses an ack on a card the principal is looking at.
 
     The single place both entry points go through — the web chat route and the
     channel adapters — so the block the model is shown and the set `ack_alert`
