@@ -1846,13 +1846,51 @@ async def extract_and_store(
     assistant_response: str,
     db_path: Path = DB_PATH,
     session_id: str = "",
+    audit_session_id: str | None = None,
+    audit_turn_id: str | None = None,
 ) -> None:
     """Extract memorable items from a conversation turn and persist them.
 
     `session_id` is forwarded to store_decision/store_advice so the stored
     rows can later be scoped back to this conversation via format_for_prompt.
     Runs as a background task — never blocks the response stream.
+
+    `audit_session_id` / `audit_turn_id` are the caller's audit ContextVars,
+    snapshotted by schedule_extraction before this task was spawned and
+    re-bound here. A background task starts from a context in which the
+    caller's `with set_turn(...)` has already exited, so without them this
+    function's model call records unattributed.
     """
+    from openexecutive.audit.context import get_active_ids, set_turn
+
+    # Fall back per field, not as a pair. Binding a half-empty snapshot
+    # would erase the ambient counterpart — a row under a session with no
+    # turn, or a turn that joins to nothing — which is worse than either
+    # binding both or leaving the ambient values alone. With nothing to
+    # restore at all this is a plain no-op, so a caller that awaits this
+    # directly from inside its own `with set_turn(...)` keeps its binding.
+    ambient_session, ambient_turn = get_active_ids()
+    effective_session = audit_session_id if audit_session_id is not None else ambient_session
+    effective_turn = audit_turn_id if audit_turn_id is not None else ambient_turn
+
+    if (effective_session, effective_turn) == (ambient_session, ambient_turn):
+        await _extract_and_store(
+            user_message, assistant_response, db_path, session_id
+        )
+        return
+
+    with set_turn(session_id=effective_session, turn_id=effective_turn):
+        await _extract_and_store(
+            user_message, assistant_response, db_path, session_id
+        )
+
+
+async def _extract_and_store(
+    user_message: str,
+    assistant_response: str,
+    db_path: Path,
+    session_id: str,
+) -> None:
     try:
         from openexecutive.audit.usage import log_model_usage
         from openexecutive.config import get_settings
@@ -1982,10 +2020,27 @@ def schedule_extraction(
     Pass `session_id` to tag extracted decisions and advice with the
     originating conversation so format_for_prompt can scope them later.
     """
+    from openexecutive.audit.context import get_active_ids
+
+    # Snapshot the audit ContextVars at scheduling time. By the time the
+    # background task runs, the caller's ``with set_turn(...)`` block has
+    # exited and the vars are back to None — so without this snapshot the
+    # memory_extractor's own model call records with ``session_id=NULL``
+    # and is invisible in the per-session view. Same pattern as
+    # memory.honcho_client's background syncs. The thread branch needs it
+    # even more: a new thread starts from an empty context, so nothing is
+    # inherited there at all.
+    audit_sid, audit_tid = get_active_ids()
     try:
         loop = asyncio.get_running_loop()
         task = loop.create_task(
-            extract_and_store(user_message, assistant_response, session_id=session_id)
+            extract_and_store(
+                user_message,
+                assistant_response,
+                session_id=session_id,
+                audit_session_id=audit_sid,
+                audit_turn_id=audit_tid,
+            )
         )
         # Hold a strong reference so GC cannot cancel the task mid-flight.
         _background_tasks.add(task)
@@ -1994,7 +2049,13 @@ def schedule_extraction(
         # No running event loop (CLI context) — run in a daemon thread.
         threading.Thread(
             target=lambda: asyncio.run(
-                extract_and_store(user_message, assistant_response, session_id=session_id)
+                extract_and_store(
+                    user_message,
+                    assistant_response,
+                    session_id=session_id,
+                    audit_session_id=audit_sid,
+                    audit_turn_id=audit_tid,
+                )
             ),
             daemon=True,
         ).start()
