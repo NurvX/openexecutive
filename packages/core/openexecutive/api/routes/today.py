@@ -910,12 +910,24 @@ def _payload_headline(payload_json: str | None) -> str | None:
     return None
 
 
-def _build_activity(limit: int, since: datetime | None = None) -> ActivityResponse:
+def _build_activity(
+    limit: int,
+    since: datetime | None = None,
+    *,
+    live_alerts_only: bool = False,
+) -> ActivityResponse:
     """Aggregate recent self-initiated Executive activity across sources.
 
     ``since`` bounds the feed to items at/after that instant (the briefs pass
     the previous delivery time so "what changed" is a real delta); the pool
     is widened so a busy history cannot starve the window.
+
+    ``live_alerts_only`` drops ``alert_raised`` rows whose alert is no longer
+    live (acked, dismissed, resolved, snoozed, past TTL). The rail wants the
+    full history — a raise really happened even if the card is gone — but the
+    briefing narrative does not: fed closed alerts it re-reports settled items
+    as live, and on an empty board they become the *only* input, so the header
+    describes a queue that no longer exists.
 
     Sources, all pulled from the shared SQLite database:
       • scheduled_actions with status='done' — fired follow-ups, nudges,
@@ -1057,17 +1069,24 @@ def _build_activity(limit: int, since: datetime | None = None) -> ActivityRespon
             at=instance.resolved_at or instance.created_at,
         ))
 
-    # Operational alerts the Executive raised. All statuses are included on
-    # purpose: this is a historical "what happened" feed (like decisions /
-    # advice, which have no status), so an alert later read or dismissed still
-    # represents a real raise event at its `created_at`. Decision-scheduling
-    # alerts are excluded in SQL (not after the pull, so they can't starve real
-    # alerts out of the pool) — they are the companion alert for a gated
-    # booking, already represented by the `decision_resolved` rows above (and as
-    # a live proposal while pending), so surfacing them here would double-count.
+    # Operational alerts the Executive raised. For the rail, all statuses are
+    # included on purpose: this is a historical "what happened" feed (like
+    # decisions / advice, which have no status), so an alert later read or
+    # dismissed still represents a real raise event at its `created_at`. The
+    # narrative passes `live_alerts_only` to opt out — see the docstring.
+    # Decision-scheduling alerts are excluded in SQL (not after the pull, so
+    # they can't starve real alerts out of the pool) — they are the companion
+    # alert for a gated booking, already represented by the `decision_resolved`
+    # rows above (and as a live proposal while pending), so surfacing them here
+    # would double-count.
+    from openexecutive.alerts import lifecycle as alert_lifecycle
+
+    now_for_alerts = datetime.now(UTC)
     for alert in alerts_store.recent_alerts(
         limit=pool, exclude_source=decision_ledger.DECISION_ALERT_SOURCE,
     ):
+        if live_alerts_only and not alert_lifecycle.is_live(alert, now_for_alerts):
+            continue
         items.append(ActivityItem(
             kind="alert_raised",
             summary=alert.headline,
@@ -1209,6 +1228,55 @@ def _narrative_inputs(
     )
 
 
+# Quiet-day lines, one per narrative scope. They match the wording the
+# synthesis prompts tell the model to emit on a quiet day, so a short-circuited
+# narrative is indistinguishable from a model-produced one.
+_QUIET_PRINCIPAL = "Quiet right now — nothing pressing."
+_QUIET_VIEWER = "Quiet right now — nothing needs you."
+
+
+def _narrative_activity(viewer: PersonBriefItem | None, scoped: bool) -> list[dict[str, Any]]:
+    """The activity list the narrative reasons over, for BOTH the hash and the
+    synthesis.
+
+    Shared on purpose: the hot path hashes this to decide staleness and the
+    background task feeds it to the model. If the two ever computed it
+    differently, every request would either regenerate forever or never
+    regenerate at all.
+
+    Closed alerts are dropped (`live_alerts_only`) — the narrative describes
+    what is live, not what once was.
+    """
+    activity = [
+        item.model_dump()
+        for item in _build_activity(20, live_alerts_only=True).items
+    ]
+    if scoped and viewer is not None:
+        # Teammate view: keep only activity in their departments.
+        vdepts = set(viewer.department_slugs)
+        activity = [a for a in activity if a.get("department") in vdepts]
+    return activity
+
+
+def _nothing_needs_attention(today_data: dict[str, Any]) -> bool:
+    """True when the viewer's slice holds nothing that wants a decision.
+
+    The header's job is to synthesize what needs attention. With no action
+    proposals, no at-risk/off-track department and nobody awaiting, there is
+    nothing to synthesize — and handing the model only the history rail makes
+    it manufacture urgency out of settled items. Callers emit a fixed quiet
+    line instead of spending a model call.
+    """
+    if today_data.get("proposals"):
+        return False
+    if any(
+        d.get("at_risk_count", 0) or d.get("off_track_count", 0)
+        for d in today_data.get("departments", [])
+    ):
+        return False
+    return not any(p.get("awaiting_count", 0) for p in today_data.get("people", []))
+
+
 def _attach_narrative(
     response: TodayResponse,
     *,
@@ -1220,9 +1288,13 @@ def _attach_narrative(
     (the deprecated alias) serves cache-only without scheduling regen."""
     from openexecutive.briefing import narrative_cache
 
-    scope, today_data, _desc, _viewer = _narrative_inputs(response, caller_person_id)
+    scope, today_data, desc, viewer = _narrative_inputs(response, caller_person_id)
     try:
-        nhash = narrative_cache.build_narrative_input_hash(today_data, scope=scope)
+        nhash = narrative_cache.build_narrative_input_hash(
+            today_data,
+            scope=scope,
+            activity=_narrative_activity(viewer, desc is not None),
+        )
         cached = narrative_cache.get(scope)
         if cached is not None:
             response.narrative = cached.narrative_text
@@ -1263,26 +1335,30 @@ async def _regen_briefing_narrative(
                 "regen; skipping write", expected_scope, scope,
             )
             return
-        activity = [item.model_dump() for item in _build_activity(20).items]
-        if viewer_desc is not None and viewer is not None:
-            # Teammate view: keep only activity in their departments.
-            vdepts = set(viewer.department_slugs)
-            activity = [a for a in activity if a.get("department") in vdepts]
-        period_label = datetime.now(UTC).strftime("%Y-%m-%d")
-        text = await asyncio.wait_for(
-            synthesize_briefing_narrative(
-                today_data=today_data, activity=activity,
-                period_label=period_label, viewer=viewer_desc,
-            ),
-            timeout=25.0,
-        )
+        activity = _narrative_activity(viewer, viewer_desc is not None)
+        if _nothing_needs_attention(today_data):
+            # Nothing awaits a decision — skip the model call entirely and
+            # write the fixed quiet line. Still cached (below) so the hot path
+            # sees a fresh hash instead of re-scheduling this task forever.
+            text = _QUIET_VIEWER if viewer_desc is not None else _QUIET_PRINCIPAL
+        else:
+            period_label = datetime.now(UTC).strftime("%Y-%m-%d")
+            text = await asyncio.wait_for(
+                synthesize_briefing_narrative(
+                    today_data=today_data, activity=activity,
+                    period_label=period_label, viewer=viewer_desc,
+                ),
+                timeout=25.0,
+            )
     except Exception:
         logger.exception("today: briefing narrative regen failed")
         return
 
     if not text:
         return
-    input_hash = narrative_cache.build_narrative_input_hash(today_data, scope=scope)
+    input_hash = narrative_cache.build_narrative_input_hash(
+        today_data, scope=scope, activity=activity
+    )
     narrative_cache.put(narrative_cache.BriefingNarrative(
         scope=scope,
         input_hash=input_hash,

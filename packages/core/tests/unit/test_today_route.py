@@ -46,6 +46,19 @@ def _setup_isolated_db(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     dept_store.seed_default_departments(db_path=db)
 
 
+def _seed_live_action_alert(db: Path, headline: str = "Approve the Q3 budget") -> None:
+    """One live, unrouted, action-category alert — enough to make the board
+    non-quiet so the narrative takes the synthesizer path."""
+    alert_store.insert_alert(
+        source="system",
+        external_id=f"live-{headline[:12]}",
+        severity="high",
+        headline=headline,
+        body="Needs a decision.",
+        db_path=db,
+    )
+
+
 def _make_client() -> TestClient:
     app = FastAPI()
     app.include_router(today_route.router)
@@ -101,6 +114,11 @@ def test_today_departments_have_fields(client: TestClient) -> None:
 # --------------------------------------------------------------------------- #
 
 def test_morning_brief_alias_returns_same_body(client: TestClient) -> None:
+    # Warm the narrative cache first: the very first /today hit is cold
+    # (narrative null) and its background task populates the cache, so
+    # comparing a cold call against a warm one would diff on `narrative`
+    # alone. The alias contract is about the rest of the body.
+    client.get("/today")
     today = client.get("/today").json()
     legacy = client.get("/morning-brief").json()
     assert today == legacy
@@ -503,6 +521,7 @@ def test_insight_served_from_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 def test_morning_brief_alias_unaffected_by_async_today(client: TestClient) -> None:
     """The sync /morning-brief alias must keep returning the same body as
     the now-async /today (both serve insight=None on a cold cache)."""
+    client.get("/today")  # warm the narrative cache — see the alias test above
     assert client.get("/today").json() == client.get("/morning-brief").json()
 
 
@@ -897,6 +916,10 @@ def test_narrative_regenerated_in_background(
     populated and the next request serves it."""
     db = tmp_path / "regen.db"
     _setup_isolated_db(db, monkeypatch)
+    # A live action proposal, so the board is NOT quiet and the synthesizer
+    # actually runs (an empty board short-circuits to the fixed quiet line
+    # without a model call — see test_empty_board_skips_the_model_call).
+    _seed_live_action_alert(db)
 
     async def _synth(**_kwargs: object) -> str:
         return "**What changed:** nothing dramatic."
@@ -1172,6 +1195,7 @@ def test_unrostered_viewer_gets_whole_company_narrative(
     whole-company (principal-scope) narrative."""
     db = tmp_path / "unrostered.db"
     _setup_isolated_db(db, monkeypatch)
+    _seed_live_action_alert(db)  # non-quiet board, so the synthesizer runs
 
     async def _synth(**kw: object) -> str:
         return "principal-brief" if kw.get("viewer") is None else "teammate-brief"
@@ -1255,25 +1279,21 @@ def test_teammate_with_no_routed_proposals_quiet_path(
         full_name="Dan", role="CFO", email="dan@x.com",
         department_slugs=["finance"], db_path=db,
     )
-    captured: dict[str, list[str]] = {}
+    calls = {"n": 0}
 
-    async def _synth(**kw: object) -> str:
-        viewer = kw.get("viewer")
-        today_data = kw.get("today_data") or {}
-        if viewer:
-            captured["proposals"] = [
-                p["headline"] for p in today_data.get("proposals", [])  # type: ignore[union-attr]
-            ]
-            return "Quiet right now — nothing needs you."
-        return "principal"
+    async def _synth(**_kw: object) -> str:
+        calls["n"] += 1
+        return "should not be reached"
 
     monkeypatch.setattr(briefing_narrative, "synthesize_briefing_narrative", _synth)
 
     c = _make_client()
     c.get("/today", headers={"x-caller-email": "dan@x.com"})
     narr = c.get("/today", headers={"x-caller-email": "dan@x.com"}).json()["narrative"]
-    assert captured["proposals"] == []  # empty slice — nothing routed to them
+    # Nothing is routed to Dan, so his slice is empty — the fixed quiet line is
+    # written directly and no model call is spent on it.
     assert narr == "Quiet right now — nothing needs you."
+    assert calls["n"] == 0
 
 
 def test_narrative_input_is_company_action_no_monitoring(
@@ -1569,3 +1589,133 @@ def test_handled_overnight_rows_are_structured_and_track_current_status(
     watching = rows["stock-acme"]
     assert watching["kind"] == "watching" and watching["alert_id"] is None
     assert watching["detail"] == "competitor ticker named on Sales" and watching["status"] == ""
+
+
+# --------------------------------------------------------------------------- #
+# Briefing-narrative accuracy: the header must describe what is LIVE.
+#
+# Regression set for the incident where a tenant's board was fully dismissed
+# yet the header still led with three closed items. Three independent defects
+# combined: closed alerts stayed in the activity feed, that feed was unbounded
+# but labelled "since last brief", and the cache hash ignored activity — so
+# once proposals hit zero the hash was constant and the text froze for a day.
+# --------------------------------------------------------------------------- #
+
+def test_activity_keeps_closed_alerts_for_the_rail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The /today/activity rail is a history feed: a dismissed alert still
+    represents a real raise event and must stay."""
+    db = tmp_path / "rail.db"
+    _setup_isolated_db(db, monkeypatch)
+    aid = alert_store.insert_alert(
+        source="system", external_id="closed-1", severity="high",
+        headline="Since-settled thing", body="b", db_path=db,
+    )
+    assert aid is not None
+    alert_store.set_status(aid, "dismissed", db_path=db)
+
+    headlines = [i.summary for i in today_route._build_activity(20).items]
+    assert "Since-settled thing" in headlines
+
+
+def test_activity_drops_closed_alerts_for_the_narrative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`live_alerts_only` drops them, so the narrative cannot re-report a
+    settled item as live. Live alerts are kept."""
+    db = tmp_path / "narr-activity.db"
+    _setup_isolated_db(db, monkeypatch)
+    closed = alert_store.insert_alert(
+        source="system", external_id="closed-2", severity="high",
+        headline="Already handled", body="b", db_path=db,
+    )
+    assert closed is not None
+    alert_store.set_status(closed, "dismissed", db_path=db)
+    alert_store.insert_alert(
+        source="system", external_id="open-2", severity="high",
+        headline="Still open", body="b", db_path=db,
+    )
+
+    live = [i.summary for i in today_route._build_activity(20, live_alerts_only=True).items]
+    assert "Already handled" not in live
+    assert "Still open" in live
+
+
+def test_narrative_hash_moves_when_only_activity_changes() -> None:
+    """The hash must cover activity. Without this, a board with no proposals,
+    no at-risk department and nobody awaiting produced a constant hash, so the
+    narrative could never regenerate inside a UTC day."""
+    empty_board: dict[str, object] = {"proposals": [], "departments": [], "people": []}
+    before = narrative_cache.build_narrative_input_hash(
+        empty_board, activity=[{"kind": "alert_raised", "summary": "one"}]
+    )
+    after = narrative_cache.build_narrative_input_hash(
+        empty_board, activity=[{"kind": "alert_raised", "summary": "two"}]
+    )
+    assert before != after
+
+
+def test_narrative_hash_ignores_activity_timestamps() -> None:
+    """Keyed on kind + summary, never the stamp — an unchanged rail must not
+    churn the cache (and burn a model call) on every poll."""
+    board: dict[str, object] = {"proposals": [], "departments": [], "people": []}
+    a = narrative_cache.build_narrative_input_hash(
+        board, activity=[{"kind": "dm_sent", "summary": "s", "at": "2026-01-01T00:00:00Z"}]
+    )
+    b = narrative_cache.build_narrative_input_hash(
+        board, activity=[{"kind": "dm_sent", "summary": "s", "at": "2026-06-30T12:00:00Z"}]
+    )
+    assert a == b
+
+
+def test_empty_board_skips_the_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core regression: with everything dismissed, the header must say it
+    is quiet rather than synthesizing a story out of the history rail."""
+    db = tmp_path / "empty-board.db"
+    _setup_isolated_db(db, monkeypatch)
+    dismissed = alert_store.insert_alert(
+        source="system", external_id="dismissed-1", severity="urgent",
+        headline="St. Albans reconciliation gap", body="b", db_path=db,
+    )
+    assert dismissed is not None
+    alert_store.set_status(dismissed, "dismissed", db_path=db)
+
+    calls = {"n": 0}
+
+    async def _synth(**_kw: object) -> str:
+        calls["n"] += 1
+        return "**Bottom line:** St. Albans is on fire."
+
+    monkeypatch.setattr(briefing_narrative, "synthesize_briefing_narrative", _synth)
+
+    c = _make_client()
+    assert c.get("/today").json()["proposals"] == []
+    narr = c.get("/today").json()["narrative"]
+    assert narr == "Quiet right now — nothing pressing."
+    assert calls["n"] == 0
+    assert "St. Albans" not in (narr or "")
+
+
+def test_live_board_still_synthesizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The quiet short-circuit must not swallow a real board."""
+    db = tmp_path / "live-board.db"
+    _setup_isolated_db(db, monkeypatch)
+    _seed_live_action_alert(db)
+
+    calls = {"n": 0}
+
+    async def _synth(**_kw: object) -> str:
+        calls["n"] += 1
+        return "**Bottom line:** the budget needs you."
+
+    monkeypatch.setattr(briefing_narrative, "synthesize_briefing_narrative", _synth)
+
+    c = _make_client()
+    c.get("/today")
+    assert c.get("/today").json()["narrative"] == "**Bottom line:** the budget needs you."
+    assert calls["n"] == 1

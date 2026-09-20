@@ -87,21 +87,31 @@ def initialize_db(db_path: Path | None = None) -> None:
 # into the input hash so a prompt change invalidates every cached narrative on
 # the next view — otherwise a wording fix wouldn't surface until the underlying
 # state changed (or the daily date rollover).
-NARRATIVE_PROMPT_VERSION = "3"
+NARRATIVE_PROMPT_VERSION = "4"
 
 
 def build_narrative_input_hash(
-    today_data: dict[str, Any], scope: str = DEFAULT_SCOPE
+    today_data: dict[str, Any],
+    scope: str = DEFAULT_SCOPE,
+    activity: list[dict[str, Any]] | None = None,
 ) -> str:
     """Stable hash of the briefing state the narrative is derived from.
 
     Keyed on the signals that should trigger a re-write — proposal
-    headlines, at-risk department counts, and who's awaiting — plus the UTC
-    date so the narrative refreshes at least daily even if nothing structural
-    changed, plus the viewer `scope` so two viewers whose slices happen to
-    coincide still cache under distinct keys, plus NARRATIVE_PROMPT_VERSION so a
-    prompt rewrite invalidates the cache. Deliberately ignores volatile fields
-    (timestamps, ids) so identical content doesn't churn the cache.
+    headlines, at-risk department counts, who's awaiting, and the activity
+    rows the narrative reasons over — plus the UTC date so the narrative
+    refreshes at least daily even if nothing structural changed, plus the
+    viewer `scope` so two viewers whose slices happen to coincide still cache
+    under distinct keys, plus NARRATIVE_PROMPT_VERSION so a prompt rewrite
+    invalidates the cache. Deliberately ignores volatile fields (timestamps,
+    ids) so identical content doesn't churn the cache.
+
+    ``activity`` must be the SAME list the synthesis is fed — callers get both
+    from ``today._narrative_activity``. Omitting it was a silent staleness bug:
+    on a board with no proposals, no at-risk department and nobody awaiting,
+    every remaining input lived in ``activity``, so the hash was constant and
+    the narrative could never regenerate within a UTC day no matter what the
+    Executive did.
     """
     proposals = [
         (p.get("headline", ""), p.get("category", ""))
@@ -117,6 +127,12 @@ def build_narrative_input_hash(
         for p in today_data.get("people", [])
         if p.get("awaiting_count", 0)
     )
+    # Keyed by kind + summary, never by timestamp, so an unchanged rail does
+    # not churn the cache the way a stamp would.
+    activity_key = sorted(
+        (str(a.get("kind", "")), str(a.get("summary", ""))[:120])
+        for a in (activity or [])
+    )
     payload = {
         "scope": scope,
         "prompt_version": NARRATIVE_PROMPT_VERSION,
@@ -124,6 +140,7 @@ def build_narrative_input_hash(
         "proposals": proposals,
         "depts": depts,
         "awaiting": awaiting,
+        "activity": activity_key,
     }
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()

@@ -226,7 +226,19 @@ def render_briefing_context(
         parts.append("")
 
     if activity:
-        parts.append("OE ACTIVITY SINCE LAST BRIEF (most recent first):")
+        # Only the standalone briefs pass `since`, and only they bound the
+        # activity list to it — so only they may call it a delta. The /today
+        # header gets whatever the rail holds, which can predate the last
+        # brief entirely; labelling that "since last brief" made the header
+        # report weeks-old rows as overnight news.
+        if since is not None:
+            parts.append("OE ACTIVITY SINCE LAST BRIEF (most recent first):")
+        else:
+            parts.append(
+                "RECENT OE ACTIVITY (most recent first) — this is a history "
+                "rail, NOT a delta: the principal may have seen these already, "
+                "so never describe them as new or as having just happened:"
+            )
         for item in activity[:15]:
             parts.append(
                 f"- [{item.get('at', '')[:10]}] {item.get('kind', 'action')}: "
