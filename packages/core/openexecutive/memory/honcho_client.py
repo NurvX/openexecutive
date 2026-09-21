@@ -53,6 +53,17 @@ logger = logging.getLogger(__name__)
 # consistent if a workspace is shared across environments.
 _EXECUTIVE_PEER_ID = "executive"
 
+
+def _strip_scaffolding(text: str) -> str:
+    """Drop the ``<outbound_reply_context>`` block inbound hydration prepends
+    for the LLM turn. It quotes the Executive's own DM, so recorded as the
+    person's words it teaches Honcho that the person did what the Executive
+    did. Imported lazily: ``integrations.inbound_hydration`` pulls in the
+    episodic and session stores, which this module must not load at import."""
+    from openexecutive.integrations.inbound_hydration import strip_outbound_reply_context
+
+    return strip_outbound_reply_context(text)
+
 # Prefix that turns a department slug into a Honcho peer id. Keeping it in
 # a constant (rather than f-stringing inline) means a future rename only
 # touches one place AND makes the namespace boundary easy to grep for
@@ -1072,7 +1083,7 @@ async def prefetch(
     so a deeper level gets a budget it can actually meet; on any failure
     we return an empty string so the turn still runs with whatever the
     builtin episodic block provides. Every outcome (ok/timeout/error/
-    disabled/no_person) emits one `peer_memory` audit row.
+    disabled/no_person/empty) emits one `peer_memory` audit row.
     """
     t0 = time.monotonic()
     if person_id is None:
@@ -1081,6 +1092,12 @@ async def prefetch(
     settings = get_settings()
     if not settings.honcho_enabled:
         _emit_peer_memory(op="prefetch", person_id=person_id, outcome="disabled")
+        return ""
+    # Ask about what the person said, not about the Executive's own DM that
+    # inbound hydration may have prepended for the LLM turn.
+    query = _strip_scaffolding(query)
+    if not query.strip():
+        _emit_peer_memory(op="prefetch", person_id=person_id, outcome="empty")
         return ""
     client = await _get_client()
     if client is None:
@@ -1284,6 +1301,12 @@ def sync_turn(
     never blocks the user-facing response. Silent on failure — Honcho's
     own retention is best-effort and we don't want a sync error to
     surface after the user already has their answer.
+
+    ``user_message`` is recorded as the person's own words, so the
+    ``<outbound_reply_context>`` block inbound hydration prepends for the
+    LLM turn is stripped first. Left in, Honcho's deriver attributes the
+    Executive's own DM to the person who replied to it ("<person> created
+    the tracker", "<person>'s email is the Executive's").
     """
     if person_id is None:
         _emit_peer_memory(op="sync_turn", person_id=None, outcome="no_person")
@@ -1292,6 +1315,7 @@ def sync_turn(
     if not settings.honcho_enabled:
         _emit_peer_memory(op="sync_turn", person_id=person_id, outcome="disabled")
         return
+    user_message = _strip_scaffolding(user_message)
     if not user_message.strip() and not assistant_response.strip():
         _emit_peer_memory(op="sync_turn", person_id=person_id, outcome="empty")
         return
@@ -1631,6 +1655,9 @@ def sync_department_turn(
             outcome="disabled",
         )
         return
+    # The originating person authors ``user_message`` in the department
+    # session too, so the same scaffolding rule as sync_turn applies.
+    user_message = _strip_scaffolding(user_message)
     if not user_message.strip() and not assistant_response.strip():
         _emit_peer_memory(
             op="sync_department_turn",

@@ -3581,6 +3581,12 @@ integrations:
     (`discord:dm:{alex_id}`) with empty history, so OE has no idea what
     Alex is replying about.
 
+    The block is context for the LLM turn, never the person's words:
+    ``memory.honcho_client`` strips it (``inbound_hydration.strip_outbound_reply_context``)
+    before ``sync_turn`` and ``sync_department_turn`` post the message and
+    before the prefetch query is sent, otherwise Honcho's deriver attributes
+    the Executive's own DM to the person who replied to it.
+
     Write side — when a direct-send tool (`send_discord_dm`,
     `send_telegram_message`, `send_slack_dm`, and therefore
     `message_person`, which delegates) runs WHILE a live conversation
