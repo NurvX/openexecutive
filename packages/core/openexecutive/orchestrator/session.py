@@ -25,6 +25,13 @@ class Session:
     # channel can resolve it. Inbound vocabulary — see `normalize_channel`.
     origin_channel: str = ""
     origin_channel_ref: str = ""
+    # True only for a session minted by the web chat route. `origin_channel`
+    # cannot stand in for this: it names an INBOUND CHAT ADAPTER, and the email
+    # poller, alert review, the CLI, the MCP server, the scheduler and the
+    # unattended workflows all leave it empty while being nothing like a
+    # browser turn. Anything that wants to treat browser turns differently has
+    # to ask for them by name.
+    from_web_chat: bool = False
     # The rostered Person behind this conversation, when one is resolved. The
     # adapters already pass this to `Executive.chat(person_id=...)`; holding it
     # on the session too lets tool handlers running mid-turn tell "the approver

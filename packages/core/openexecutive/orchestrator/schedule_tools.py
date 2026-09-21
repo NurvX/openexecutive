@@ -16,11 +16,12 @@ so there is no `send_email` wrapper here.
 from __future__ import annotations
 
 import base64
+import contextlib
 import contextvars
 import copy
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -32,6 +33,46 @@ logger = logging.getLogger(__name__)
 current_session: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "current_session", default=None
 )
+
+
+@contextlib.contextmanager
+def set_session(session: Any) -> Iterator[None]:
+    """Bind ``current_session`` for the duration of the ``with`` block.
+
+    Bind this around the *whole* stream, from outside the Executive's async
+    generator — not with a bare ``current_session.set()`` inside it.
+
+    `Executive.stream_chat` does call `current_session.set(session)` at its
+    top, and that is enough for the callers that drive it with a plain
+    ``async for`` (the adapters' `.chat()` wrapper, the CLI, tests). It is NOT
+    enough for the SSE chat route, which drives the generator one step at a
+    time under ``asyncio.wait_for(stream.__anext__(), ...)``. `wait_for` wraps
+    each step in a fresh Task that *copies* the context, so a `set()` made
+    inside the generator mutates a throwaway copy and is gone by the next
+    resume: step one sees the session, every step after it sees ``None``.
+    The tool-call loop runs on those later steps, so every handler reading
+    `current_session` got ``None`` on web — silently.
+
+    That cost a production incident. `ack_alert` reads the turn's trusted
+    alert board off the session; with ``None`` it fell back to an empty set
+    and refused every ack the principal asked for, on the one surface they
+    actually use. The same ``None`` also blanks the `session_id` on
+    `scheduled_actions` rows and disables `schedule_followup`'s
+    seen-channel_refs anti-spam gate, which only fires when it can see a
+    session.
+
+    Save/restore rather than ``Token.reset()``, for the same reason
+    `audit.context.set_turn` does it: the Token variant raises ``ValueError:
+    <Token …> was created in a different Context`` when ``__exit__`` runs in a
+    different Context than ``__enter__`` — exactly what task-hopping SSE
+    drivers produce. Save/restore is Context-independent.
+    """
+    prior = current_session.get()
+    current_session.set(session)
+    try:
+        yield
+    finally:
+        current_session.set(prior)
 
 
 def _record_send_to_activity(
@@ -154,14 +195,38 @@ def _record_outbound_context(
     """Persist an outbound→inbound DM linkage so the recipient's reply can be
     hydrated with the originating conversation's context.
 
-    Only writes when a live session is active (``current_session`` is set):
-    proactive scheduler/cadence sends have no originating conversation to
-    reconnect a reply to, so they intentionally create no linkage. Best-effort
-    — any failure here must never break the send the caller just completed.
+    Only writes when a live session is active (``current_session`` is set), and
+    not for browser turns. Best-effort — any failure here must never break the
+    send the caller just completed.
+
+    The browser exclusion is deliberate and narrow. This linkage is read back
+    by `inbound_hydration`, which quotes the originating conversation into the
+    turn that handles a recipient's REPLY — a turn whose user content that
+    recipient authored. Until `current_session` was bound for the whole SSE
+    body (see `set_session`) this function never saw a web session at all, so
+    web sends created no linkage; fixing that binding would have switched the
+    flow on for the principal's broadest surface as a silent side effect.
+    Whether the principal's private web conversation may surface that way is a
+    product decision, so it is held here rather than carried in unannounced.
+
+    It is keyed on ``from_web_chat``, NOT on an empty ``origin_channel``.
+    Those are not the same set: ``origin_channel`` names an inbound chat
+    adapter, and the email poller, alert review's outbound session, the CLI,
+    the MCP server, the scheduler and the unattended workflows all leave it
+    empty while legitimately recording linkage — the email path in particular
+    both writes it here and reads it back through `hydrate_user_message`.
+    Keying on the empty string would silently break every one of them.
     """
     try:
         session = current_session.get()
         if session is None:
+            return
+        # `is True`, not truthiness: only a session that genuinely declares
+        # itself a browser turn suppresses linkage. Duck-typed and mocked
+        # session objects auto-vivify unknown attributes into truthy values,
+        # and silently dropping linkage is the worse failure direction — a
+        # lost reply thread is invisible, an extra row is not.
+        if getattr(session, "from_web_chat", False) is True:
             return
         originating_session_id = getattr(session, "session_id", None)
         recipient_person_id = _resolve_recipient_person_id(channel, channel_ref)
