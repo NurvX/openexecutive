@@ -51,17 +51,21 @@ def save_message(
     content: str | list[dict[str, Any]],
     db_path: Path = DB_PATH,
     action_chips: str | None = None,
+    stopped: bool = False,
 ) -> None:
     """Persist one chat message. ``action_chips`` is a JSON-encoded list of the
     assistant turn's action-chip dicts (or None), so reopening a saved session
-    restores the ✓ tool-action pills instead of bare prose."""
+    restores the ✓ tool-action pills instead of bare prose. ``stopped`` marks an
+    assistant message the user halted mid-stream, so the reply is not read back
+    as a complete one."""
     text = content if isinstance(content, str) else str(content)
     now = datetime.now(UTC).isoformat()
     with _get_conn(db_path) as conn:
         conn.execute(
-            "INSERT INTO chat_messages (session_id, role, content, created_at, action_chips) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (session_id, role, text, now, action_chips),
+            "INSERT INTO chat_messages "
+            "(session_id, role, content, created_at, action_chips, stopped) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, role, text, now, action_chips, 1 if stopped else 0),
         )
 
 
@@ -70,7 +74,7 @@ def load_messages(session_id: str, db_path: Path = DB_PATH) -> list[dict[str, An
         return []
     with _get_conn(db_path) as conn:
         rows = conn.execute(
-            "SELECT role, content, action_chips FROM chat_messages "
+            "SELECT role, content, action_chips, stopped FROM chat_messages "
             "WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
@@ -85,6 +89,13 @@ def load_messages(session_id: str, db_path: Path = DB_PATH) -> list[dict[str, An
                 chips = None
             if chips:
                 msg["actions"] = chips
+        # Attached only when true, like `actions` above, so untouched rows keep
+        # the exact dict shape every existing consumer expects. Safe to ride
+        # along into `Session.conversation_history`: the Executive rebuilds each
+        # history turn as {"role", "content"}, so extra keys never reach the
+        # Anthropic payload.
+        if row["stopped"]:
+            msg["stopped"] = True
         out.append(msg)
     return out
 

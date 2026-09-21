@@ -56,6 +56,23 @@ class ChatRequest(BaseModel):
     committee_review: bool = False
     # Set by the Ask OE side panel only; absent on the main chat page.
     page_context: PageContext | None = None
+    # Client-minted id for THIS turn, so the client can address it via
+    # POST /chat/stop from the moment Send is pressed. It is deliberately not
+    # the audit `turn_id` (that keeps its server-minted `t-` shape, which audit
+    # queries filter on) — see `_clean_client_turn_id` in api/routes/chat.py.
+    # Bounded, but deliberately NOT pattern-validated here: a malformed id only
+    # means this turn can't be stopped, and 422-ing the whole chat turn over it
+    # would contradict `_clean_client_turn_id`, which drops it and carries on.
+    # The max_length is a size bound, not a format check.
+    client_turn_id: str | None = Field(None, max_length=64)
+
+
+class StopChatRequest(BaseModel):
+    """Body of POST /chat/stop — the `client_turn_id` sent with the turn."""
+
+    client_turn_id: str = Field(
+        ..., min_length=8, max_length=64, pattern=r"^[A-Za-z0-9-]+$"
+    )
 
 
 class ChatResponse(BaseModel):

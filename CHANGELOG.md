@@ -53,7 +53,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `app_migrations` table); the sweep can be deleted in the release after
   next.
 
+### Changed
+- **The chat turn ceiling is now 300s (360s with Committee review)**, up from
+  120s/180s: deep multi-specialist turns were being cut off mid-answer. A
+  ceiling this generous is only reasonable because a turn can now be ended by
+  the user, so the two changes ship together. The onboarding interview, which
+  previously borrowed `CHAT_STREAM_TIMEOUT_S`, gets its own
+  `INTERVIEW_TIMEOUT_S` (still 120s) — it retries twice, so inheriting the new
+  ceiling would have meant a 10-minute hang before the wizard surfaced a
+  timeout.
+
+### Fixed
+- **A turn broken off early is no longer missing from the next turn's
+  context.** On the disconnect and timeout paths the route persisted the
+  partial turn to SQLite, but the Executive's post-turn block — which mirrors
+  it into the live in-memory session — was skipped, and a cached session never
+  re-reads its history from the DB. The next turn in the same process then
+  prompted as though the turn had never happened, while a page reload showed
+  it. The route now mirrors the turn itself on every broken-out path.
+- **The UI proxy now forwards client disconnects upstream.** `signal:
+  req.signal` was missing from the backend proxy's `fetch`, so the API never
+  saw `http.disconnect` and its `request.is_disconnected()` check could not
+  fire in production: closing a tab left the turn running to completion against
+  Anthropic and the partial reply was never saved.
+- **A disconnected turn no longer keeps working after the client is gone.**
+  The SSE driver races the stop switch with `asyncio.wait`, which — unlike the
+  `asyncio.wait_for` it replaced — does not cancel its futures when the task
+  awaiting it is cancelled. Since Starlette cancels the response body on
+  `http.disconnect`, the in-flight step is now cancelled in a `finally`, so a
+  closed tab cannot leave a specialist or tool round running with no deadline
+  and no persistence.
+
 ### Added
+- **Stop button in chat.** A reply can now be halted mid-stream, from the main
+  chat composer and the Ask OE side panel (Escape works too). Whatever the
+  Executive had written is kept, persisted and marked *Stopped by you*, so a
+  truncated answer is not read back as a complete one after a reload. The
+  client mints a `client_turn_id` and sends it with the turn; `POST /chat/stop`
+  halts it. Keying on a client-minted id is what makes the button live from the
+  moment Send is pressed — the server spends several seconds fetching context
+  before the response stream exists, and a stop inside that window costs
+  nothing because no model call has been made yet. An unknown id and another
+  caller's turn both return 404, so the endpoint cannot be used to probe which
+  turns are live.
 - **Conversational onboarding.** `/onboard` now opens with "tell me about your
   company" instead of a 12-step form. The user writes a paragraph (and can
   attach a deck, one-pager or brief), the new `onboarding_interviewer` agent

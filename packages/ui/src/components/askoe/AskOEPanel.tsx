@@ -7,6 +7,7 @@ import Message from "@/components/Message";
 import { useAskOE } from "@/components/askoe/AskOEContext";
 import type { ActionTaken, FormPatch } from "@/lib/api";
 import { streamChat } from "@/lib/api";
+import { isAbortError, useStoppableTurn } from "@/lib/use-stoppable-turn";
 
 // One proposal card per form_patch event: what was applied/skipped, the
 // Executive's rationale, and an Undo that restores the pre-patch values.
@@ -25,6 +26,8 @@ interface PanelMessage {
   content: string;
   actions?: ActionTaken[];
   patches?: PatchCardData[];
+  /** The user stopped this reply mid-stream. */
+  stopped?: boolean;
 }
 
 function PatchCard({
@@ -93,6 +96,8 @@ export default function AskOEPanel() {
   // Synchronous in-flight guard: `streaming` state updates async, so two
   // rapid Enter presses could both pass the state check before re-render.
   const sendingRef = useRef(false);
+  const { isStopping, beginTurn, stop, serverAcknowledgedStop, endTurn } =
+    useStoppableTurn();
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
@@ -139,15 +144,21 @@ export default function AskOEPanel() {
       setStreaming(true);
       setStreamingContent("");
       setActivityLabel(null);
+      const { clientTurnId, signal } = beginTurn();
 
       let content = "";
+      let wasStopped = false;
       const actions: ActionTaken[] = [];
       const patches: PatchCardData[] = [];
       try {
         // Page context is snapshotted per turn — current route, form
         // descriptor, and live field values at the moment of sending.
         const pageContext = ctx.buildPageContext();
-        for await (const item of streamChat(trimmed, sessionId, { pageContext })) {
+        for await (const item of streamChat(trimmed, sessionId, {
+          pageContext,
+          clientTurnId,
+          signal,
+        })) {
           if (item.type === "chunk" && item.content) {
             content += item.content;
             setActivityLabel(null);
@@ -160,14 +171,31 @@ export default function AskOEPanel() {
             actions.push(item);
           } else if (item.type === "error") {
             setError(item.message ?? "Something went wrong.");
-          } else if (item.type === "done" && item.session_id) {
+          } else if (item.type === "stopped") {
+            // The server is winding the turn down itself and will close with
+            // `done`; stand the abort fallback down so it can.
+            wasStopped = true;
+            serverAcknowledgedStop();
+            if (item.session_id) setSessionId(item.session_id);
+          } else if (
+            (item.type === "done" || item.type === "chunk") &&
+            item.session_id
+          ) {
+            // Adopt the id from any event that carries one, not only `done` —
+            // a turn that ends without `done` would otherwise leave the panel
+            // pointing at no session.
             setSessionId(item.session_id);
           }
           // thinking / phase / debug_event: no panel surface needed.
           // `activity` is surfaced — it fills the streaming placeholder.
         }
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Request failed.");
+        if (isAbortError(e)) {
+          // Our own safety-net abort. A stop is not an error.
+          wasStopped = true;
+        } else {
+          setError(e instanceof Error ? e.message : "Request failed.");
+        }
       } finally {
         // Don't append an empty assistant turn when the request failed
         // before producing anything — the error box is the only signal.
@@ -179,16 +207,18 @@ export default function AskOEPanel() {
               content,
               actions: actions.length ? actions : undefined,
               patches: patches.length ? patches : undefined,
+              stopped: wasStopped || undefined,
             },
           ]);
         }
+        endTurn();
         setStreamingContent("");
         setActivityLabel(null);
         setStreaming(false);
         sendingRef.current = false;
       }
     },
-    [ctx, handlePatch, sessionId, streaming]
+    [beginTurn, ctx, endTurn, handlePatch, serverAcknowledgedStop, sessionId, streaming]
   );
 
   const undoPatch = useCallback(
@@ -298,7 +328,12 @@ export default function AskOEPanel() {
 
           {messages.map((m, i) => (
             <div key={i}>
-              <Message role={m.role} content={m.content} actions={m.actions} />
+              <Message
+                role={m.role}
+                content={m.content}
+                actions={m.actions}
+                stopped={m.stopped}
+              />
               {m.patches?.map((card, j) => (
                 <PatchCard key={j} card={card} onUndo={() => undoPatch(i, j)} />
               ))}
@@ -340,15 +375,28 @@ export default function AskOEPanel() {
               }
               className="flex-1 px-3 py-2 text-sm rounded-lg bg-surface-input border border-line text-fg placeholder:text-fg-subtle resize-none focus:outline-none focus:border-indigo-500"
             />
-            <button
-              type="button"
-              disabled={streaming || !input.trim()}
-              onClick={() => void send(input)}
-              aria-label="Send"
-              className="min-h-touch min-w-touch flex items-center justify-center rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white transition-colors"
-            >
-              <Icon name="arrow-send" size="w-4 h-4" />
-            </button>
+            {streaming ? (
+              <button
+                type="button"
+                disabled={isStopping}
+                onClick={() => void stop()}
+                aria-label="Stop the executive"
+                title="Stop — whatever has been written so far is kept"
+                className="min-h-touch min-w-touch flex items-center justify-center rounded-lg bg-surface-overlay border border-line-strong text-fg hover:border-fg-muted disabled:opacity-40 transition-colors"
+              >
+                <Icon name="stop" size="w-3.5 h-3.5" fill="currentColor" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={!input.trim()}
+                onClick={() => void send(input)}
+                aria-label="Send"
+                className="min-h-touch min-w-touch flex items-center justify-center rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white transition-colors"
+              >
+                <Icon name="arrow-send" size="w-4 h-4" />
+              </button>
+            )}
           </div>
         </div>
       </aside>

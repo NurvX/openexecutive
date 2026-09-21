@@ -20,6 +20,7 @@ import {
   getSuggestedPrompts,
   streamChat,
 } from "@/lib/api";
+import { isAbortError, useStoppableTurn } from "@/lib/use-stoppable-turn";
 
 interface ChatProps {
   onDebugEvent?: (event: DebugEvent) => void;
@@ -61,6 +62,8 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages ?? []);
   const [input, setInput] = useState(initialInput ?? "");
   const [isLoading, setIsLoading] = useState(false);
+  const { isStopping, beginTurn, stop: handleStop, serverAcknowledgedStop, endTurn } =
+    useStoppableTurn();
   const [sessionId, setSessionId] = useState<string | undefined>(initialSessionId);
   const [streamingContent, setStreamingContent] = useState("");
   // Inline action chips that arrived for the in-flight assistant message.
@@ -120,6 +123,26 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   // We pass the prompt explicitly into handleSend so the state-clearing in
   // handleSend doesn't race with React batching `setInput("")` after the
   // submit reads it back.
+  // Escape stops the turn. This has to be a document listener rather than the
+  // textarea's onKeyDown: the textarea is `disabled` while a turn is in
+  // flight, and a disabled element cannot hold focus or emit key events — so
+  // the one condition under which we want Escape is exactly the one where the
+  // textarea handler can never run.
+  useEffect(() => {
+    if (!isLoading) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // An overlay that consumed this Escape (a tooltip, a dialog) calls
+      // preventDefault. Stopping the turn as well would make one keypress do
+      // two unrelated things.
+      if (e.defaultPrevented) return;
+      e.preventDefault();
+      void handleStop();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [isLoading, handleStop]);
+
   const didAutoSubmitRef = useRef(false);
   useEffect(() => {
     if (didAutoSubmitRef.current) return;
@@ -130,6 +153,16 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     handleSend(seed);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Every streamed event carries the resolved session id, not just `done`.
+  // Adopting it as soon as it is seen means a turn that ends without `done`
+  // (an aborted stream) still leaves the client pointing at the right session,
+  // rather than falling back to "" and orphaning the conversation.
+  function adoptSessionId(id: string) {
+    if (adoptedSessionIdRef.current === id) return;
+    adoptedSessionIdRef.current = id;
+    setSessionId(id);
+  }
 
   async function handleSend(text?: string) {
     const message = (text ?? input).trim();
@@ -150,27 +183,34 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     setIsConsulting(false);
     setActivityLabel(null);
     setCommitteePhase(null);
+    const { clientTurnId, signal } = beginTurn();
     onTurnStart?.();
 
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
 
-    try {
-      let accumulated = "";
-      // Local mirror of streamingActions so the closure builds the final
-      // message without depending on the async setState applying first.
-      const turnActions: ActionTaken[] = [];
+    // Declared outside the try so the abort path in `catch` can still commit
+    // whatever streamed before the stop.
+    let accumulated = "";
+    // Local mirror of streamingActions so the closure builds the final
+    // message without depending on the async setState applying first.
+    const turnActions: ActionTaken[] = [];
+    let wasStopped = false;
 
+    try {
       for await (const item of streamChat(message, sessionId, {
         committeeReview: committeeEnabled,
         files: filesForTurn,
+        clientTurnId,
+        signal,
       })) {
         if (item.type === "debug_event") {
           onDebugEvent?.(item);
           continue;
         }
         if (item.type === "chunk" && item.content) {
+          if (item.session_id) adoptSessionId(item.session_id);
           accumulated += item.content;
           setIsConsulting(false);
           setActivityLabel(null);
@@ -194,10 +234,17 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         } else if (item.type === "action_taken") {
           turnActions.push(item);
           setStreamingActions([...turnActions]);
+        } else if (item.type === "stopped") {
+          // The server acknowledged the stop and is winding the turn down
+          // itself; `done` follows over the same stream. Stand the abort
+          // fallback down, or it would fire mid-wind-down and cost us the
+          // terminal events — including the `session_id` a first turn needs.
+          wasStopped = true;
+          serverAcknowledgedStop();
+          if (item.session_id) adoptSessionId(item.session_id);
         } else if (item.type === "done") {
           if (item.session_id) {
-            adoptedSessionIdRef.current = item.session_id;
-            setSessionId(item.session_id);
+            adoptSessionId(item.session_id);
             onTurnComplete?.(item.session_id);
           }
         } else if (item.type === "error") {
@@ -205,25 +252,65 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         }
       }
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: accumulated,
-          actions: turnActions.length > 0 ? turnActions : undefined,
-        },
-      ]);
+      // A stop before any output persists nothing server-side — not even the
+      // user's message, because saving it alone would break the user/assistant
+      // alternation the stored history relies on. So rather than leave a pair
+      // of bubbles that silently vanish on reload, take the message back and
+      // return the text to the composer: the user stopped before it started,
+      // and can edit and resend. Skipped when files were attached — dropping a
+      // file selection without saying so would be worse than the mismatch.
+      if (wasStopped && !accumulated && turnActions.length === 0) {
+        if (filesForTurn.length === 0) {
+          setMessages((prev) =>
+            prev.length && prev[prev.length - 1].role === "user"
+              ? prev.slice(0, -1)
+              : prev,
+          );
+          setInput(message);
+        }
+      } else if (accumulated || turnActions.length > 0) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: accumulated,
+            actions: turnActions.length > 0 ? turnActions : undefined,
+            stopped: wasStopped || undefined,
+          },
+        ]);
+      }
       setStreamingContent("");
       setStreamingActions([]);
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: `Something went wrong: ${detail}` },
-      ]);
+      if (isAbortError(err)) {
+        // Our own safety-net abort fired (the server never sent `stopped`).
+        // Keep whatever streamed; this is a stop, not a failure.
+        if (accumulated || turnActions.length > 0) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: accumulated,
+              actions: turnActions.length > 0 ? turnActions : undefined,
+              stopped: true,
+            },
+          ]);
+        }
+        // `done` never arrived, so nothing else will clear the parent's
+        // in-flight state or refresh the sidebar. Safe to call with an empty
+        // id: the parent only adopts a truthy one (see handleTurnComplete).
+        onTurnComplete?.(adoptedSessionIdRef.current ?? sessionId ?? "");
+      } else {
+        const detail = err instanceof Error ? err.message : String(err);
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: `Something went wrong: ${detail}` },
+        ]);
+      }
       setStreamingContent("");
       setStreamingActions([]);
     } finally {
+      endTurn();
       setIsLoading(false);
       setIsConsulting(false);
       setActivityLabel(null);
@@ -321,6 +408,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                   role={msg.role}
                   content={msg.content}
                   actions={msg.role === "assistant" ? msg.actions : undefined}
+                  stopped={msg.role === "assistant" ? msg.stopped : undefined}
                 />
               ))}
 
@@ -449,15 +537,28 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
             >
               Committee
             </button>
-            <button
-              type="button"
-              onClick={() => handleSend()}
-              disabled={(!input.trim() && pendingFiles.length === 0) || isLoading}
-              aria-label="Send message"
-              className="flex-shrink-0 min-h-touch min-w-touch w-10 h-10 rounded-xl bg-indigo-500 hover:bg-indigo-400 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 flex items-center justify-center cursor-pointer"
-            >
-              <Icon name="arrow-send" size="w-4 h-4" className="text-white" />
-            </button>
+            {isLoading ? (
+              <button
+                type="button"
+                onClick={handleStop}
+                disabled={isStopping}
+                aria-label="Stop the executive"
+                title="Stop — whatever has been written so far is kept"
+                className="flex-shrink-0 min-h-touch min-w-touch w-10 h-10 rounded-xl bg-surface-overlay border border-line-strong text-fg hover:border-fg-muted disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 flex items-center justify-center cursor-pointer"
+              >
+                <Icon name="stop" size="w-3.5 h-3.5" fill="currentColor" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => handleSend()}
+                disabled={!input.trim() && pendingFiles.length === 0}
+                aria-label="Send message"
+                className="flex-shrink-0 min-h-touch min-w-touch w-10 h-10 rounded-xl bg-indigo-500 hover:bg-indigo-400 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 flex items-center justify-center cursor-pointer"
+              >
+                <Icon name="arrow-send" size="w-4 h-4" className="text-white" />
+              </button>
+            )}
           </div>
           <p className="text-center text-xs text-fg-muted mt-2 inline-flex items-center justify-center gap-1.5 w-full">
             <span className="hidden sm:inline">Enter to send · Shift+Enter for new line</span>

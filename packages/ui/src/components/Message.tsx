@@ -15,6 +15,10 @@ interface MessageProps {
   // workflow opened, person updated, alert flagged…). User messages
   // never have actions.
   actions?: ActionTaken[];
+  // The user stopped this reply mid-stream. Renders a marker so a truncated
+  // answer isn't read as a complete one — on reload too, since the flag is
+  // persisted with the message.
+  stopped?: boolean;
 }
 
 function ActionChip({ action }: { action: ActionTaken }) {
@@ -34,7 +38,7 @@ function ActionChip({ action }: { action: ActionTaken }) {
   return inner;
 }
 
-export default function Message({ role, content, isStreaming, actions }: MessageProps) {
+export default function Message({ role, content, isStreaming, actions, stopped }: MessageProps) {
   if (role === "user") {
     return (
       <div className="flex justify-end mb-6">
@@ -83,6 +87,10 @@ export default function Message({ role, content, isStreaming, actions }: Message
               <ActionChip key={`${action.tool}-${i}`} action={action} />
             ))}
           </div>
+        )}
+
+        {stopped && !isStreaming && (
+          <p className="mt-2 text-xs text-fg-muted">Stopped by you</p>
         )}
       </div>
     </div>
