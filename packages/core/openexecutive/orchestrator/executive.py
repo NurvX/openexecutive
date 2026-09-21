@@ -636,7 +636,9 @@ class Executive:
         reasoning (via the ``ask_about_person`` tool) has data.
 
         ``peer_memory_reasoning_level`` trades latency for synthesis
-        depth on Honcho's dialectic prefetch. Default ``"minimal"``
+        depth on Honcho's dialectic prefetch; it applies only when
+        ``HONCHO_PREFETCH_MODE=dialectic`` (the default representation
+        mode reads derived memory with no LLM call and ignores it). Default ``"minimal"``
         bounds Honcho's synthesis depth — production telemetry showed
         ``"low"`` was hitting the ~5s tail consistently for power-user
         peers as their representations grew. The committee path keeps

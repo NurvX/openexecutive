@@ -304,10 +304,11 @@ class Settings(BaseSettings):
 
     # ---- Honcho memory provider ----------------------------------------
     # External per-person memory layer (https://honcho.dev). When enabled,
-    # the Executive queries Honcho for a `<peer_memory>` block keyed off the
-    # inbound user's Person.id (so Slack-Alice and Discord-Alice share one
-    # peer card) and syncs each completed turn back to Honcho. Default OFF
-    # so a fresh checkout's behavior is unchanged.
+    # the Executive fetches a `<peer_memory>` block keyed off the inbound
+    # user's Person.id (so Slack-Alice and Discord-Alice share one peer
+    # card) — by default from the peer's derived representation, see
+    # HONCHO_PREFETCH_MODE — and syncs each completed turn back to Honcho.
+    # Default OFF so a fresh checkout's behavior is unchanged.
     honcho_enabled: bool = Field(False, alias="HONCHO_ENABLED")
     honcho_api_key: str | None = Field(None, alias="HONCHO_API_KEY")
     # Self-hosted Honcho lives at whatever URL the operator deploys it to.
@@ -319,6 +320,20 @@ class Settings(BaseSettings):
     # turn. 3s is generous for a local-network self-host; on timeout we
     # silently degrade to no peer_memory block and continue.
     honcho_prefetch_timeout_s: float = Field(3.0, alias="HONCHO_PREFETCH_TIMEOUT_S")
+    # How the per-turn prefetch reads the person's memory. ``representation``
+    # reads the derived representation + peer card relevant to the inbound
+    # message: a GET with no LLM behind it (~100 ms). ``dialectic`` asks
+    # Honcho a reasoned question instead: an LLM call, seconds. Applies to
+    # every per-person prefetch, committee turns included; department
+    # prefetches and the ask_about_person tool always use the dialectic call.
+    honcho_prefetch_mode: Literal["representation", "dialectic"] = Field(
+        "representation", alias="HONCHO_PREFETCH_MODE"
+    )
+    # Conclusions retrieved per turn in representation mode (Honcho accepts
+    # 1..100). The rendered block is additionally capped by size.
+    honcho_prefetch_max_conclusions: int = Field(
+        20, alias="HONCHO_PREFETCH_MAX_CONCLUSIONS", ge=1, le=100
+    )
 
     @model_validator(mode="after")
     def _validate_honcho(self) -> "Settings":

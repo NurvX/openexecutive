@@ -341,6 +341,11 @@ def _make_chat_runner(
                     response = await executive.chat(
                         user_message=query,
                         session=session,
+                        # A scenario may supply the <peer_memory> body itself.
+                        # Evals run with no person_id, so the Honcho prefetch
+                        # never fires; this is the only way to exercise how the
+                        # Executive USES peer memory. None keeps chat()'s default.
+                        peer_memory_context=scenario.get("peer_memory_context"),
                     )
                     scores = await judge_chat(scenario, response)
                     ok = float(scores.get("overall", 0)) >= _PASS_THRESHOLD
