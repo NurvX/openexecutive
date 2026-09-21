@@ -78,7 +78,11 @@ def _get_or_create_session(session_id: str | None, request: Request) -> Any:
 
     new_id = session_id or str(uuid.uuid4())
     profile = load_or_create_profile()
-    session = Session(session_id=new_id, company_profile=profile if not profile.is_empty() else None)
+    session = Session(
+        session_id=new_id,
+        company_profile=profile if not profile.is_empty() else None,
+        from_web_chat=True,
+    )
 
     if session_id:
         # Server may have restarted — reload history from DB so conversation continues.
@@ -150,6 +154,46 @@ def _build_page_context_block(page_context: PageContext | None) -> str:
         )
 
     return "\n".join(lines)
+
+
+def _seed_seen_channel_refs(session: Any, person_id: int | None) -> None:
+    """Record the caller's OWN channel addresses as seen on this session.
+
+    `schedule_followup` refuses to queue a send to a `(channel, channel_ref)`
+    the session has not seen — an anti-spam gate, and the reason an injected
+    "email this to attacker@evil" in an alert body cannot become a scheduled
+    send. The chat adapters populate it from the inbound message; nothing
+    populated it for a browser turn.
+
+    The gate was unreachable on web until `set_session` bound the session for
+    the whole stream, so it silently allowed ANY address; reachable, it reads
+    an empty set as "seen nothing" and refuses even the principal's own,
+    breaking "remind me tomorrow at 9am". Seeding the caller's own refs is
+    what makes the gate mean on web what it means everywhere else: you may
+    schedule to yourself, and to whatever this conversation actually used.
+
+    Adds only. An address removed from the roster stays in the set for the
+    life of the in-memory session.
+    """
+    if person_id is None:
+        return
+    try:
+        from openexecutive.people.store import get_person
+
+        person = get_person(person_id)
+    except Exception:
+        logger.warning("chat.seen_refs_seed_failed person_id=%s", person_id, exc_info=True)
+        return
+    if person is None:
+        return
+    for channel, ref in (
+        ("email", getattr(person, "email", None)),
+        ("slack_dm", getattr(person, "slack_user_id", None)),
+        ("discord_dm", getattr(person, "discord_user_id", None)),
+        ("telegram", getattr(person, "telegram_chat_id", None)),
+    ):
+        if ref:
+            session.seen_channel_refs.add((channel, str(ref)))
 
 
 def _resolve_caller_person_id(request: Request) -> int | None:
@@ -234,6 +278,11 @@ async def _run_chat_turn(
     # sidebar by signed-in user). See `_resolve_caller_person_id` for
     # the precedence rule that protects against cross-identity leakage.
     caller_person_id = _resolve_caller_person_id(request)
+    # Let the caller schedule to their own addresses. Runs per turn rather than
+    # only on session creation so a newly-added address works without a fresh
+    # session; note it only ever ADDS, so an address removed from the roster
+    # stays scheduleable for the life of this in-memory session.
+    _seed_seen_channel_refs(session, caller_person_id)
 
     # Persist the session row immediately (idempotent INSERT OR IGNORE) so a
     # mid-turn failure never leaves a ghost in-memory session with no DB row.
@@ -261,6 +310,7 @@ async def _run_chat_turn(
     # on timeout, so failure modes are unchanged.
     from openexecutive.audit import set_turn
     from openexecutive.memory.honcho_client import prefetch as _honcho_prefetch
+    from openexecutive.orchestrator.schedule_tools import set_session
 
     async def _do_episodic() -> str:
         try:
@@ -362,16 +412,22 @@ async def _run_chat_turn(
         timeout_s += settings.committee_extra_timeout_s
 
     async def event_generator():
-        # Bind the turn for the whole SSE body, not just its first step.
-        # `_sse_body` drives the executive with `asyncio.wait_for`, which
-        # wraps every `__anext__()` in a fresh Task that copies the context
-        # at that moment — so a binding made *inside* the executive's own
-        # generator lands in a throwaway per-step context and is gone by the
-        # next resume. Everything after step one (the whole tool-call loop
+        # Bind the turn AND the session for the whole SSE body, not just its
+        # first step. `_sse_body` drives the executive with `asyncio.wait_for`,
+        # which wraps every `__anext__()` in a fresh Task that copies the
+        # context at that moment — so a binding made *inside* the executive's
+        # own generator lands in a throwaway per-step context and is gone by
+        # the next resume. Everything after step one (the whole tool-call loop
         # and the specialist fan-out) then records with no session or turn.
         # Bound out here, in the generator Starlette itself drives, every
-        # step inherits it. `set_turn` saves and restores rather than using
-        # Token.reset precisely so it survives that task-hopping.
+        # step inherits it. Both managers save and restore rather than using
+        # Token.reset precisely so they survive that task-hopping.
+        #
+        # `set_session` is here for exactly the same reason `set_turn` is, and
+        # was missing until it cost a production incident — see its docstring
+        # in `orchestrator.schedule_tools` for the mechanism and the blast
+        # radius. Every tool handler that reads `current_session` mid-turn
+        # depends on this binding.
         # aclosing is load-bearing, not decoration: `async for` does NOT
         # close its sub-iterator when the enclosing generator is closed. This
         # body used to BE event_generator, so a client disconnect ran its
@@ -379,7 +435,10 @@ async def _run_chat_turn(
         # Executive's upstream stream aclose). Wrapping it in a plain
         # `async for` would leave `_sse_body` suspended at its yield until a
         # later GC hop — or never, if the loop closes first.
-        with set_turn(session_id=session.session_id, turn_id=turn_id):
+        with (
+            set_turn(session_id=session.session_id, turn_id=turn_id),
+            set_session(session),
+        ):
             async with contextlib.aclosing(_sse_body()) as body:
                 async for evt in body:
                     yield evt
