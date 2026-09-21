@@ -951,6 +951,27 @@ memory:
     pass that got only garbage from reading as one that found nothing.
     `stored` is incremented AFTER the write, so a locked database reports
     `stored=0` rather than a healthy-looking pass that wrote no rows.
+    A `bad_quote` drop earns exactly one corrective call: the model is shown
+    the rejected items and the quotes it gave, told to copy the span
+    character-for-character (typos included) or return empty arrays, with the
+    tool forced where the provider supports tool choice. Every retry item is
+    validated first (a still-invalid one adds no second drop; counted
+    `still_invalid`), then classified: label matches a pending bad-quote drop
+    record → recovery, stored and record released; else its quote (terminal
+    punctuation ignored) already supports a stored item of that kind →
+    re-send, ignored and counted `repeated`; else a new proposal, stored and
+    counted — a reworded label cannot be told from a different item, so its
+    original drop stands. Recovery is checked before re-send because two
+    items can rest on one sentence. Malformed shapes at any level (a kind
+    that is not a list, an item or payload that is not a dict, a response
+    with no tool call) are counted `malformed`. The row's `retry` block
+    (`rejected`, `recovered`, `repeated`, `still_invalid`, `malformed`,
+    `failure`) is always present; `rejected` is set from the complete drop
+    list when the row is written, so neither a store failure before the
+    retry nor a cancellation during it can zero it. `proposed == stored +
+    item drops` still holds after the retry. A retry exception is the
+    retry's own `failure`; the first pass's results stand. `memory_extraction`
+    is a declared `EVENT_TYPES` member so the audit UI filter can select it.
 
 peer_memory:
   what: |
