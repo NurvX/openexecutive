@@ -210,6 +210,13 @@ cd evals && python run_evals.py --scenarios scenarios/ --output results/
 - Eval scenarios for new agents or prompt changes
 - `ruff check` and `mypy` must pass
 - Architecture docs updated per `## Architecture Docs` above (when integrations, scheduler, departments/people, caching, invariants, routing patterns, or top-level modules change)
+- PR title is `type(scope): what changed`, in the imperative — e.g.
+  `fix(chat): bind the session for the whole SSE turn`. Types: `fix`, `feat`,
+  `docs`, `chore`, `refactor`, `test`, `perf`. Scope is the subsystem
+  (`chat`, `memory`, `alerts`, `briefing`, `orchestrator`, `integrations`,
+  `ui`, `deps`, …), not a file path; drop it only when the change genuinely
+  spans the repo. Say what changed rather than what it is about, lowercase
+  after the colon, no trailing period. See `.github/PULL_REQUEST_TEMPLATE.md`.
 - PR description is three sections and nothing else: **Problem**, **Approach**,
   **Checklist** (see `.github/PULL_REQUEST_TEMPLATE.md`). Rationale, review
   findings and alternatives go in the commit message; open questions go in the
