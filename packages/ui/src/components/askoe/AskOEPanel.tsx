@@ -85,6 +85,7 @@ export default function AskOEPanel() {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
+  const [activityLabel, setActivityLabel] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -137,6 +138,7 @@ export default function AskOEPanel() {
       setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
       setStreaming(true);
       setStreamingContent("");
+      setActivityLabel(null);
 
       let content = "";
       const actions: ActionTaken[] = [];
@@ -148,7 +150,10 @@ export default function AskOEPanel() {
         for await (const item of streamChat(trimmed, sessionId, { pageContext })) {
           if (item.type === "chunk" && item.content) {
             content += item.content;
+            setActivityLabel(null);
             setStreamingContent(content);
+          } else if (item.type === "activity") {
+            setActivityLabel(item.label);
           } else if (item.type === "form_patch") {
             patches.push(handlePatch(item));
           } else if (item.type === "action_taken") {
@@ -159,6 +164,7 @@ export default function AskOEPanel() {
             setSessionId(item.session_id);
           }
           // thinking / phase / debug_event: no panel surface needed.
+          // `activity` is surfaced — it fills the streaming placeholder.
         }
       } catch (e) {
         setError(e instanceof Error ? e.message : "Request failed.");
@@ -177,6 +183,7 @@ export default function AskOEPanel() {
           ]);
         }
         setStreamingContent("");
+        setActivityLabel(null);
         setStreaming(false);
         sendingRef.current = false;
       }
@@ -214,6 +221,7 @@ export default function AskOEPanel() {
     setSessionId(undefined);
     setError(null);
     setStreamingContent("");
+    setActivityLabel(null);
   }, []);
 
   if (!ctx.open) return null;
@@ -300,7 +308,7 @@ export default function AskOEPanel() {
           {streaming && (
             <Message
               role="assistant"
-              content={streamingContent || "…"}
+              content={streamingContent || activityLabel || "…"}
               isStreaming
             />
           )}

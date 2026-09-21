@@ -18,6 +18,29 @@ export interface ActionTaken {
   iteration?: number;
 }
 
+// Names the round of tool calls currently in flight, so the progress line can
+// say what is actually happening. One event per tool-use iteration, emitted
+// immediately before `thinking`. Ephemeral — unlike ActionTaken it is never
+// persisted with the assistant message. Real specialist fan-out is
+// deliberately generic ("Consulting specialists…"); individual specialist
+// names are never surfaced. See backend `orchestrator/activity_labels.py`.
+// Shown when a tool round is in flight but no `activity` event named it —
+// an older backend, or the agent loop's defensive fallback when the labeller
+// itself failed. Deliberately worded the same as the backend's own
+// `FALLBACK_LABEL` in orchestrator/activity_labels.py: both mean "something is
+// running that we can't name". Nothing enforces that across the language
+// boundary, so change the two together.
+export const FALLBACK_ACTIVITY_LABEL = "Working…";
+
+export interface Activity {
+  type: "activity";
+  // Present-progressive and already ends in an ellipsis — render verbatim.
+  label: string;
+  // Canonical tool behind the label; for MCP this is the underlying tool name.
+  tool: string;
+  iteration?: number;
+}
+
 export interface ChatChunk {
   type:
     | "chunk"
@@ -98,7 +121,12 @@ export interface FormPatch {
   iteration?: number;
 }
 
-export type StreamItem = ChatChunk | DebugEvent | ActionTaken | FormPatch;
+export type StreamItem =
+  | ChatChunk
+  | DebugEvent
+  | ActionTaken
+  | FormPatch
+  | Activity;
 
 export interface StreamChatOptions {
   committeeReview?: boolean;

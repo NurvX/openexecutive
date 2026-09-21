@@ -16,6 +16,7 @@ import {
   ChatMessage,
   CommitteePhase,
   DebugEvent,
+  FALLBACK_ACTIVITY_LABEL,
   getSuggestedPrompts,
   streamChat,
 } from "@/lib/api";
@@ -66,6 +67,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
   // Reset on every turn; frozen onto the message at `done` event time.
   const [streamingActions, setStreamingActions] = useState<ActionTaken[]>([]);
   const [isConsulting, setIsConsulting] = useState(false);
+  const [activityLabel, setActivityLabel] = useState<string | null>(null);
   const [committeeEnabled, setCommitteeEnabled] = useState(false);
   const [committeePhase, setCommitteePhase] = useState<CommitteePhase | null>(null);
   const [suggested, setSuggested] = useState<string[]>([]);
@@ -146,6 +148,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     setStreamingContent("");
     setStreamingActions([]);
     setIsConsulting(false);
+    setActivityLabel(null);
     setCommitteePhase(null);
     onTurnStart?.();
 
@@ -170,12 +173,20 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
         if (item.type === "chunk" && item.content) {
           accumulated += item.content;
           setIsConsulting(false);
+          setActivityLabel(null);
           setStreamingContent(accumulated);
+        } else if (item.type === "activity") {
+          // Arrives immediately before `thinking`, so the label is in place
+          // before the indicator turns on. Deliberately not cleared by
+          // `action_taken`: a chip can land while the same round is still
+          // running, and clearing there would flicker the line off and on.
+          setActivityLabel(item.label);
         } else if (item.type === "thinking") {
           setIsConsulting(true);
         } else if (item.type === "phase" && item.phase) {
           setCommitteePhase(item.phase);
           setIsConsulting(false);
+          setActivityLabel(null);
         } else if (item.type === "committee_critique") {
           // Severity preview only; full critique stays server-side.
           // Nothing to render yet — phase indicator already reflects the
@@ -215,6 +226,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     } finally {
       setIsLoading(false);
       setIsConsulting(false);
+      setActivityLabel(null);
       setCommitteePhase(null);
       textareaRef.current?.focus();
     }
@@ -341,7 +353,9 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                       {committeePhase ? (
                         <CommitteePhaseIndicator phase={committeePhase} />
                       ) : isConsulting ? (
-                        <span className="text-xs text-fg-muted italic">Consulting specialists…</span>
+                        <span className="text-xs text-fg-muted italic">
+                          {activityLabel ?? FALLBACK_ACTIVITY_LABEL}
+                        </span>
                       ) : null}
                     </div>
                   </div>
