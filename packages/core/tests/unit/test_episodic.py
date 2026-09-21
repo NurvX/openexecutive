@@ -795,6 +795,9 @@ def test_extract_and_store_drops_decision_with_question_quote(
     assert ep.list_decisions(db_path=db) == [], (
         "decision with question-mark quote must be dropped by the validator"
     )
+    assert create_mock.await_count == 2, (
+        "a bad quote earns one corrective call; the replayed quote is rejected again"
+    )
 
 
 def test_extract_and_store_stores_decision_with_valid_quote(
@@ -887,4 +890,7 @@ def test_extract_and_store_drops_initiative_with_hallucinated_quote(
 
     assert ep.list_initiatives(db_path=db) == [], (
         "initiative with hallucinated user_commitment_quote must be dropped"
+    )
+    assert create_mock.await_count == 2, (
+        "a bad quote earns one corrective call; the replayed quote is rejected again"
     )

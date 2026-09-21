@@ -1730,7 +1730,8 @@ _EXTRACTION_SYSTEM = (
     "Required for every item: a `user_commitment_quote` field with verbatim text copied from "
     "the USER QUESTION block. The quote must be a declarative commitment — NOT a question, "
     "NOT a hypothetical, NOT a paraphrase. If you cannot find such a quote in the USER QUESTION "
-    "text, do not include the item at all. A deterministic post-extraction validator will "
+    "text, do not include the item at all. Copy it exactly as the user typed it — typos, "
+    "casing and punctuation included; never correct or tidy it. A deterministic post-extraction validator will "
     "drop any item whose quote does not appear verbatim in the USER QUESTION or whose quote "
     "ends in a question mark — fabricating quotes wastes a tool call.\n"
     "\n"
@@ -1976,8 +1977,13 @@ def _accept(
     spec: _ItemSpec,
     user_message: str,
     dropped: list[dict[str, str]],
+    rejected: list[tuple[_ItemSpec, dict[str, Any]]] | None = None,
 ) -> bool:
     """True when ``item`` is complete and genuinely the user's own commitment.
+
+    ``rejected`` collects the full item on the bad-quote path so the retry can
+    show the model exactly what it wrote; the audit record keeps only the
+    truncated label.
 
     Shared by all three kinds so a drop is recorded on every rejecting path.
     Counting an item as proposed and then returning without a drop record is
@@ -1999,12 +2005,14 @@ def _accept(
         )
         return False
 
-    quote = str(item.get("user_commitment_quote", ""))
+    quote = _quote_of(item)
     label = str(item.get(spec.label, ""))
     if not _is_valid_user_commitment(quote, user_message):
         dropped.append(
-            {"kind": spec.kind, "reason": "bad_quote", "label": label[:60]}
+            {"kind": spec.kind, "reason": "bad_quote", "label": label[:_LABEL_CHARS]}
         )
+        if rejected is not None:
+            rejected.append((spec, item))
         logger.debug(
             "Dropping %s — invalid user_commitment_quote %r (%s=%r)",
             spec.kind,
@@ -2016,6 +2024,296 @@ def _accept(
     return True
 
 
+_ITEM_SPECS = (_DECISIONS, _INITIATIVES, _ADVICE)
+
+# How much of an item's label rides in its drop record, in the retry prompt and
+# in the identity the two passes use to recognise the same item. One number,
+# because a drop record and a re-submission must cut the label identically to
+# match up.
+_LABEL_CHARS = 60
+
+# How much of a rejected quote is echoed back to the model on the retry. The
+# quote is model output and uncapped, so this bounds the retry prompt.
+_RETRY_QUOTE_ECHO_CHARS = 200
+
+# Output budget for both extraction calls. Three short arrays of items; a
+# model that needs more is padding, not extracting.
+_EXTRACTION_MAX_TOKENS = 1024
+
+
+def _store_item(
+    spec: _ItemSpec, item: dict[str, Any], *, session_id: str, db_path: Path
+) -> None:
+    """Persist one accepted item. The three store functions take different
+    fields, so this is the one place the mapping lives; both extraction passes
+    go through it. Raises on a failed write — a locked database must surface
+    as the pass's `failure`, not as a healthy-looking `stored=0`."""
+    if spec is _DECISIONS:
+        store_decision(
+            domain=item.get("domain", "general"),
+            summary=item["summary"],
+            rationale=item.get("rationale", ""),
+            session_id=session_id,
+            db_path=db_path,
+        )
+    elif spec is _INITIATIVES:
+        store_initiative(
+            title=item["title"],
+            status=item.get("status", "active"),
+            summary=item["summary"],
+            db_path=db_path,
+        )
+    else:
+        store_advice(
+            domain=item.get("domain", "general"),
+            query_summary=item["query_summary"],
+            advice_summary=item["advice_summary"],
+            session_id=session_id,
+            db_path=db_path,
+        )
+
+
+def _run_items(
+    payload: dict[str, Any],
+    user_message: str,
+    *,
+    proposed: dict[str, int],
+    stored: dict[str, int],
+    dropped: list[dict[str, str]],
+    rejected: list[tuple[_ItemSpec, dict[str, Any]]],
+    accepted: set[tuple[str, str]],
+    session_id: str,
+    db_path: Path,
+) -> None:
+    """First pass over one tool payload: read → count → validate → store.
+
+    ``accepted`` receives the `_stored_quote_key` of every stored item so the retry
+    can tell a re-send of something already stored from a recovered or new
+    item.
+    """
+    for spec in _ITEM_SPECS:
+        for item in _iter_items(payload, spec, dropped):
+            proposed[spec.key] += 1
+            _validate_and_store(
+                item, spec, user_message,
+                dropped=dropped, rejected=rejected, stored=stored,
+                accepted=accepted, session_id=session_id, db_path=db_path,
+            )
+
+
+def _validate_and_store(
+    item: dict[str, Any],
+    spec: _ItemSpec,
+    user_message: str,
+    *,
+    dropped: list[dict[str, str]],
+    rejected: list[tuple[_ItemSpec, dict[str, Any]]] | None,
+    stored: dict[str, int],
+    accepted: set[tuple[str, str]],
+    session_id: str,
+    db_path: Path,
+) -> bool:
+    """First-pass item: validate and, if it passes, store and count it. The
+    retry classifies an accepted item first (recovery / re-send / new), so it
+    calls `_accept` and `_store_and_count` itself."""
+    if not _accept(item, spec, user_message, dropped, rejected):
+        return False
+    _store_and_count(
+        spec, item, stored=stored, accepted=accepted, session_id=session_id, db_path=db_path
+    )
+    return True
+
+
+def _store_and_count(
+    spec: _ItemSpec,
+    item: dict[str, Any],
+    *,
+    stored: dict[str, int],
+    accepted: set[tuple[str, str]],
+    session_id: str,
+    db_path: Path,
+) -> None:
+    """Store an accepted item and count it — after the write, never before."""
+    _store_item(spec, item, session_id=session_id, db_path=db_path)
+    stored[spec.key] += 1
+    accepted.add(_stored_quote_key(spec, item))
+
+
+def _quote_of(item: dict[str, Any]) -> str:
+    """The item's quote as text. A JSON `null` is no quote, not the word
+    "None" — which `str()` would make it, and which then matches any user
+    message containing that word."""
+    quote = item.get("user_commitment_quote")
+    return "" if quote is None else str(quote)
+
+
+def _drop_label_key(spec: _ItemSpec, item: dict[str, Any]) -> tuple[str, str]:
+    """How a re-submission is matched to its drop record: kind and label, cut
+    the way the record cuts it. A reworded label does not match — the item is
+    then stored as a new proposal and the original drop stands, because
+    "reworded" and "different" cannot be told apart."""
+    return spec.kind, str(item.get(spec.label, ""))[:_LABEL_CHARS]
+
+
+def _stored_quote_key(spec: _ItemSpec, item: dict[str, Any]) -> tuple[str, str]:
+    """How a re-sent, already-stored item is recognised: kind and the quote it
+    rests on, ignoring terminal punctuation. The model rewords labels freely
+    but keeps a quote that passed, so the quote is the stable identity; asked
+    to re-copy character-for-character it may gain or lose the full stop, so
+    that must not make a new identity. Checked only after the drop records:
+    a correctly re-quoted item whose label matches a pending drop is a
+    recovery even when its sentence already supports a stored item."""
+    return spec.kind, _normalize_for_quote_match(_quote_of(item)).strip(" .!")
+
+
+def _find_drop(dropped: list[dict[str, str]], key: tuple[str, str]) -> int | None:
+    """Index of the bad-quote drop record a re-submitted item was filed under.
+
+    Only an exact `(kind, label)` match counts. A looser rule — "any bad-quote
+    drop of this kind" — would let an unrelated valid item consume the record
+    and report a recovery that never happened, erasing the very `bad_quote`
+    census this row exists to show. None means the item is a new proposal,
+    whether or not the model meant it as a reworded re-send.
+    """
+    kind, label = key
+    for i, d in enumerate(dropped):
+        if d["kind"] == kind and d["reason"] == "bad_quote" and d.get("label") == label:
+            return i
+    return None
+
+
+def _retry_prompt(
+    turn_block: str, rejected: list[tuple[_ItemSpec, dict[str, Any]]]
+) -> str:
+    lines = []
+    for spec, item in rejected:
+        _, label = _drop_label_key(spec, item)
+        quote = _quote_of(item)[:_RETRY_QUOTE_ECHO_CHARS]
+        lines.append(f'- {spec.kind} "{label}": quote given "{quote}"')
+    return (
+        f"{turn_block}\n\n"
+        "REJECTED ITEMS — the user_commitment_quote you gave was NOT found "
+        "verbatim in USER QUESTION:\n"
+        + "\n".join(lines)
+        + "\n\nRe-submit ONLY these items. Copy user_commitment_quote "
+        "character-for-character from USER QUESTION, including typos and casing. "
+        "If USER QUESTION has no declarative sentence that supports an item, omit "
+        "it. Do not add new items. Return empty arrays for anything you cannot "
+        "re-quote."
+    )
+
+
+async def _retry_rejected(
+    rejected: list[tuple[_ItemSpec, dict[str, Any]]],
+    *,
+    turn_block: str,
+    user_message: str,
+    routing_model: str,
+    proposed: dict[str, int],
+    stored: dict[str, int],
+    dropped: list[dict[str, str]],
+    accepted: set[tuple[str, str]],
+    result: dict[str, Any],
+    session_id: str,
+    db_path: Path,
+) -> None:
+    """One corrective pass for items the first pass dropped as `bad_quote`.
+
+    The model has repeatedly paraphrased the user's words instead of copying
+    them, and the validator (rightly) rejects a paraphrase — so a real
+    commitment was lost on the first slip with no second chance. This shows
+    the model exactly which quotes failed and asks for the verbatim span, with
+    the tool forced so a text-only reply cannot happen. Cost: one utility-model
+    call, only on turns that dropped something.
+
+    Accounting keeps `proposed == stored + item drops` true. Every retry item
+    is validated first; a still-invalid one adds no second drop and is counted
+    under `still_invalid`. A valid item is then classified in this order: its
+    label matches a pending bad-quote drop record → a recovery, stored and the
+    record released; else its quote (same kind, terminal punctuation ignored)
+    already supports a stored item → a re-send, ignored and counted under
+    `repeated`; else a new proposal, stored and counted — including a
+    re-submission whose label the model reworded, since that cannot be told
+    from a different item, and its original drop then stands. Recovery is
+    checked before re-send because two items can rest on one sentence.
+    Malformed shapes at any level — a kind that is not a list, an item that is
+    not a dict, a tool payload that is not a dict, or a response with no
+    `store_memories` call at all — are counted under `malformed`, so a retry
+    that returned garbage does not read as one that obediently returned
+    nothing. The tool is forced where the provider supports tool choice.
+
+    ``result`` is the caller's `retry` block, mutated in place: work done
+    before a cancellation stays counted. An `Exception` here is recorded as
+    the retry's own `failure` and leaves the first pass's results untouched;
+    cancellation propagates so the whole pass is marked FAILED, as it is
+    today.
+    """
+    from openexecutive.audit.usage import log_model_usage
+    from openexecutive.providers import get_provider
+
+    scratch: list[dict[str, str]] = []
+    tool_calls: int | None = None  # None until a response arrives
+    try:
+        response = await get_provider(routing_model).messages_create(
+            model=routing_model,
+            max_tokens=_EXTRACTION_MAX_TOKENS,
+            system=_EXTRACTION_SYSTEM,
+            tools=[_EXTRACTION_TOOL],
+            tool_choice={"type": "tool", "name": "store_memories"},
+            messages=[{"role": "user", "content": _retry_prompt(turn_block, rejected)}],
+        )
+        log_model_usage(response, model=routing_model, actor="memory_extractor")
+
+        tool_calls = 0
+        for block in response.content:
+            if block.type != "tool_use" or block.name != "store_memories":
+                continue
+            tool_calls += 1
+            inp = block.input
+            if not isinstance(inp, dict):
+                scratch.append({"kind": "pass", "reason": "payload_not_a_dict"})
+                continue
+            for spec in _ITEM_SPECS:
+                for item in _iter_items(inp, spec, scratch):
+                    if not _accept(item, spec, user_message, scratch):
+                        continue
+                    drop_at = _find_drop(dropped, _drop_label_key(spec, item))
+                    if drop_at is None and _stored_quote_key(spec, item) in accepted:
+                        result["repeated"] += 1
+                        continue
+                    _store_and_count(
+                        spec, item, stored=stored, accepted=accepted,
+                        session_id=session_id, db_path=db_path,
+                    )
+                    if drop_at is None:
+                        proposed[spec.key] += 1
+                    else:
+                        del dropped[drop_at]
+                        result["recovered"] += 1
+    except Exception as exc:
+        result["failure"] = type(exc).__name__
+        logger.exception("Episodic memory extraction retry failed — keeping first pass")
+    finally:
+        # Counted in `finally` so a retry that died mid-loop still reports the
+        # drops it had already seen, not zeros beside its `failure`. A response
+        # with no tool call is one malformed shape; no response at all is not.
+        malformed = sum(1 for d in scratch if d["reason"] in _SHAPE_REASONS)
+        result["malformed"] = malformed + (1 if tool_calls == 0 else 0)
+        result["still_invalid"] = len(scratch) - malformed
+
+
+def _no_retry() -> dict[str, Any]:
+    """The `retry` audit shape when no corrective pass ran (or before it has)."""
+    return {
+        "rejected": 0,
+        "recovered": 0,
+        "repeated": 0,
+        "still_invalid": 0,
+        "malformed": 0,
+        "failure": "",
+    }
+
+
 def _audit_extraction(
     proposed: dict[str, int],
     stored: dict[str, int],
@@ -2023,8 +2321,13 @@ def _audit_extraction(
     *,
     session_id: str,
     failure: str = "",
+    retry: dict[str, Any] | None = None,
 ) -> None:
     """One `memory_extraction` audit row per extraction pass.
+
+    `retry` is always present in the details (zeros when nothing was rejected)
+    so a query never has to branch on key presence; it says how many bad-quote
+    drops a corrective pass was owed and how many it recovered.
 
     The point is that "the model proposed nothing" and "the model proposed
     things and every one was rejected" are different failures with different
@@ -2051,13 +2354,17 @@ def _audit_extraction(
     total_stored = sum(stored.values())
     malformed = sum(1 for d in dropped if d["reason"] in _SHAPE_REASONS)
     prefix = f"FAILED({failure}) " if failure else ""
+    retry = retry if retry is not None else _no_retry()
+    retry_note = (
+        f" retry={retry['recovered']}/{retry['rejected']}" if retry["rejected"] else ""
+    )
     try:
         from openexecutive.audit import log_event
 
         log_event(
             "memory_extraction",
             f"{prefix}proposed={total_proposed} stored={total_stored} "
-            f"dropped={len(dropped)} malformed={malformed}",
+            f"dropped={len(dropped)} malformed={malformed}{retry_note}",
             session_id=session_id or None,
             actor="memory_extractor",
             details={
@@ -2070,6 +2377,7 @@ def _audit_extraction(
                 # drops on decisions this week" is a query, not a string split
                 # over a field that can itself contain colons.
                 "dropped": dropped[:_MAX_DROPPED_IN_AUDIT],
+                "retry": retry,
             },
         )
     except Exception:
@@ -2129,6 +2437,9 @@ async def _extract_and_store(
     proposed = {"decisions": 0, "initiatives": 0, "advice": 0}
     stored = {"decisions": 0, "initiatives": 0, "advice": 0}
     dropped: list[dict[str, str]] = []
+    rejected: list[tuple[_ItemSpec, dict[str, Any]]] = []
+    accepted: set[tuple[str, str]] = set()
+    retry = _no_retry()
     failure = ""
     try:
         from openexecutive.audit.usage import log_model_usage
@@ -2155,22 +2466,18 @@ async def _extract_and_store(
         else:
             existing_block = ""
 
+        turn_block = (
+            f"{existing_block}"
+            f"USER QUESTION:\n{user_message[:_MAX_INPUT_CHARS]}\n\n"
+            f"EXECUTIVE RESPONSE:\n{assistant_response[:_MAX_INPUT_CHARS]}"
+        )
         response = await get_provider(routing_model).messages_create(
             model=routing_model,
-            max_tokens=1024,
+            max_tokens=_EXTRACTION_MAX_TOKENS,
             system=_EXTRACTION_SYSTEM,
             tools=[_EXTRACTION_TOOL],
             tool_choice={"type": "auto"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"{existing_block}"
-                        f"USER QUESTION:\n{user_message[:_MAX_INPUT_CHARS]}\n\n"
-                        f"EXECUTIVE RESPONSE:\n{assistant_response[:_MAX_INPUT_CHARS]}"
-                    ),
-                }
-            ],
+            messages=[{"role": "user", "content": turn_block}],
         )
 
         log_model_usage(response, model=routing_model, actor="memory_extractor")
@@ -2190,45 +2497,32 @@ async def _extract_and_store(
             if not isinstance(inp, dict):
                 dropped.append({"kind": "pass", "reason": "payload_not_a_dict"})
                 continue
-            # Each loop is read → count → validate → store. The counting and
-            # validation are identical across the three kinds and live in
-            # `_accept`; only the store call differs, because the three store
-            # functions take different fields.
-            for d in _iter_items(inp, _DECISIONS, dropped):
-                proposed["decisions"] += 1
-                if not _accept(d, _DECISIONS, user_message, dropped):
-                    continue
-                store_decision(
-                    domain=d.get("domain", "general"),
-                    summary=d["summary"],
-                    rationale=d.get("rationale", ""),
-                    session_id=session_id,
-                    db_path=db_path,
-                )
-                stored["decisions"] += 1
-            for i in _iter_items(inp, _INITIATIVES, dropped):
-                proposed["initiatives"] += 1
-                if not _accept(i, _INITIATIVES, user_message, dropped):
-                    continue
-                store_initiative(
-                    title=i["title"],
-                    status=i.get("status", "active"),
-                    summary=i["summary"],
-                    db_path=db_path,
-                )
-                stored["initiatives"] += 1
-            for a in _iter_items(inp, _ADVICE, dropped):
-                proposed["advice"] += 1
-                if not _accept(a, _ADVICE, user_message, dropped):
-                    continue
-                store_advice(
-                    domain=a.get("domain", "general"),
-                    query_summary=a["query_summary"],
-                    advice_summary=a["advice_summary"],
-                    session_id=session_id,
-                    db_path=db_path,
-                )
-                stored["advice"] += 1
+            _run_items(
+                inp,
+                user_message,
+                proposed=proposed,
+                stored=stored,
+                dropped=dropped,
+                rejected=rejected,
+                accepted=accepted,
+                session_id=session_id,
+                db_path=db_path,
+            )
+
+        if rejected:
+            await _retry_rejected(
+                rejected,
+                turn_block=turn_block,
+                user_message=user_message,
+                routing_model=routing_model,
+                proposed=proposed,
+                stored=stored,
+                dropped=dropped,
+                accepted=accepted,
+                result=retry,
+                session_id=session_id,
+                db_path=db_path,
+            )
 
     except Exception as exc:
         # Recorded so the audit row can say the pass FAILED. Without it a
@@ -2248,9 +2542,13 @@ async def _extract_and_store(
         raise
     finally:
         # In `finally`, not the happy path: a pass that crashed is exactly the
-        # one an operator needs to see.
+        # one an operator needs to see. `rejected` is the count of bad-quote
+        # drops a corrective pass was owed, set here from the complete list so
+        # neither a store failure before the retry nor a cancellation during
+        # it can leave a block that denies the drop records beside it.
+        retry["rejected"] = len(rejected)
         _audit_extraction(
-            proposed, stored, dropped, session_id=session_id, failure=failure
+            proposed, stored, dropped, session_id=session_id, failure=failure, retry=retry
         )
 
 
