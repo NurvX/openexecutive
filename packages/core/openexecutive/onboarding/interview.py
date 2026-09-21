@@ -569,7 +569,7 @@ async def advance(
     for attempt in range(2):
         try:
             response = await asyncio.wait_for(
-                _call(), timeout=settings.chat_stream_timeout_s
+                _call(), timeout=settings.interview_timeout_s
             )
         except TimeoutError as exc:  # asyncio.TimeoutError is an alias since 3.11
             raise InterviewTimeout(

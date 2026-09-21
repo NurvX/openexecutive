@@ -1763,7 +1763,7 @@ today:
 
 chat:
   module: openexecutive.api.routes.chat
-  endpoint: POST /chat — server-sent events stream of the live turn.
+  endpoint: POST /chat — server-sent events stream of the live turn. POST /chat/stop halts one mid-flight.
   sse_event_types:
     - "chunk — one text delta from the assistant response stream. Fields: type, content, session_id."
     - "thinking — keepalive emitted at the start of EVERY tool-use round, not just specialist ones. Fields: type, session_id. It carries no tool information, so the UI uses it purely as an in-flight boolean and takes the wording from the `activity` event that immediately precedes it. It used to be the sole driver of a hardcoded 'Consulting specialists…' string, which is why an MCP or calendar round looked like a specialist fan-out."
@@ -1773,8 +1773,116 @@ chat:
     - "action_taken — emitted whenever the Executive's tool-use loop completes a side-effecting tool call. Fields: type, tool, summary (≤80 chars, human-readable), target (person / channel ref / resource), link (optional in-app path the UI drills into), iteration. See `openexecutive.orchestrator.action_chips.SIDE_EFFECTING_TOOLS` for the canonical instrumented set; read-only tools (consult_specialist, lookup_person, list_people, search_skills, load_skill, search_tools, web_search, ask_about_person, list_workflows) never emit this event. The chip is suppressed when the handler returned an error payload — no green ✓ over a red outcome."
     - "debug_event — internal observability for the Agent Activity panel (knowledge_retrieved, routing_decision, specialist_start/done, synthesis_start, skill_invocation, mcp_invocation, web_search_invocation, committee_*). Not part of the user-visible conversation."
     - "form_patch — emitted when the Executive calls `propose_form_values` (Ask OE panel form-fill tier). Fields: type, form_id, fields (name → proposed value map), rationale, iteration. The panel applies the values into the registered on-screen form as highlighted suggestions; nothing is saved server-side and the user submits through the form's normal Save. NOT persisted with the assistant message (same deferred-persistence bucket as the action-chip note below predating chip persistence) — reopening a panel session loses the proposal cards, though values already applied to a form are unaffected."
+    - "stopped — the user halted the turn via POST /chat/stop. Carries type + session_id. ALWAYS followed by `done` over the same still-open stream: the server winds the turn down and reports, rather than the connection simply dying, so a consumer's state machine reaches its normal terminal state and there is no abort path to special-case. Deliberately NOT an `error` — a stop is a user decision, not a failure — so a consumer that ignores the event degrades to 'the turn ended normally', which is the safe reading. Whatever the Executive produced before the stop is persisted and flagged (chat_messages.stopped)."
     - "done — final marker carrying the resolved session_id; UI uses this to commit the streamed assistant message and clear the pending-prompt state."
     - "error — terminal error before/after streaming. Always followed by `done` so the stream consumer's state-machine reaches a clean end."
+  stop_control: |
+    The Stop button. The CLIENT mints a `client_turn_id` (uuid4) and sends it
+    with the turn; `POST /chat/stop` takes that id and sets an asyncio.Event
+    the SSE driver loop races against `stream.__anext__()`.
+
+    Why a client-minted id rather than the server's `turn_id`: `_run_chat_turn`
+    runs its context fan-out (RAG + episodic + Honcho prefetch + briefing)
+    BEFORE constructing the StreamingResponse, so no header and no SSE byte —
+    and therefore no server-issued id — reaches the client for several seconds.
+    That is exactly the window where stopping is free, because the Executive
+    has not been asked for a first step and no model call has been made. A
+    client id is live from the moment Send is pressed and closes it.
+
+    The client id is NOT reused as the audit `turn_id`: that keeps its
+    server-minted `t-` + 12-hex shape, which audit queries filter on, and
+    letting a client choose an audit key is the thing `_clean_session_id`
+    exists to prevent. `_CLIENT_TURN_ID_RE` is deliberately narrower than
+    `_SESSION_ID_RE` (the value reaches log lines). A malformed id is DROPPED,
+    not rejected — it only means that turn is not stoppable, which is never a
+    reason to fail the turn.
+
+    Authorization: the registry stores an OWNER KEY, not the raw
+    `caller_person_id`. That id is None for a signed-in user not yet on the
+    People roster, for a fresh install with no principal, and on any transient
+    DB error during lookup — so comparing person ids directly would make every
+    such caller the owner of every other such caller's turn. `_stop_owner_key`
+    falls back person id -> verified email -> "local" (no caller header at all,
+    i.e. CLI/curl against a local API). The UI proxy strips client-sent
+    `x-caller-*` and re-stamps from the verified NextAuth session, so the email
+    cannot be spoofed. Unknown id and "not yours" both return 404, on purpose —
+    distinguishing them would make the endpoint an oracle for which turn ids
+    are live.
+
+    Registration is refused rather than forced on two conditions, and a refused
+    turn simply isn't stoppable (it always still runs): an id already held by a
+    live turn (overwriting would make the first turn unstoppable and point Stop
+    at the wrong one), and a full registry. At the cap the NEW turn is refused
+    rather than the oldest evicted — entries are popped when their turn ends,
+    so the oldest is typically a long-running live turn whose owner is the most
+    likely person to reach for Stop.
+
+    A malformed `client_turn_id` on /chat is DROPPED, never rejected: failing a
+    whole chat turn over an unstoppable id would be the wrong trade. On
+    /chat/stop the id *is* the payload, so a bad one is a 422.
+
+    How the work actually stops: the route cancels the pending `__anext__`
+    task and AWAITS it before touching the generator again (cancel() only
+    requests cancellation, and `aclose()` on a generator whose step is still
+    running raises RuntimeError). The CancelledError propagates into whatever
+    the Executive is awaiting — the Anthropic stream, a tool call, a specialist
+    gather — which is why executive.py re-raises CancelledError out of its
+    `gather(return_exceptions=True)` calls rather than treating it as a tool
+    failure.
+
+    `asyncio.wait` carries a duty `wait_for` used to discharge: it does NOT
+    cancel its futures when the task awaiting it is cancelled, and Starlette
+    cancels the SSE body on `http.disconnect`. `_next_stream_step` therefore
+    cancels the pending step in a `finally`, so a closed tab cannot leave
+    `__anext__` running a full specialist or tool round with no deadline, no
+    registry entry and no persistence. That `finally` is the load-bearing part
+    of the function; tests/unit/test_chat_stream_step.py pins it.
+
+    The route persists BEFORE emitting the terminal frames on every path,
+    including the stop: closing the tab in the gap between a `stopped` frame
+    and the write would lose the partial reply, which is the one thing the
+    feature exists to preserve. The first-turn session-title call (a Haiku
+    round-trip with a ~10s budget) is skipped on the stop path, so persisting
+    first does not make the button feel dead.
+
+    `_active_stops` is single-process, exactly like `_sessions` and
+    `_last_turn_*` in the same module and `_active_cancellations` in
+    api/routes/evals.py (the pattern this copies). A second uvicorn worker
+    would break in-flight session continuity before it broke stop. It is
+    bounded (`_STOP_REGISTRY_MAX`) so a leaked entry cannot grow without limit.
+
+    Two accepted consequences, by design rather than oversight:
+      - A stopped turn writes the inbound `chat_turn` audit row plus an
+        explicit outbound one marked `stopped`. The Executive's own outbound
+        row never happens, because it is cancelled before its post-turn block.
+      - A side-effecting tool cancelled mid-flight may already have fired (the
+        DM sent, the event booked) without emitting its `action_taken` chip.
+        Identical to the pre-existing whole-turn timeout behaviour.
+      - A stop landing before the Executive produces anything saves nothing —
+        not even the user message, since storing it alone would break the
+        user/assistant alternation the stored history relies on. The UI matches
+        that by taking the message back and returning its text to the composer
+        (unless files were attached, where silently dropping the selection
+        would be worse), so the live view and a reload agree.
+      - A stopped FIRST turn is renamed detached rather than inline. The rename
+        only ever runs on a first turn, and the stopped turn is part of the
+        history, so simply skipping it would leave the placeholder title
+        forever; awaiting it would add a ~10s Haiku round-trip to a stop.
+      - Stopping a COMMITTEE turn during its silent draft phase saves nothing.
+        `stream_chat_with_committee` accumulates the draft into a local and
+        never yields it (only the revised stream reaches the client), so
+        `full_response` is empty and `_persist_turn` returns on its empty
+        guard. The turn simply ends with no assistant message. The UI matches
+        this by not appending an empty bubble, so the live view and a reload
+        agree. Changing it means restructuring the draft phase.
+
+    The route also mirrors a broken-out turn into the live in-memory Session.
+    The Executive's post-turn block is skipped whenever its generator closes
+    early, and `_get_or_create_session` never re-reads history for a session it
+    already holds — so without this the NEXT turn would prompt as though the
+    stopped turn never happened while a page reload showed it. This applies to
+    the disconnect and timeout paths too, where it was a latent bug.
+
   ask_oe_page_context: |
     The Ask OE side panel (packages/ui/src/components/askoe/*, available on
     every AppShell route — not `/`, which IS the chat) sends an optional
@@ -1790,6 +1898,18 @@ chat:
     prefix, so conditional inclusion would invalidate the cache whenever
     panel and non-panel turns alternate. Guarded by
     tests/unit/test_executive_form_patch.py::test_tool_list_is_cache_stable_and_includes_form_tool.
+  persisted_message_fields: |
+    Two per-message fields survive a reload alongside the prose, both attached
+    by `load_messages` only when set so an untouched row keeps the exact dict
+    shape every consumer expects:
+      - `chat_messages.action_chips` — JSON list of the turn's action chips.
+      - `chat_messages.stopped` — 1 when the user halted the reply mid-stream,
+        so a truncated answer is not read back as a complete one. Additive
+        migration guarded by a PRAGMA check, same shape as action_chips.
+    Safe to ride along into `Session.conversation_history`: the Executive
+    rebuilds each history turn as {"role", "content"}, so neither key ever
+    reaches the Anthropic payload.
+
   activity_labels: |
     The in-flight progress line. `orchestrator/activity_labels.py` is the
     sibling of `action_chips.py`: same tool -> phrase mapping, but

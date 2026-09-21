@@ -1361,7 +1361,7 @@ async def directional_chat(
     (which is capped at ``_PREFETCH_CEILING_S``) because the model
     deliberately invoked this tool, but still a ceiling — without one a
     Honcho hang would pin the entire tool-call loop until
-    CHAT_STREAM_TIMEOUT_S fires (~2 min), starving every other tool
+    CHAT_STREAM_TIMEOUT_S fires (5 min by default), starving every other tool
     call in the same turn.
     """
     t0 = time.monotonic()

@@ -138,7 +138,12 @@ export default function HomePage() {
   );
 
   const handleTurnComplete = useCallback((sessionId: string) => {
-    setActiveSessionId(sessionId);
+    // Only adopt a real id. A turn that ends without ever learning one (an
+    // aborted stream) would otherwise set this to "", which <Chat> reads as
+    // "the parent selected a different session" and clears the transcript
+    // with — losing the very reply the stop was meant to keep. The in-flight
+    // flag is cleared either way, so the Agent Activity panel never sticks.
+    if (sessionId) setActiveSessionId(sessionId);
     setIsTurnInFlight(false);
     refreshSessions();
   }, [refreshSessions]);

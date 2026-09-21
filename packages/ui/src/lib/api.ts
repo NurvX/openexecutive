@@ -48,7 +48,10 @@ export interface ChatChunk {
     | "error"
     | "thinking"
     | "phase"
-    | "committee_critique";
+    | "committee_critique"
+    // The user pressed Stop. Always followed by `done` over the same still-open
+    // stream, so the consumer's state machine still reaches a clean end.
+    | "stopped";
   content?: string;
   session_id?: string;
   message?: string;
@@ -137,6 +140,13 @@ export interface StreamChatOptions {
   // Ask OE panel only — what page/form the user is looking at. Ignored on
   // the multipart route (the panel doesn't support attachments).
   pageContext?: PageContext;
+  // Client-minted id for this turn, so it can be addressed by `stopChat`.
+  // Omit it and the turn simply isn't stoppable.
+  clientTurnId?: string;
+  // Safety net only. The normal stop path leaves the stream open and lets the
+  // server wind down and send `stopped` + `done`; this aborts the fetch
+  // outright if that never arrives.
+  signal?: AbortSignal;
 }
 
 export async function* streamChat(
@@ -153,10 +163,12 @@ export async function* streamChat(
     form.append("message", message);
     if (sessionId) form.append("session_id", sessionId);
     form.append("committee_review", String(committeeReview));
+    if (opts?.clientTurnId) form.append("client_turn_id", opts.clientTurnId);
     for (const file of files) form.append("files", file, file.name);
     response = await fetch(`${API_BASE}/chat/upload`, {
       method: "POST",
       body: form,
+      signal: opts?.signal,
     });
   } else {
     response = await fetch(`${API_BASE}/chat`, {
@@ -167,7 +179,9 @@ export async function* streamChat(
         session_id: sessionId,
         committee_review: committeeReview,
         page_context: opts?.pageContext ?? undefined,
+        client_turn_id: opts?.clientTurnId ?? undefined,
       }),
+      signal: opts?.signal,
     });
   }
 
@@ -188,24 +202,50 @@ export async function* streamChat(
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
 
-    for (const line of lines) {
-      if (line.startsWith("data: ")) {
-        try {
-          const data: StreamItem = JSON.parse(line.slice(6));
-          yield data;
-        } catch {
-          // skip malformed lines
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          try {
+            const data: StreamItem = JSON.parse(line.slice(6));
+            yield data;
+          } catch {
+            // skip malformed lines
+          }
         }
       }
     }
+  } finally {
+    // `break`-ing out of the caller's `for await` closes this generator but
+    // would otherwise leave the HTTP body open.
+    await reader.cancel().catch(() => {});
+  }
+}
+
+/** Ask the backend to stop an in-flight turn.
+ *
+ * Best-effort and never throws: a 404 just means the turn already ended, and a
+ * network failure is covered by the caller's abort fallback. The SSE stream
+ * stays the authority on how the turn actually finished — this only flips the
+ * server-side switch. Returns whether the server accepted the stop.
+ */
+export async function stopChat(clientTurnId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/chat/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_turn_id: clientTurnId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 
@@ -769,6 +809,10 @@ export interface ChatMessage {
   // `chat_messages.action_chips` so reopening a saved session restores
   // them (the backend re-attaches them here via load_messages).
   actions?: ActionTaken[];
+  // True when the user stopped this reply mid-stream. Persisted to
+  // `chat_messages.stopped`, so the marker survives a reload rather than
+  // letting a truncated reply read as a complete one.
+  stopped?: boolean;
 }
 
 export interface Decision {

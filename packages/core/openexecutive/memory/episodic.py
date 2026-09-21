@@ -190,6 +190,7 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
                 content    TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 action_chips TEXT,
+                stopped INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             );
             CREATE TABLE IF NOT EXISTS scheduled_actions (
@@ -258,6 +259,19 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
         if "action_chips" not in _cm_existing:
             try:
                 conn.execute("ALTER TABLE chat_messages ADD COLUMN action_chips TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+
+        # Additive migration: flag an assistant message the user stopped
+        # mid-stream, so the "Stopped" marker survives a reload instead of a
+        # truncated reply reading as a complete one. Legacy rows default to 0.
+        if "stopped" not in _cm_existing:
+            try:
+                conn.execute(
+                    "ALTER TABLE chat_messages "
+                    "ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0"
+                )
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
                     raise

@@ -8,12 +8,12 @@ import re
 import sqlite3
 import time
 import uuid
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
-from openexecutive.api.models import ChatRequest, PageContext
+from openexecutive.api.models import ChatRequest, PageContext, StopChatRequest
 from openexecutive.audit import log_event as audit_log
 from openexecutive.integrations.attachments import build_attachment_output
 from openexecutive.orchestrator.debug_events import DebugCollector
@@ -65,6 +65,317 @@ def _clean_session_id(session_id: str | None) -> str | None:
         )
         return None
     return session_id
+
+
+# Client-minted turn ids address an in-flight turn from POST /chat/stop. The
+# charset is deliberately NARROWER than _SESSION_ID_RE: this value reaches log
+# lines (same log-injection argument as above) and nothing here needs the
+# integration-shaped ids a session id has to carry — a uuid4 is the only
+# expected shape.
+# `\Z`, not `$`: `$` also matches before a trailing newline, so `re.match`
+# would accept "aaaaaaaa\n" and register an id with a newline in it.
+_CLIENT_TURN_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}\Z")
+
+# Upper bound on the live-turn registry. Entries are popped in _sse_body's
+# `finally`, so this only matters if a turn dies somewhere that bypasses it;
+# the cap keeps such a leak from growing without limit.
+_STOP_REGISTRY_MAX = 512
+
+# Headroom on top of the whole-turn deadline before a registry entry is
+# considered stranded. Covers the pre-stream context fetch and the post-stream
+# persistence, neither of which counts against the turn deadline.
+_STOP_TTL_GRACE_S = 120.0
+
+
+class _StopEntry(NamedTuple):
+    event: asyncio.Event
+    # Who may stop this turn. NOT the raw `caller_person_id`: that resolves to
+    # None for a signed-in user who isn't on the People roster yet, for a fresh
+    # install with no principal, and on any transient DB error during lookup —
+    # so comparing person ids directly would make every such caller the owner
+    # of every other such caller's turn. See `_stop_owner_key`.
+    owner: str
+    turn_id: str
+    # Monotonic registration time, used to reclaim entries stranded by a path
+    # that never reaches `_sse_body`'s `finally`.
+    started_at: float
+
+
+# client_turn_id -> stop switch for every currently-streaming chat turn. Same
+# shape as `_active_cancellations` in api/routes/evals.py — structurally the
+# identical mechanism (id -> event registry, a POST that flips it, a terminal
+# SSE event, the streamer popping the entry in its `finally`).
+#
+# The vocabulary differs on purpose and the split is worth knowing about when
+# grepping: evals "cancels" a RUN the user started and may not be watching, and
+# says `canceled`; chat "stops" a reply that is being written in front of the
+# user, and says `stopped`, because that is the word on the button. If you are
+# looking for every stoppable-async pattern in this codebase, grep both.
+#
+# Single-process only — exactly like `_sessions` above and `_last_turn_*` below. A second
+# uvicorn worker would break in-flight session continuity before it broke this.
+_active_stops: dict[str, _StopEntry] = {}
+
+
+def _clean_client_turn_id(client_turn_id: str | None) -> str | None:
+    """Drop a client-supplied turn id that isn't a plausible id.
+
+    Dropped rather than rejected, following `_clean_session_id`: a malformed id
+    only means this turn cannot be stopped, which is never a reason to fail the
+    turn itself.
+    """
+    if client_turn_id is None:
+        return None
+    if not _CLIENT_TURN_ID_RE.match(client_turn_id):
+        logger.warning("chat.client_turn_id_rejected len=%d", len(client_turn_id))
+        return None
+    return client_turn_id
+
+
+# Strong references to detached rename tasks, so GC cannot cancel one
+# mid-flight. Mirrors `memory.episodic._background_tasks`.
+_rename_tasks: set[asyncio.Task[None]] = set()
+
+
+def _rename_session_in_background(
+    session_id: str, message: str, full_response: str, turn_id: str
+) -> None:
+    """Generate and store a session title without holding up the stream.
+
+    Used on the stop path only. Everywhere else the rename is awaited so the
+    sidebar has the good title by the time the client acts on `done`.
+    """
+    from openexecutive.config import get_settings
+    from openexecutive.memory.session_store import update_session_title
+    from openexecutive.utils.session_title import generate_session_title
+
+    async def _run() -> None:
+        try:
+            new_title = await asyncio.wait_for(
+                generate_session_title(message, full_response),
+                timeout=get_settings().utility_fast_timeout_s,
+            )
+            if new_title:
+                update_session_title(session_id, new_title)
+        except Exception:
+            # asyncio.TimeoutError is an Exception subclass in 3.11+, so this
+            # covers the timeout and any DB failure. A missed rename only
+            # leaves the placeholder title.
+            logger.exception("chat.title_update_failed turn_id=%s", turn_id)
+
+    try:
+        task = asyncio.create_task(_run())
+    except RuntimeError:  # pragma: no cover - no running loop (CLI context)
+        return
+    _rename_tasks.add(task)
+    task.add_done_callback(_rename_tasks.discard)
+
+
+def _stop_owner_key(request: Request, caller_person_id: int | None) -> str:
+    """A stable identity for "who may stop this turn".
+
+    Prefers the roster Person id, then the verified caller email, then a
+    local-trust sentinel. The email step matters: `_resolve_caller_person_id`
+    collapses every unrostered signed-in user to None, and two different people
+    must not end up owning each other's turns just because neither is on the
+    roster yet. The UI proxy strips client-sent `x-caller-*` and re-stamps the
+    header from the verified session, so the email cannot be spoofed.
+
+    The sentinel is only reached when there is no header at all — CLI and
+    direct curl against a local API, where there is no identity to separate.
+    """
+    if caller_person_id is not None:
+        return f"person:{caller_person_id}"
+    email = (request.headers.get("x-caller-email") or "").strip().lower()
+    if email:
+        return f"email:{email}"
+    return "local"
+
+
+def _sweep_stale_stops() -> None:
+    """Reclaim entries that outlived any turn that could still be running.
+
+    Entries are normally popped in `_sse_body`'s `finally`, but that only runs
+    once Starlette starts consuming the generator. Anything that strands an
+    entry would otherwise hold its slot for the life of the process — and since
+    a full registry now refuses NEW turns rather than evicting live ones, 512
+    strandings would silently take the Stop button away from everybody until a
+    restart. The TTL is generous: it only needs to exceed the longest a turn
+    can legitimately hold a slot.
+    """
+    # Imported lazily, like every other `get_settings` use in this module.
+    from openexecutive.config import get_settings
+
+    settings = get_settings()
+    ttl = (
+        settings.chat_stream_timeout_s
+        + settings.committee_extra_timeout_s
+        + _STOP_TTL_GRACE_S
+    )
+    cutoff = time.monotonic() - ttl
+    stale = [k for k, e in _active_stops.items() if e.started_at < cutoff]
+    for key in stale:
+        _active_stops.pop(key, None)
+    if stale:
+        logger.warning("chat.stop_registry_swept count=%d", len(stale))
+
+
+def _register_stop(
+    client_turn_id: str, owner: str, turn_id: str
+) -> asyncio.Event | None:
+    """Register a stop switch for a turn that is about to stream.
+
+    Returns None when the turn could not be registered, which only costs it the
+    Stop button — never the turn itself.
+    """
+    _sweep_stale_stops()
+    if client_turn_id in _active_stops:
+        # A live turn already owns this id (client retry, double submit, a
+        # scripted caller reusing a value). Overwriting would make the first
+        # turn permanently unstoppable and point Stop at the wrong one, and
+        # whichever finished first would pop the other's entry.
+        logger.warning("chat.stop_id_collision turn_id=%s", turn_id)
+        return None
+    if len(_active_stops) >= _STOP_REGISTRY_MAX:
+        # Deliberately refuse the NEW turn rather than evicting the oldest
+        # entry: entries are popped when their turn ends, so the oldest is
+        # typically a long-running LIVE turn, and evicting it would silently
+        # take the Stop button away from the person most likely to want it.
+        logger.warning("chat.stop_registry_full turn_id=%s", turn_id)
+        return None
+    event = asyncio.Event()
+    _active_stops[client_turn_id] = _StopEntry(
+        event, owner, turn_id, time.monotonic()
+    )
+    return event
+
+
+def _release_stop(client_turn_id: str | None, turn_id: str | None = None) -> None:
+    """Drop a turn's registry entry, but only if it is still that turn's.
+
+    The identity check stops one turn from popping an entry belonging to a
+    different turn that reused the same client id.
+    """
+    if not client_turn_id:
+        return
+    entry = _active_stops.get(client_turn_id)
+    if entry is None:
+        return
+    if turn_id is not None and entry.turn_id != turn_id:
+        return
+    _active_stops.pop(client_turn_id, None)
+
+
+class _StreamStep(NamedTuple):
+    """One step of the SSE driver loop.
+
+    Exactly one of these is true: `item` holds a produced value, or `exhausted`
+    / `stopped` / `timed_out` says why nothing was produced.
+    """
+
+    item: Any = None
+    produced: bool = False
+    exhausted: bool = False
+    stopped: bool = False
+    timed_out: bool = False
+
+
+async def _cancel_stream_step(anext_task: asyncio.Task[Any], turn_id: str) -> None:
+    """Cancel an in-flight `__anext__` step and wait for it to unwind.
+
+    `cancel()` only *requests* cancellation; the throw is not delivered until
+    the task next runs. Two things depend on actually awaiting it:
+
+    - `aclose()` on an async generator whose `__anext__` task is still running
+      raises RuntimeError("asynchronous generator is already running").
+    - The await is what stops the work. The CancelledError propagates into
+      whatever the Executive is awaiting — the Anthropic stream, a tool call, a
+      specialist gather — which is why executive.py re-raises CancelledError
+      out of its `gather(return_exceptions=True)` calls rather than treating it
+      as a tool failure.
+    """
+    if anext_task.done():
+        return
+    anext_task.cancel()
+    try:
+        await anext_task
+    except (asyncio.CancelledError, StopAsyncIteration):
+        # Deliberately not `suppress(BaseException)`: that would hide real
+        # cleanup errors. Catching CancelledError here can also swallow an
+        # OUTER cancel re-delivered during this await, but we are called from a
+        # `finally` while that cancellation is already propagating, so it
+        # continues on its way regardless — and the inner `cancel()` above has
+        # already been requested, which is the part that must not be skipped.
+        pass
+    except Exception:
+        logger.exception("chat.stream_step_failed turn_id=%s", turn_id)
+
+
+async def _next_stream_step(
+    stream: Any,
+    stop_waiter: asyncio.Task[bool] | None,
+    remaining: float,
+    turn_id: str,
+) -> _StreamStep:
+    """Advance `stream` one step, racing the stop switch and the deadline.
+
+    Extracted from the driver loop because the ordering here is load-bearing in
+    several ways and is much easier to reason about — and to test — on its own.
+
+    `asyncio.wait_for` cannot be used: it owns its inner task and cancels it on
+    timeout, leaving nothing to race a second future against. But that also
+    means we inherit a duty `wait_for` used to discharge for us. `asyncio.wait`
+    does NOT cancel its futures when the task awaiting it is cancelled, and
+    Starlette cancels this whole body on `http.disconnect` — so without the
+    `finally` below, a closed tab would leave `__anext__` running a full
+    specialist or tool round with no deadline, no registry entry and no
+    persistence. The `finally` is the load-bearing part of this function.
+    """
+    # One Task per step — exactly what `asyncio.wait_for` built here before,
+    # and like it this COPIES the current context, so the `set_turn` /
+    # `set_session` bindings made in `event_generator` are inherited by every
+    # step. See that function's comment for why that matters.
+    anext_task: asyncio.Task[Any] = asyncio.ensure_future(stream.__anext__())
+    try:
+        waiters: set[asyncio.Future[Any]] = {anext_task}
+        if stop_waiter is not None:
+            waiters.add(stop_waiter)
+        await asyncio.wait(
+            waiters, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if anext_task.done():
+            # Deliver a produced item even when the stop fired in the same
+            # tick. The work is already paid for, and an `action_taken` here
+            # would otherwise be dropped from the chips we persist. There is no
+            # await between the `wait` above and this check, so nothing can slip
+            # in between them.
+            try:
+                return _StreamStep(item=anext_task.result(), produced=True)
+            except StopAsyncIteration:
+                return _StreamStep(exhausted=True)
+
+        if stop_waiter is not None and stop_waiter.done():
+            return _StreamStep(stopped=True)
+        return _StreamStep(timed_out=True)
+    finally:
+        # Every exit: stop, deadline, AND an outer cancellation from a client
+        # disconnect. Never leave the step running.
+        await _cancel_stream_step(anext_task, turn_id)
+
+
+def _request_stop(client_turn_id: str, owner: str) -> str | None:
+    """Flip a turn's stop switch. Returns its server `turn_id`, or None.
+
+    None covers BOTH "no such live turn" and "not yours" on purpose: the two
+    must be indistinguishable to the caller, or the endpoint becomes an oracle
+    for which turn ids are live.
+    """
+    entry = _active_stops.get(client_turn_id)
+    if entry is None or entry.owner != owner:
+        return None
+    entry.event.set()
+    return entry.turn_id
 
 
 def _get_or_create_session(session_id: str | None, request: Request) -> Any:
@@ -230,6 +541,7 @@ async def _run_chat_turn(
     attachment_blocks: list[dict[str, Any]] | None,
     request: Request,
     page_context: PageContext | None = None,
+    client_turn_id: str | None = None,
 ) -> StreamingResponse:
     """Shared streaming-chat handler for both the JSON and multipart routes.
 
@@ -250,7 +562,46 @@ async def _run_chat_turn(
     turn_id = f"t-{uuid.uuid4().hex[:12]}"
     collector = DebugCollector(t0=t0, turn_id=turn_id)
 
-    session = _get_or_create_session(session_id, request)
+    # Resolve the caller and arm the stop switch FIRST, before the session
+    # load, the audit write and the context fan-out below. Every one of those
+    # happens before the StreamingResponse exists, so the client has no SSE
+    # byte to learn a server id from and can only address the turn by the id it
+    # minted itself. Registering here makes the Stop button live from as close
+    # to "the moment Send was pressed" as the server can manage; a stop landing
+    # in this window also costs zero tokens, because the Executive is never
+    # asked for a first step.
+    #
+    # `_resolve_caller_person_id` is used for Honcho's per-person memory and
+    # for tagging the session row's owner (so /sessions can filter the sidebar
+    # by signed-in user); see its docstring for the precedence rule that
+    # protects against cross-identity leakage.
+    caller_person_id = _resolve_caller_person_id(request)
+    client_turn_id = _clean_client_turn_id(client_turn_id)
+    stop_event: asyncio.Event | None = None
+    if client_turn_id:
+        stop_event = _register_stop(
+            client_turn_id, _stop_owner_key(request, caller_person_id), turn_id
+        )
+        if stop_event is None:
+            # Refused (id collision, or the registry is at its cap). The turn
+            # still runs; it just isn't stoppable. Drop our handle so the
+            # `finally` below can't pop an entry belonging to another turn.
+            client_turn_id = None
+        else:
+            logger.info("chat.stop_registered turn_id=%s", turn_id)
+
+    # Guarded for the same reason as the gather further down: the stop switch
+    # is already registered, and `_sse_body`'s `finally` — which normally
+    # releases it — only runs once Starlette starts consuming the generator.
+    # This call can realistically raise (a hand-edited `company/profile.yaml`
+    # that no longer parses, or a locked SQLite DB), and a stranded entry is
+    # now permanent-ish: the registry refuses new turns at its cap rather than
+    # evicting live ones, so enough of them would disable Stop for everybody.
+    try:
+        session = _get_or_create_session(session_id, request)
+    except BaseException:
+        _release_stop(client_turn_id, turn_id)
+        raise
     is_first_turn = len(session.conversation_history) == 0
 
     logger.info(
@@ -273,11 +624,6 @@ async def _run_chat_turn(
         full={"message": message},
     )
 
-    # Resolve the caller. Used for Honcho's per-person memory AND for
-    # tagging the session row's owner (so /sessions can filter the
-    # sidebar by signed-in user). See `_resolve_caller_person_id` for
-    # the precedence rule that protects against cross-identity leakage.
-    caller_person_id = _resolve_caller_person_id(request)
     # Let the caller schedule to their own addresses. Runs per turn rather than
     # only on session creation so a newly-added address works without a fresh
     # session; note it only ever ADDS, so an address removed from the roster
@@ -379,37 +725,48 @@ async def _run_chat_turn(
     # instead of only the ones that reach the recorder.
     session.trusted_alert_ids = set()
 
-    retrieved_context, episodic_context, peer_memory_context, briefing_context = await asyncio.gather(
-        asyncio.to_thread(
-            retrieve,
-            query=message,
-            specialist_name=None,
-            store=request.app.state.store if hasattr(request.app.state, "store") else None,
-        ),
-        _do_episodic(),
-        _do_prefetch(),
-        _do_briefing(),
-    )
+    # `_sse_body`'s `finally` is what normally releases the registry entry, but
+    # it only runs once Starlette starts consuming the generator. Everything
+    # from here to the `StreamingResponse` below therefore needs its own
+    # guard — the gather, the page-context builder and the settings load can
+    # all raise, and the entry would otherwise be stranded until the registry
+    # cap evicted it.
+    try:
+        retrieved_context, episodic_context, peer_memory_context, briefing_context = await asyncio.gather(
+            asyncio.to_thread(
+                retrieve,
+                query=message,
+                specialist_name=None,
+                store=request.app.state.store if hasattr(request.app.state, "store") else None,
+            ),
+            _do_episodic(),
+            _do_prefetch(),
+            _do_briefing(),
+        )
+        sources = _extract_sources(retrieved_context)
+        collector.emit("knowledge_retrieved", {
+            "query": message,
+            "chunk_count": len(sources),
+            "sources": sources,
+        })
+        logger.info("chat.knowledge_done turn_id=%s chunks=%d", turn_id, len(sources))
 
-    sources = _extract_sources(retrieved_context)
-    collector.emit("knowledge_retrieved", {
-        "query": message,
-        "chunk_count": len(sources),
-        "sources": sources,
-    })
-    logger.info("chat.knowledge_done turn_id=%s chunks=%d", turn_id, len(sources))
+        page_context_block = _build_page_context_block(page_context)
 
-    page_context_block = _build_page_context_block(page_context)
+        executive = Executive(
+            mcp_gateway=getattr(request.app.state, "mcp_gateway", None)
+        )
+        settings = get_settings()
+        timeout_s = settings.chat_stream_timeout_s
 
-    executive = Executive(mcp_gateway=getattr(request.app.state, "mcp_gateway", None))
-    settings = get_settings()
-    timeout_s = settings.chat_stream_timeout_s
-
-    if committee_review:
-        # Committee adds reviewer fan-out + a full revision pass on top of
-        # the draft. Extend the whole-turn deadline so the route doesn't
-        # cut us off mid-revision.
-        timeout_s += settings.committee_extra_timeout_s
+        if committee_review:
+            # Committee adds reviewer fan-out + a full revision pass on top of
+            # the draft. Extend the whole-turn deadline so the route doesn't
+            # cut us off mid-revision.
+            timeout_s += settings.committee_extra_timeout_s
+    except BaseException:
+        _release_stop(client_turn_id, turn_id)
+        raise
 
     async def event_generator():
         # Bind the turn AND the session for the whole SSE body, not just its
@@ -454,6 +811,7 @@ async def _run_chat_turn(
         exec_t0 = time.monotonic()
         timed_out = False
         client_disconnected = False
+        stopped = False
 
         try:
             # Flush knowledge_retrieved (and any other pre-stream events) first.
@@ -526,10 +884,22 @@ async def _run_chat_turn(
                     "assistant",
                     full_response,
                     action_chips=json.dumps(action_chips) if action_chips else None,
+                    stopped=stopped,
                 )
+                # The Executive's own post-turn block (executive.py, after its
+                # `async for`) is what normally mirrors the turn into the live
+                # in-memory Session. On every broken-out path it is skipped,
+                # because the generator is closed at its yield — and
+                # `_get_or_create_session` never re-reads history for a session
+                # already in `_sessions`. Without this the NEXT turn in this
+                # process would build its prompt as though the stopped turn had
+                # never happened, while a page reload showed it.
+                if stopped or client_disconnected or timed_out:
+                    session.add_user_message(message)
+                    session.add_assistant_message(full_response)
                 logger.info(
-                    "chat.turn_persisted turn_id=%s is_first_turn=%s disconnected=%s",
-                    turn_id, is_first_turn, client_disconnected,
+                    "chat.turn_persisted turn_id=%s is_first_turn=%s disconnected=%s stopped=%s",
+                    turn_id, is_first_turn, client_disconnected, stopped,
                 )
 
                 # First-turn rename: replace the truncated-message
@@ -541,7 +911,22 @@ async def _run_chat_turn(
                 # Hard timeout on the title call so a slow/hung Haiku can't
                 # stall the SSE `done` event indefinitely. On timeout we
                 # leave the placeholder title in place.
-                if is_first_turn:
+                if is_first_turn and stopped:
+                    # The rename is a Haiku round-trip with a
+                    # `utility_fast_timeout_s` budget (10s by default), and on
+                    # the stop path the user is waiting on the stream to close
+                    # — a stop that takes ten seconds to finish is not a stop.
+                    # But it cannot simply be skipped either: the rename only
+                    # ever runs on a first turn, and the mirror above has
+                    # already made this turn part of the history, so turn 2
+                    # would not be a first turn and the session would keep its
+                    # truncated-message placeholder title forever. Run it
+                    # detached instead, so the stream closes immediately and
+                    # the sidebar picks the title up on its next refresh.
+                    _rename_session_in_background(
+                        session.session_id, message, full_response, turn_id
+                    )
+                elif is_first_turn:
                     from openexecutive.memory.session_store import (
                         update_session_title,
                     )
@@ -563,60 +948,106 @@ async def _run_chat_turn(
                             "chat.title_update_failed turn_id=%s", turn_id
                         )
 
-            while True:
-                if await request.is_disconnected():
-                    client_disconnected = True
-                    logger.info("chat.client_disconnected turn_id=%s", turn_id)
-                    break
+            # One long-lived waiter, created once. Re-creating it per iteration
+            # would race `Event.set()` and could miss a stop that landed
+            # between two steps.
+            stop_waiter: asyncio.Task[bool] | None = (
+                asyncio.ensure_future(stop_event.wait())
+                if stop_event is not None
+                else None
+            )
+            try:
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        # Catches a stop that landed before this step — including
+                        # during the pre-stream context gather, where we have not
+                        # asked the Executive for anything yet and the stop
+                        # therefore costs nothing.
+                        stopped = True
+                        logger.info(
+                            "chat.stopped turn_id=%s chunks=%d", turn_id, chunk_count
+                        )
+                        break
 
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                    logger.warning(
-                        "chat.timeout turn_id=%s timeout_s=%s collected_chunks=%d",
-                        turn_id, timeout_s, chunk_count,
+                    if await request.is_disconnected():
+                        client_disconnected = True
+                        logger.info("chat.client_disconnected turn_id=%s", turn_id)
+                        break
+
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        logger.warning(
+                            "chat.timeout turn_id=%s timeout_s=%s collected_chunks=%d",
+                            turn_id, timeout_s, chunk_count,
+                        )
+                        break
+
+                    step = await _next_stream_step(
+                        stream, stop_waiter, remaining, turn_id
                     )
-                    break
 
-                try:
-                    item = await asyncio.wait_for(stream.__anext__(), timeout=remaining)
-                except StopAsyncIteration:
-                    break
-                except TimeoutError:
-                    timed_out = True
-                    logger.warning(
-                        "chat.timeout turn_id=%s timeout_s=%s collected_chunks=%d",
-                        turn_id, timeout_s, chunk_count,
-                    )
-                    break
+                    if step.exhausted:
+                        break
 
-                if isinstance(item, str):
-                    if item == Executive._THINKING:
-                        data = json.dumps({
-                            "type": "thinking",
-                            "session_id": session.session_id,
-                        })
+                    if step.produced:
+                        item = step.item
+                        if isinstance(item, str):
+                            if item == Executive._THINKING:
+                                data = json.dumps({
+                                    "type": "thinking",
+                                    "session_id": session.session_id,
+                                })
+                            else:
+                                full_response += item
+                                chunk_count += 1
+                                data = json.dumps({
+                                    "type": "chunk",
+                                    "content": item,
+                                    "session_id": session.session_id,
+                                })
+                            yield f"data: {data}\n\n"
+                        else:
+                            if isinstance(item, dict) and item.get("type") == "action_taken":
+                                action_chips.append(item)
+                            yield f"data: {json.dumps(item)}\n\n"
+
+                        if stop_event is not None and stop_event.is_set():
+                            stopped = True
+                            logger.info(
+                                "chat.stopped turn_id=%s chunks=%d", turn_id, chunk_count
+                            )
+                            break
+                        continue
+
+                    if step.stopped:
+                        stopped = True
+                        logger.info(
+                            "chat.stopped turn_id=%s chunks=%d", turn_id, chunk_count
+                        )
                     else:
-                        full_response += item
-                        chunk_count += 1
-                        data = json.dumps({
-                            "type": "chunk",
-                            "content": item,
-                            "session_id": session.session_id,
-                        })
-                    yield f"data: {data}\n\n"
-                else:
-                    if isinstance(item, dict) and item.get("type") == "action_taken":
-                        action_chips.append(item)
-                    yield f"data: {json.dumps(item)}\n\n"
+                        timed_out = True
+                        logger.warning(
+                            "chat.timeout turn_id=%s timeout_s=%s collected_chunks=%d",
+                            turn_id, timeout_s, chunk_count,
+                        )
+                    break
+            finally:
+                if stop_waiter is not None:
+                    # Otherwise: "Task was destroyed but it is pending".
+                    stop_waiter.cancel()
 
             logger.info(
-                "chat.executive_done turn_id=%s chunks=%d duration_s=%.2f timed_out=%s disconnected=%s",
-                turn_id, chunk_count, time.monotonic() - exec_t0, timed_out, client_disconnected,
+                "chat.executive_done turn_id=%s chunks=%d duration_s=%.2f timed_out=%s disconnected=%s stopped=%s",
+                turn_id, chunk_count, time.monotonic() - exec_t0, timed_out,
+                client_disconnected, stopped,
             )
 
             # Best-effort cancel of the underlying iterator if we broke out early.
-            if timed_out or client_disconnected:
+            # On the stop path the awaited cancellation above has already closed
+            # the generator, so this is a no-op there; it stays as the safety net
+            # for the other break-outs.
+            if timed_out or client_disconnected or stopped:
                 aclose = getattr(stream, "aclose", None)
                 if aclose is not None:
                     with contextlib.suppress(Exception):
@@ -630,7 +1061,35 @@ async def _run_chat_turn(
                 await _persist_turn()
                 return
 
+            # Persist BEFORE the terminal frames on every path, including the
+            # stop. Yielding first would mean that closing the tab in the gap
+            # between the `stopped` frame and this call loses the partial reply
+            # — which is the one thing the feature exists to preserve. The
+            # first-turn title call, which used to make that gap ~10s wide, is
+            # skipped on the stop path above, so persisting first no longer
+            # makes the button feel dead.
             await _persist_turn()
+
+            if stopped:
+                # Not an `error` event — a stop is a user decision, not a
+                # failure.
+                yield f"data: {json.dumps({'type': 'stopped', 'session_id': session.session_id})}\n\n"
+                # The Executive is cancelled before its own post-turn block runs,
+                # so the outbound `chat_turn` row it would have written never
+                # happens. Record the stop here instead, or the audit log shows
+                # an inbound turn with no response side at all.
+                audit_log(
+                    "chat_turn",
+                    f"Stopped by user after {chunk_count} chunk(s)",
+                    session_id=session.session_id,
+                    turn_id=turn_id,
+                    actor="executive",
+                    details={
+                        "direction": "out",
+                        "stopped": True,
+                        "chunks": chunk_count,
+                    },
+                )
 
             if timed_out:
                 err_evt = collector.emit("turn_error", {"reason": "timeout", "timeout_s": timeout_s})
@@ -646,6 +1105,7 @@ async def _run_chat_turn(
                 "chunks": chunk_count,
                 "duration_s": round(time.monotonic() - exec_t0, 3),
                 "timed_out": timed_out,
+                "stopped": stopped,
             })
             yield f"data: {json.dumps(collector.to_sse_dict(complete_evt))}\n\n"
 
@@ -675,7 +1135,9 @@ async def _run_chat_turn(
                 "duration_s": round(time.monotonic() - exec_t0, 3),
                 "timed_out": timed_out,
                 "client_disconnected": client_disconnected,
+                "stopped": stopped,
             }
+            _release_stop(client_turn_id, turn_id)
 
     return StreamingResponse(
         event_generator(),
@@ -696,7 +1158,33 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
         attachment_blocks=None,
         request=request,
         page_context=body.page_context,
+        client_turn_id=body.client_turn_id,
     )
+
+
+@router.post("/chat/stop")
+async def chat_stop(body: StopChatRequest, request: Request) -> dict[str, str]:
+    """Stop an in-flight /chat turn, addressed by its `client_turn_id`.
+
+    404 means "no live turn of yours with that id" — a turn that already
+    finished and a turn belonging to someone else are deliberately
+    indistinguishable from here, so this can't be used to probe which ids are
+    live. Stopping is best-effort by design: the SSE stream stays open and
+    remains the authority on how the turn actually ended.
+    """
+    client_turn_id = _clean_client_turn_id(body.client_turn_id)
+    stopped_turn_id = (
+        _request_stop(
+            client_turn_id,
+            _stop_owner_key(request, _resolve_caller_person_id(request)),
+        )
+        if client_turn_id
+        else None
+    )
+    if stopped_turn_id is None:
+        raise HTTPException(status_code=404, detail="No in-flight turn with that id")
+    logger.info("chat.stop_requested turn_id=%s", stopped_turn_id)
+    return {"status": "stopping", "turn_id": stopped_turn_id}
 
 
 @router.post("/chat/upload")
@@ -705,6 +1193,9 @@ async def chat_upload(
     message: str = Form(..., min_length=1, max_length=32000),
     session_id: str | None = Form(None),
     committee_review: bool = Form(False),
+    # Size bound only — see the note on ChatRequest.client_turn_id for why the
+    # format is checked by `_clean_client_turn_id` instead of rejected here.
+    client_turn_id: str | None = Form(None, max_length=64),
     files: list[UploadFile] = File(...),  # noqa: B008 — FastAPI multipart marker, mirrors the pattern for File parameters
 ) -> StreamingResponse:
     """Streaming chat turn with file/photo attachments.
@@ -765,6 +1256,7 @@ async def chat_upload(
         committee_review=committee_review,
         attachment_blocks=image_blocks or None,
         request=request,
+        client_turn_id=client_turn_id,
     )
 
 

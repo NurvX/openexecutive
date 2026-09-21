@@ -361,12 +361,24 @@ class Settings(BaseSettings):
         # because hosted Honcho doesn't need an operator-set URL.
         return self
 
-    chat_stream_timeout_s: float = Field(120.0, alias="CHAT_STREAM_TIMEOUT_S")
+    # Whole-turn wall-clock ceiling for a streaming chat turn. Raised from 120s
+    # because deep multi-specialist turns were being cut off mid-answer. A
+    # ceiling this high is only tolerable because the user can end a turn
+    # themselves — see POST /chat/stop in api/routes/chat.py.
+    chat_stream_timeout_s: float = Field(300.0, alias="CHAT_STREAM_TIMEOUT_S")
 
     # Extra wall-clock allowance added to chat_stream_timeout_s when a request
-    # opts in to Committee review. Committee adds three reviewer calls + one
-    # full-pass revision on top of the draft, typically 5–12s.
+    # opts in to Committee review (so 360s in total at the defaults). Committee
+    # adds three reviewer calls + one full-pass revision on top of the draft,
+    # typically 5–12s.
     committee_extra_timeout_s: float = Field(60.0, alias="COMMITTEE_EXTRA_TIMEOUT_S")
+
+    # Per-call ceiling for the onboarding interview. It used to borrow
+    # chat_stream_timeout_s, which meant raising that to 300s would have let the
+    # wizard's 2-attempt retry loop hang for up to 600s before surfacing
+    # InterviewTimeout. Split out at its own former effective value so the
+    # wizard's behaviour is unchanged.
+    interview_timeout_s: float = Field(120.0, alias="INTERVIEW_TIMEOUT_S")
 
     # Reasoning effort for deep-reasoning specialists (adaptive thinking +
     # `output_config.effort`; translated to OpenRouter `reasoning.effort` on

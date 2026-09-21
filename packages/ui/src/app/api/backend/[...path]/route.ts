@@ -77,6 +77,11 @@ async function proxy(req: NextRequest, params: { path: string[] }): Promise<Resp
     // Forward the body for non-GET/HEAD. `duplex: "half"` is required by
     // Node's fetch when streaming a request body.
     body: req.method === "GET" || req.method === "HEAD" ? undefined : req.body,
+    // Propagate a client disconnect upstream. Without this the backend never
+    // sees `http.disconnect`, so its `request.is_disconnected()` check — and
+    // the "persist the partial turn on disconnect" path behind it — never fire,
+    // and a closed tab leaves the turn running to completion against Anthropic.
+    signal: req.signal,
     // @ts-expect-error -- `duplex` is valid in Node fetch but not in the TS lib types yet.
     duplex: "half",
   };
