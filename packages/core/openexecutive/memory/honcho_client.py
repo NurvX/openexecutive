@@ -5,14 +5,16 @@ Executive can recall facts about a user across Slack, Discord, Telegram,
 email, and the web UI in one peer card. This module exposes three
 surfaces the orchestrator calls per turn:
 
-- :func:`prefetch` — asks Honcho a dialectic question about the inbound
-  user and returns a short ``<peer_memory>`` block that the Executive
-  injects into the user turn (never the system block — see
-  ``CLAUDE.md`` / prompt caching rules). Bounded by
+- :func:`prefetch` — returns a short ``<peer_memory>`` block about the
+  inbound user that the Executive injects into the user turn (never the
+  system block — see ``CLAUDE.md`` / prompt caching rules). By default
+  (``HONCHO_PREFETCH_MODE=representation``) it reads the peer's derived
+  representation and card, ranked against the inbound message: a GET with
+  no LLM behind it. ``HONCHO_PREFETCH_MODE=dialectic`` asks Honcho a
+  reasoned question instead (``peer.aio.chat``, an LLM call), where
+  ``reasoning_level`` trades latency for synthesis depth. Bounded by
   ``Settings.honcho_prefetch_timeout_s`` so a Honcho outage can't stall
-  the chat turn. Accepts ``reasoning_level`` to trade latency for
-  synthesis depth (``"low"`` for the per-turn path, bumped to
-  ``"medium"``/``"high"`` for committee-reviewed turns).
+  the chat turn.
 - :func:`sync_turn` — fire-and-forget persist of the completed exchange
   so Honcho's server-side extraction can update the peer card. Accepts
   ``co_present_person_ids`` to add all distinct humans in a thread
@@ -40,7 +42,7 @@ import logging
 import re
 import time
 import unicodedata
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from openexecutive.audit import log_event as audit_log
 from openexecutive.audit.context import get_active_ids, set_turn
@@ -52,6 +54,23 @@ logger = logging.getLogger(__name__)
 # fixed id (rather than per-deployment) keeps the assistant's representation
 # consistent if a workspace is shared across environments.
 _EXECUTIVE_PEER_ID = "executive"
+
+
+async def _executive_peer(client: Any) -> Any:
+    """Resolve the Executive's own peer with observation of it switched off.
+
+    Every sync writes the Executive's reply under this peer so the person's
+    representation sees both sides of the exchange. Left at Honcho's default
+    the deriver would also build a representation OF the Executive from those
+    replies: pure cost, nothing here ever reads it, and the place where a
+    person's words get misattributed to the Executive. ``observe_me=False``
+    stops it. The async ``peer()`` is a get-or-create POST on every call and
+    the server applies a changed configuration to an existing peer, so passing
+    it is free and self-healing for peers created before this existed.
+    """
+    from honcho.api_types import PeerConfig
+
+    return await client.aio.peer(_EXECUTIVE_PEER_ID, configuration=PeerConfig(observe_me=False))
 
 
 def _strip_scaffolding(text: str) -> str:
@@ -97,6 +116,14 @@ def _safe_honcho_id(raw: str) -> str:
 # Executive entry points can annotate the kwarg they thread through.
 ReasoningLevel = Literal["minimal", "low", "medium", "high", "max"]
 
+# How ``prefetch`` reads the person's memory; see ``Settings.honcho_prefetch_mode``.
+PrefetchMode = Literal["representation", "dialectic"]
+
+# Cap on the rendered representation block. It lands in the (uncached) user
+# turn on every ordinary turn, so it is bounded by characters and not only by
+# conclusion count: N conclusions of unknown length is not a budget.
+_REPRESENTATION_MAX_CHARS = 4000
+
 # Honcho's dialectic latency scales steeply with ``reasoning_level``. Measured
 # against hosted Honcho on a warm workspace, same query: ``low`` ~2.1s,
 # ``minimal`` ~2.8s, ``medium`` ~8.1s. A single flat budget therefore makes the
@@ -121,6 +148,9 @@ ReasoningLevel = Literal["minimal", "low", "medium", "high", "max"]
 # ``high``/``max`` are extrapolated — no OE call site requests them yet, so
 # there is nothing to measure. Revisit with real numbers before relying on
 # either.
+#
+# None of this applies in representation mode: that prefetch is a GET with no
+# LLM behind it and runs on the base budget, unscaled.
 _REASONING_TIMEOUT_MULTIPLIER: dict[str, float] = {
     "minimal": 1.0,
     "low": 1.0,
@@ -160,9 +190,16 @@ _SYNC_TOTAL_TIMEOUT_S = 60.0
 _CLIENT_TIMEOUT_HEADROOM_S = 5.0
 
 
+def base_prefetch_timeout_s(base_timeout_s: float) -> float:
+    """The unscaled per-turn budget; a non-positive setting falls back to
+    the default (``wait_for`` with a timeout <= 0 fires before the request
+    is made)."""
+    return base_timeout_s if base_timeout_s > 0 else _DEFAULT_PREFETCH_TIMEOUT_S
+
+
 def prefetch_timeout_s(reasoning_level: ReasoningLevel, base_timeout_s: float) -> float:
     """The wall-clock budget for one dialectic prefetch at ``reasoning_level``."""
-    base = base_timeout_s if base_timeout_s > 0 else _DEFAULT_PREFETCH_TIMEOUT_S
+    base = base_prefetch_timeout_s(base_timeout_s)
     scaled = base * _REASONING_TIMEOUT_MULTIPLIER.get(reasoning_level, 1.0)
     return max(base, min(scaled, _PREFETCH_CEILING_S))
 
@@ -1067,23 +1104,23 @@ async def prefetch(
 ) -> str:
     """Return a short ``<peer_memory>`` block for ``person_id``, or ``""``.
 
-    Sent through Honcho's dialectic chat endpoint with the inbound user
-    message as the query, so the synthesized answer is targeted at what
-    the Executive actually needs to know right now — not a fixed
-    most-recent slice.
+    ``Settings.honcho_prefetch_mode`` picks how the block is produced:
 
-    ``reasoning_level`` trades latency for synthesis depth. The standard
-    per-turn path uses ``"low"`` (fast, fits the 3s prefetch budget);
-    committee-reviewed turns and explicit deep-research workflows can
-    bump to ``"medium"``/``"high"`` for a richer answer at the cost of
-    a few extra seconds and a Sonnet-tier OpenRouter call.
+    - ``representation`` (default): the peer's card and the derived
+      conclusions most relevant to the inbound message, read straight from
+      Honcho (``peer.aio.context(search_query=...)``). No LLM behind it, so
+      it runs on ``Settings.honcho_prefetch_timeout_s`` unscaled and
+      ``reasoning_level`` is ignored.
+    - ``dialectic``: Honcho's chat endpoint with the inbound message as the
+      question, so the answer is synthesized prose. ``reasoning_level``
+      trades latency for synthesis depth and scales the budget
+      (``prefetch_timeout_s``) so deeper levels can actually finish.
 
-    Times out at ``prefetch_timeout_s(reasoning_level, ...)`` — the
-    configured ``Settings.honcho_prefetch_timeout_s`` scaled for the level,
-    so a deeper level gets a budget it can actually meet; on any failure
-    we return an empty string so the turn still runs with whatever the
-    builtin episodic block provides. Every outcome (ok/timeout/error/
-    disabled/no_person/empty) emits one `peer_memory` audit row.
+    On timeout or any failure we return an empty string so the turn still
+    runs with whatever the builtin episodic block provides. Every outcome
+    (ok/empty/timeout/error/disabled/no_person) emits one `peer_memory`
+    audit row; ``empty`` means no block was produced — nothing to ask
+    (``reason: no_query``) or nothing known about the person yet.
     """
     t0 = time.monotonic()
     if person_id is None:
@@ -1097,7 +1134,9 @@ async def prefetch(
     # inbound hydration may have prepended for the LLM turn.
     query = _strip_scaffolding(query)
     if not query.strip():
-        _emit_peer_memory(op="prefetch", person_id=person_id, outcome="empty")
+        _emit_peer_memory(
+            op="prefetch", person_id=person_id, outcome="empty", details={"reason": "no_query"}
+        )
         return ""
     client = await _get_client()
     if client is None:
@@ -1105,22 +1144,21 @@ async def prefetch(
         # construction-failed case (logged by `_get_client`).
         _emit_peer_memory(op="prefetch", person_id=person_id, outcome="error")
         return ""
-    budget_s = prefetch_timeout_s(reasoning_level, settings.honcho_prefetch_timeout_s)
+    plan = _plan_prefetch(settings, reasoning_level)
     try:
-        answer = await asyncio.wait_for(
-            _do_prefetch(client, query, person_id, reasoning_level),
-            timeout=budget_s,
+        answer, sizes = await asyncio.wait_for(
+            _run_prefetch(plan, client, query, person_id), timeout=plan.budget_s
         )
         _emit_peer_memory(
             op="prefetch",
             person_id=person_id,
-            outcome="ok",
+            outcome=plan.outcome_for(answer),
             duration_ms=int((time.monotonic() - t0) * 1000),
             details={
                 "query_preview": query[:160],
                 "response_chars": len(answer),
-                "reasoning_level": reasoning_level,
-                "timeout_s": budget_s,
+                **plan.details,
+                **sizes,
             },
         )
         return answer
@@ -1131,19 +1169,64 @@ async def prefetch(
             person_id=person_id,
             outcome="timeout",
             duration_ms=int((time.monotonic() - t0) * 1000),
-            details={"reasoning_level": reasoning_level, "timeout_s": budget_s},
+            details=plan.details,
         )
         return ""
-    except Exception:
+    except Exception as exc:
         logger.exception("honcho: prefetch failed for person_id=%s", person_id)
         _emit_peer_memory(
             op="prefetch",
             person_id=person_id,
             outcome="error",
             duration_ms=int((time.monotonic() - t0) * 1000),
-            details={"reasoning_level": reasoning_level, "timeout_s": budget_s},
+            # The type is what distinguishes a server without the context
+            # route (an HTTP error) from a bug; the message may echo input.
+            details={**plan.details, "error_type": type(exc).__name__},
         )
         return ""
+
+
+class _PrefetchPlan(NamedTuple):
+    """Everything about one prefetch that depends on the configured mode,
+    decided once so ``prefetch`` itself has a single code path."""
+
+    mode: PrefetchMode
+    budget_s: float
+    # Audit details every row for this prefetch carries (ok, timeout, error).
+    details: dict[str, Any]
+    reasoning_level: ReasoningLevel
+    max_conclusions: int
+
+    @staticmethod
+    def outcome_for(answer: str) -> str:
+        # No block was produced: a person Honcho has nothing on yet, or a
+        # dialectic that answered nothing. Distinct from ``ok`` so the flow
+        # chart does not show a memory step that injected nothing.
+        return "ok" if answer else "empty"
+
+
+def _plan_prefetch(settings: Any, reasoning_level: ReasoningLevel) -> _PrefetchPlan:
+    mode: PrefetchMode = settings.honcho_prefetch_mode
+    max_conclusions: int = settings.honcho_prefetch_max_conclusions
+    if mode == "representation":
+        budget_s = base_prefetch_timeout_s(settings.honcho_prefetch_timeout_s)
+        details: dict[str, Any] = {"mode": mode, "timeout_s": budget_s, "max_conclusions": max_conclusions}
+    else:
+        budget_s = prefetch_timeout_s(reasoning_level, settings.honcho_prefetch_timeout_s)
+        details = {"mode": mode, "timeout_s": budget_s, "reasoning_level": reasoning_level}
+    return _PrefetchPlan(mode, budget_s, details, reasoning_level, max_conclusions)
+
+
+async def _run_prefetch(
+    plan: _PrefetchPlan, client: Any, query: str, person_id: int
+) -> tuple[str, dict[str, Any]]:
+    """The one mode dispatch: the block text plus any mode-specific sizes for
+    the audit row."""
+    if plan.mode == "representation":
+        return await _do_prefetch_representation(
+            client, query, person_id, max_conclusions=plan.max_conclusions
+        )
+    return await _do_prefetch(client, query, person_id, plan.reasoning_level), {}
 
 
 async def _do_prefetch(
@@ -1164,6 +1247,65 @@ async def _do_prefetch(
     # `chat()` returns `str | None`; treat None / whitespace as "nothing to
     # add" so callers can do a simple truthiness check.
     return (answer or "").strip()
+
+
+async def _do_prefetch_representation(
+    client: Any,
+    query: str,
+    person_id: int,
+    *,
+    max_conclusions: int,
+) -> tuple[str, dict[str, Any]]:
+    """The representation-mode body: the peer's card plus the conclusions
+    most relevant to ``query``, rendered for the ``<peer_memory>`` block,
+    with the sizes the audit row records."""
+    peer = await client.aio.peer(str(person_id))
+    # No `target=` (the peer's own representation) and no session, for the
+    # same reason `_do_prefetch` passes none: the GLOBAL view is what makes a
+    # fact learned on Slack surface in a later email turn.
+    resp = await peer.aio.context(
+        search_query=query,
+        search_top_k=max_conclusions,
+        max_conclusions=max_conclusions,
+    )
+    card = [line.strip() for line in (getattr(resp, "peer_card", None) or []) if line and line.strip()]
+    representation = (getattr(resp, "representation", None) or "").strip()
+    rendered = _render_peer_context(card, representation, max_chars=_REPRESENTATION_MAX_CHARS)
+    return rendered, {"card_lines": len(card), "representation_chars": len(representation)}
+
+
+_PEER_MEMORY_CLOSE = "</peer_memory>"
+
+
+def _block_safe_line(line: str) -> str:
+    """One line of Honcho text as it may appear inside ``<peer_memory>``.
+
+    Conclusions are derived from what people wrote, including inbound email
+    from anyone, so a line can carry control characters or the block's own
+    closing tag. Control and format characters go (the newline is handled by
+    the caller), and a literal closing tag is defanged so the block cannot
+    be ended early."""
+    cleaned = "".join(ch for ch in line if unicodedata.category(ch) not in ("Cc", "Cf"))
+    return cleaned.replace(_PEER_MEMORY_CLOSE, "<\\/peer_memory>").strip()
+
+
+def _render_peer_context(card: list[str], representation: str, *, max_chars: int) -> str:
+    """Card first — it carries ``IDENTITY: Name: ...``, which binds the bare
+    peer id the conclusions name the person by — then the representation.
+    Empty when Honcho has nothing. Whole lines only: a line that does not fit
+    the remaining budget is dropped, never cut, so a half observation never
+    reaches the model."""
+    parts = [part for part in ("\n".join(card), representation) if part]
+    kept: list[str] = []
+    used = 0
+    for raw in "\n\n".join(parts).split("\n"):
+        line = _block_safe_line(raw)
+        cost = len(line) + (1 if kept else 0)
+        if used + cost > max_chars:
+            continue
+        kept.append(line)
+        used += cost
+    return "\n".join(kept).strip()
 
 
 async def _do_directional(
@@ -1414,7 +1556,7 @@ async def _do_sync_body(
         return
     try:
         user_peer = await client.aio.peer(str(person_id))
-        exec_peer = await client.aio.peer(_EXECUTIVE_PEER_ID)
+        exec_peer = await _executive_peer(client)
         sess = await client.aio.session(
             _safe_honcho_id(session_id or f"person-{person_id}")
         )
@@ -1777,7 +1919,7 @@ async def _do_sync_department_body(
         return
     try:
         dept_peer = await client.aio.peer(_department_peer_id(department_slug))
-        exec_peer = await client.aio.peer(_EXECUTIVE_PEER_ID)
+        exec_peer = await _executive_peer(client)
         # Dept session id keeps dept and person syncs from colliding in
         # the same Honcho session. Without the `dept-<slug>-` prefix,
         # the same session_id would host both the person and the dept as
@@ -2005,7 +2147,7 @@ async def _do_append_department_note_body(
         return
     try:
         dept_peer = await client.aio.peer(_department_peer_id(department_slug))
-        exec_peer = await client.aio.peer(_EXECUTIVE_PEER_ID)
+        exec_peer = await _executive_peer(client)
         session_id = _safe_honcho_id(f"dept-{department_slug}-notes")
         sess = await client.aio.session(session_id)
         # The dept peer must be in the notes session for Honcho to derive

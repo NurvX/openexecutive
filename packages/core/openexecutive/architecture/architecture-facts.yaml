@@ -993,17 +993,52 @@ peer_memory:
     prefetch: |
       ``prefetch(query, *, person_id, session_id=None, reasoning_level="low")``
       — once per turn at the start of ``Executive.stream_chat`` /
-      ``stream_chat_with_committee``. Calls Honcho's dialectic endpoint
-      (``peer.aio.chat(query)``) and returns a short ``<peer_memory>``
-      block injected into the USER turn (never a cached system block,
-      so it doesn't poison prompt caching). On timeout the turn
-      proceeds with an empty block. ``reasoning_level`` trades latency
-      for synthesis depth: ``"low"`` for the per-turn path,
-      ``"medium"`` for committee-reviewed turns (and inbound email,
-      which defaults ``committee_review=True``) that already pay
-      deep-review latency.
+      ``stream_chat_with_committee`` (the chat route runs it in parallel
+      with RAG and episodic retrieval and hands the result in). Returns a
+      short ``<peer_memory>`` block injected into the USER turn (never a
+      cached system block, so it doesn't poison prompt caching); on
+      timeout or error the turn proceeds with an empty block.
+      ``HONCHO_PREFETCH_MODE`` picks how the block is produced:
 
-      ``HONCHO_PREFETCH_TIMEOUT_S`` is the knob for the FAST per-turn
+      ``representation`` (default) reads the peer's card and the derived
+      conclusions most relevant to the inbound message —
+      ``peer.aio.context(search_query=message, search_top_k=K,
+      max_conclusions=K)``, ``K = HONCHO_PREFETCH_MAX_CONCLUSIONS``
+      (default 20) — a GET with no LLM behind it, ~100 ms on a
+      self-hosted instance. The block is the card lines (``IDENTITY:
+      Name: ...``, which binds the bare peer id the conclusions name the
+      person by) then Honcho's representation text, whole lines only up
+      to ``_REPRESENTATION_MAX_CHARS`` (4000): a line that does not fit is
+      dropped, never cut, control characters are stripped and a literal
+      ``</peer_memory>`` is defanged, since conclusions derive from text
+      anyone who can email the Executive wrote. A person Honcho has
+      nothing on yet yields no block and ``outcome=empty``.
+      It runs on ``HONCHO_PREFETCH_TIMEOUT_S`` unscaled and ignores
+      ``reasoning_level``. Honcho's own guidance is the same split:
+      ``context()`` for per-turn grounding, ``chat()`` when a reasoned
+      answer is worth the latency.
+
+      ``dialectic`` asks Honcho's chat endpoint (``peer.aio.chat(query)``)
+      with the inbound message as the question, so the answer is
+      synthesized prose from an LLM call (seconds). There
+      ``reasoning_level`` trades latency for synthesis depth:
+      ``"minimal"`` on ``stream_chat``, which awaits the prefetch inline
+      before the first streamed byte (``"low"`` was measured hitting the
+      ~5s tail for peers with large representations); ``"low"`` from the
+      chat route, which runs the prefetch inside the same gather as RAG
+      and episodic retrieval so the extra depth adds no dead air of its
+      own; ``"medium"`` for committee-reviewed turns that already pay
+      deep-review latency. The mode applies to every per-person
+      ``prefetch`` call, committee turns included; only
+      ``prefetch_department`` and ``directional_chat`` (the
+      ``ask_about_person`` tool) always use the chat endpoint, because
+      they are deliberate questions off the inline path. Set ``dialectic``
+      for a Honcho server without the
+      peer-context route; an error there is one audit row with
+      ``error_type`` and a memory-less turn, never a fallback that spends
+      the budget twice.
+
+      In dialectic mode, ``HONCHO_PREFETCH_TIMEOUT_S`` is the knob for the FAST per-turn
       path and is used unscaled there (``minimal``/``low`` sit at 1.0).
       Only the deliberate levels scale off it — ``medium`` 4x, ``high``
       5x, ``max`` 6x — capped at ``_PREFETCH_CEILING_S`` and never below
@@ -1043,7 +1078,17 @@ peer_memory:
       ``sync_turn(user, assistant, *, person_id, session_id, co_present_person_ids)``
       — fire-and-forget background task scheduled on the current event
       loop; never blocks the user-facing response. Persists the
-      completed exchange to a Honcho session. ``co_present_person_ids``
+      completed exchange to a Honcho session: the person's message under
+      their peer and the Executive's reply under the ``executive`` peer,
+      which is resolved through ``_executive_peer`` with
+      ``PeerConfig(observe_me=False)``. Recording the reply lets the
+      person's representation see both sides of the exchange; without
+      the flag Honcho's deriver also built a representation OF the
+      Executive from those replies — pure cost, nothing reads it, and the
+      place where a person's words were misattributed to the Executive.
+      The async ``peer()`` is a get-or-create POST that applies a changed
+      configuration to an existing peer, so the flag is re-asserted on
+      every sync for free. ``co_present_person_ids``
       enumerates other humans in the conversation context (Discord
       thread members, Slack thread participants, email To+Cc) so
       Honcho can store them as session peers — the data shape that
@@ -1205,7 +1250,12 @@ peer_memory:
     ``prefetch_department``, ``sync_department_turn``, or
     ``append_department_note``. ``outcome`` is one of
     ``ok | timeout | error | disabled | no_person | no_department |
-    no_loop | empty``. Rows carry ``person_id``, optional
+    no_loop | empty`` (``empty`` on a prefetch means no block was
+    produced: nothing to ask — ``reason: no_query`` — or nothing known
+    about the person yet). Prefetch rows carry
+    ``mode``, ``timeout_s`` and, per mode, ``reasoning_level`` or
+    ``max_conclusions`` / ``card_lines`` / ``representation_chars``;
+    error rows add ``error_type``. Rows carry ``person_id``, optional
     ``department_slug`` (the new field joins person_id at the top of
     the audit details for dept-keyed ops; person-only ops leave it
     None), ``duration_ms``, and op-specific ``details`` (query

@@ -310,6 +310,7 @@ async def _run_chat_turn(
                     message,
                     person_id=caller_person_id,
                     session_id=session.session_id,
+                    # Dialectic mode only; representation mode ignores it.
                     reasoning_level="medium" if committee_review else "low",
                 )
             except Exception:
