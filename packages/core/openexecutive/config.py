@@ -130,6 +130,17 @@ class Settings(BaseSettings):
     knowledge_distance_threshold: float = Field(
         0.55, alias="KNOWLEDGE_DISTANCE_THRESHOLD"
     )
+    # Optional tighter gate for the BUILTIN collection only. Built-in
+    # knowledge is generic MBA material and an order of magnitude larger than
+    # a typical company corpus, so the distance that admits the right company
+    # doc also admits a lot of unrelated handbook prose. Unset (None) keeps
+    # the single shared threshold, which is the historical behaviour.
+    # Cosine distance is in [0, 2]; a negative value would silently disable
+    # builtin retrieval entirely and read as "the knowledge base stopped
+    # helping" rather than as a config error.
+    knowledge_builtin_distance_threshold: float | None = Field(
+        None, ge=0.0, le=2.0, alias="KNOWLEDGE_BUILTIN_DISTANCE_THRESHOLD"
+    )
     knowledge_builtin_n_results: int = Field(5, alias="KNOWLEDGE_BUILTIN_N_RESULTS")
     knowledge_company_n_results: int = Field(3, alias="KNOWLEDGE_COMPANY_N_RESULTS")
 

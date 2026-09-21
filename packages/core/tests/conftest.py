@@ -14,6 +14,13 @@ os.environ.setdefault("EXEC_EMAIL_ADDRESS", "ceo.test@example.com")
 # full-app test errors at construction — the same trap BACKEND_SHARED_SECRET sets
 # (see CLAUDE.md → Testing). Clear it so the suite matches CI either way.
 os.environ.pop("OE_PUBLIC_DEPLOYMENT", None)
+# The RAG distance gates are read by retrieve() at call time and several
+# retrieval tests hard-code distances either side of the 0.55 default. Because
+# config.py loads a developer's .env, putting a tuning value there — the
+# documented way to use these levers — would otherwise change the gate for the
+# whole suite and fail those tests for a reason nothing in them mentions.
+os.environ.pop("KNOWLEDGE_DISTANCE_THRESHOLD", None)
+os.environ.pop("KNOWLEDGE_BUILTIN_DISTANCE_THRESHOLD", None)
 
 
 @pytest.fixture(autouse=True)
