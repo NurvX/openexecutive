@@ -42,7 +42,10 @@ import logging
 import re
 import time
 import unicodedata
+from datetime import UTC, datetime
 from typing import Any, Literal, NamedTuple
+
+from pydantic import BaseModel
 
 from openexecutive.audit import log_event as audit_log
 from openexecutive.audit.context import get_active_ids, set_turn
@@ -2196,3 +2199,222 @@ async def _do_append_department_note_body(
                 "error_msg": str(exc)[:300],
             },
         )
+
+
+# --------------------------------------------------------------------------- #
+# People overview — what peer memory knows about each rostered person, for the
+# Pulse page. Read-only, no LLM call: one peers listing plus, per person, one
+# conclusions page and one card read.
+# --------------------------------------------------------------------------- #
+
+
+# Bounds for the overview, matching the two precedents in this module: the
+# per-person reads share the per-loop client with the live chat prefetch, so
+# they are capped like the session purge (socket exhaustion), and the peers
+# listing walks every page, so it gets an outer clock like the sync bodies (a
+# blackholing endpoint must not pin the task for minutes).
+_OVERVIEW_CONCURRENCY = 8
+_OVERVIEW_LISTING_TIMEOUT_S = 15.0
+
+
+class PersonConclusion(BaseModel):
+    content: str
+    created_at: str
+
+
+class PersonMemory(BaseModel):
+    person_id: int
+    full_name: str
+    is_principal: bool
+    card: list[str]
+    """Peer card lines minus the identity lines OE writes itself."""
+    conclusion_count: int
+    """The server's total when it reports one, else the page length."""
+    last_observed_at: str | None
+    recent: list[PersonConclusion]
+    """Newest first."""
+    error: str | None = None
+    """Exception type name when this person's read failed; the rest is empty."""
+
+
+class PeopleMemory(BaseModel):
+    status: Literal["ok", "disabled", "error"]
+    people: list[PersonMemory]
+    conclusion_total: int
+
+
+def _overview_error(error_type: str, *, started: float) -> PeopleMemory:
+    _emit_peer_memory(
+        op="overview",
+        person_id=None,
+        outcome="error",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        details={"error_type": error_type},
+    )
+    return PeopleMemory(status="error", people=[], conclusion_total=0)
+
+
+def _iso(value: Any) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _as_instant(value: Any) -> datetime:
+    """A sortable UTC instant for a ``created_at`` of any shape the server
+    might send: an aware datetime, a naive one (taken as UTC), or an ISO
+    string. Byte order on the rendered string is not chronological across
+    offsets (``13:00+05:00`` sorts after ``12:00Z`` yet is five hours older),
+    so ordering never uses the string. Unparseable values sort oldest."""
+    try:
+        if not isinstance(value, datetime):
+            value = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    except (ValueError, TypeError, OverflowError, OSError):
+        # Covers the conversion too: a stamp within one offset of the
+        # datetime range parses fine and overflows on `astimezone`.
+        return datetime.min.replace(tzinfo=UTC)
+
+
+def _safe_lines(text: Any) -> list[str]:
+    """Physical lines of one Honcho text value, each scrubbed, blanks dropped.
+    Split before the scrub: the scrub deletes newlines, and a value spanning
+    two lines would otherwise be glued into one that hides what its second
+    line starts with."""
+    lines = (_block_safe_line(line) for line in str(text).splitlines())
+    return [line for line in lines if line]
+
+
+async def _person_memory(person: Any, peer: Any, *, recent: int) -> PersonMemory:
+    """One person's view: the self-conclusions (observer == observed == the
+    peer, the same scope the per-turn prefetch reads) newest first, their
+    total, and the card without the identity lines the roster already
+    supplies. Every line goes through ``_block_safe_line`` because the text
+    was derived from what people wrote, inbound email included."""
+    page = await peer.conclusions.aio.list(size=recent, reverse=True)
+    # `reverse=True` asks the server for its newest page; the order within
+    # that page is sorted here by instant so the first item is the newest
+    # whatever the server's default. When the page carries no total, the
+    # count is at best the page length.
+    items = sorted(page.items, key=lambda c: _as_instant(c.created_at), reverse=True)
+    total = getattr(page, "total", None)
+    if total is None:
+        total = len(items)
+    conclusions = [
+        PersonConclusion(
+            content=" ".join(_safe_lines(c.content)),
+            created_at=_block_safe_line(_iso(c.created_at)),
+        )
+        for c in items
+    ]
+    # Split and scrub before the identity test: a control character ahead of
+    # ``IDENTITY:``, or an identity claim on the second line of one card
+    # element, would otherwise pass the test and reach the page.
+    card = [
+        line
+        for element in (await peer.aio.get_card() or [])
+        for line in _safe_lines(element)
+        if not _is_identity_line(line)
+    ]
+    return PersonMemory(
+        person_id=person.id,
+        full_name=person.full_name,
+        is_principal=person.is_principal,
+        card=card,
+        conclusion_count=int(total),
+        last_observed_at=conclusions[0].created_at if conclusions else None,
+        recent=conclusions,
+    )
+
+
+def _person_memory_failed(person: Any, exc: BaseException) -> PersonMemory:
+    return PersonMemory(
+        person_id=person.id,
+        full_name=person.full_name,
+        is_principal=person.is_principal,
+        card=[],
+        conclusion_count=0,
+        last_observed_at=None,
+        recent=[],
+        error=type(exc).__name__,
+    )
+
+
+async def people_overview(*, recent: int) -> PeopleMemory:
+    """What peer memory knows about each rostered person.
+
+    Peers are taken from the workspace listing and matched to the roster by
+    id, never created: ``client.aio.peer(id)`` is a get-or-create POST and a
+    read-only page must not mint peers for people who have never talked.
+    Non-person peers (the Executive, departments) are skipped. The listing
+    runs under one outer clock; each person is then read under the unscaled
+    prefetch budget, at most ``_OVERVIEW_CONCURRENCY`` at a time, and one
+    person's failure or timeout yields an entry with ``error`` set and
+    leaves the others intact. Principal first, then by person id. One
+    ``peer_memory`` audit row per call, ``op=overview``.
+    """
+    from openexecutive.people import registry
+
+    settings = get_settings()
+    if not settings.honcho_enabled:
+        _emit_peer_memory(op="overview", person_id=None, outcome="disabled")
+        return PeopleMemory(status="disabled", people=[], conclusion_total=0)
+
+    started = time.monotonic()
+    client = await _get_client()
+    if client is None:
+        return _overview_error("ClientConstructionFailed", started=started)
+
+    roster = {p.id: p for p in registry.list_people() if p.id is not None}
+
+    async def _matched_peers() -> list[tuple[Any, Any]]:
+        # Keyed by person: the page walk can yield a peer twice if the
+        # listing shifts under it, and a person must appear once. Only a
+        # peer id spelled exactly as OE writes it (``str(person_id)``)
+        # matches — ``int()`` would also accept "007" or non-ASCII digits,
+        # and a stray id must skip one peer, never fail the listing.
+        found: dict[int, tuple[Any, Any]] = {}
+        async for peer in await client.aio.peers():
+            peer_id = str(getattr(peer, "id", ""))
+            if not (peer_id.isascii() and peer_id.isdigit()):
+                continue
+            person_id = int(peer_id)
+            if str(person_id) == peer_id and person_id in roster and person_id not in found:
+                found[person_id] = (roster[person_id], peer)
+        return list(found.values())
+
+    try:
+        matched = await asyncio.wait_for(_matched_peers(), timeout=_OVERVIEW_LISTING_TIMEOUT_S)
+    except Exception as exc:
+        logger.warning("Honcho peers listing failed: %s", type(exc).__name__)
+        return _overview_error(type(exc).__name__, started=started)
+
+    budget = base_prefetch_timeout_s(settings.honcho_prefetch_timeout_s)
+    gate = asyncio.Semaphore(_OVERVIEW_CONCURRENCY)
+
+    async def _read(person: Any, peer: Any) -> PersonMemory:
+        async with gate:
+            return await asyncio.wait_for(_person_memory(person, peer, recent=recent), timeout=budget)
+
+    results = await asyncio.gather(
+        *(_read(person, peer) for person, peer in matched), return_exceptions=True
+    )
+    people: list[PersonMemory] = []
+    for (person, _peer), result in zip(matched, results, strict=True):
+        if isinstance(result, PersonMemory):
+            people.append(result)
+        elif isinstance(result, Exception):
+            people.append(_person_memory_failed(person, result))
+        else:
+            raise result  # a BaseException (cancellation) is not ours to swallow
+    people.sort(key=lambda m: (not m.is_principal, m.person_id))
+    total = sum(m.conclusion_count for m in people)
+    errors = sum(1 for m in people if m.error)
+    _emit_peer_memory(
+        op="overview",
+        person_id=None,
+        outcome="ok",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        details={"people": len(people), "conclusions": total, "errors": errors},
+    )
+    return PeopleMemory(status="ok", people=people, conclusion_total=total)

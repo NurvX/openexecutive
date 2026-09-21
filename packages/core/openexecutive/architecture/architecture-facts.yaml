@@ -1325,6 +1325,41 @@ peer_memory:
       ``disabled | ok | error`` with ``latency_ms``. Intentionally does
       NOT exercise the dialectic endpoint (that would cost an LLM call
       per probe).
+    people_overview: |
+      ``GET /memories/people?recent=N`` (``honcho_client.people_overview``)
+      — what peer memory knows about each rostered person, for the Pulse
+      page's People tab. Read-only, no LLM call: one ``peers()`` listing
+      (every page, under one 15 s clock — the SDK walk is otherwise bounded
+      only per request), then per matched person (at most 8 in flight, each
+      under the unscaled prefetch budget, because the reads share the
+      per-loop client with the live chat prefetch) one self-conclusions
+      page (``peer.conclusions``,
+      newest first, ``recent`` of them, plus the page total) and one
+      ``get_card()`` with OE's own ``IDENTITY:`` lines removed. Peers are
+      matched to the roster by id and never created — ``peer(id)`` is a
+      get-or-create POST and a read must not mint peers for people who
+      have never talked; the ``executive`` and ``department_*`` peers and
+      archived people are skipped. Every line, timestamps included, passes
+      ``_block_safe_line``. The UI shares one in-flight request between the
+      header and the tab.
+      Response ``{status: ok|disabled|error, people: [{person_id,
+      full_name, is_principal, card, conclusion_count, last_observed_at,
+      recent: [{content, created_at}], error}], conclusion_total}``; one
+      person's failure or timeout sets that entry's ``error`` and leaves
+      the rest intact. One ``peer_memory`` row per call, ``op=overview``,
+      ``person_id`` null, ``details.people / conclusions / errors``. The
+      Pulse header adds ``conclusion_total`` to its Memories tile (hint
+      names the peer-note share; fetched apart from the gating batch so
+      the strip never waits on Honcho); the UI hides the tab when
+      ``status`` is ``disabled``. Peers match only an id spelled exactly
+      as OE writes it, once per person; within the newest page the
+      conclusions are ordered by instant (never by the rendered string,
+      which is not chronological across offsets); card elements and
+      conclusions are split on physical lines and scrubbed before the
+      identity-line filter, so a claim on an element's second line is
+      caught too. The UI is
+      read-only here: peer memory is Honcho's derived view, not the
+      Executive's own record the way decisions and advice are.
     audit_filter: |
       ``/audit?event_type=peer_memory`` for the flat list;
       ``/audit/session/{id}`` for per-turn context with peer_memory

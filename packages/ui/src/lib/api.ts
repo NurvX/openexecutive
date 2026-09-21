@@ -798,6 +798,31 @@ export interface Advice {
   advice_summary: string;
 }
 
+// Peer memory — what the Executive has learned about each person, derived
+// server-side and read-only here (no edit/delete: it is not the Executive's
+// own record the way decisions and advice are).
+export interface PersonConclusion {
+  content: string;
+  created_at: string;
+}
+
+export interface PersonMemory {
+  person_id: number;
+  full_name: string;
+  is_principal: boolean;
+  card: string[];
+  conclusion_count: number;
+  last_observed_at: string | null;
+  recent: PersonConclusion[];
+  error: string | null;
+}
+
+export interface PeopleMemory {
+  status: "ok" | "disabled" | "error";
+  people: PersonMemory[];
+  conclusion_total: number;
+}
+
 export async function listDecisions(): Promise<Decision[]> {
   const res = await fetch(`${API_BASE}/memories/decisions`);
   if (!res.ok) throw new Error("Failed to list decisions");
@@ -859,6 +884,47 @@ export async function updateAdvice(id: number, patch: Partial<Omit<Advice, "id" 
 export async function deleteAdvice(id: number): Promise<void> {
   const res = await fetch(`${API_BASE}/memories/advice/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error("Failed to delete advice");
+}
+
+// The Pulse header and the People tab both mount on page load and both need
+// this; behind it are one Honcho listing plus two reads per person, so the
+// two mounts share one in-flight request instead of doubling that fan-out.
+const PEOPLE_MEMORY_SHARE_MS = 5_000;
+// `settledAt` is null while the request is still running: a pending request is
+// always shared, however long it has run (the backend bounds it, not us), and a
+// resolved one for five seconds after it settled.
+let peopleMemoryShared: {
+  recent: number;
+  promise: Promise<PeopleMemory>;
+  settledAt: number | null;
+} | null = null;
+
+export function listPeopleMemory(recent = 5): Promise<PeopleMemory> {
+  const shared = peopleMemoryShared;
+  if (
+    shared &&
+    shared.recent === recent &&
+    (shared.settledAt === null || Date.now() - shared.settledAt < PEOPLE_MEMORY_SHARE_MS)
+  ) {
+    return shared.promise;
+  }
+  const promise = (async () => {
+    const res = await fetch(`${API_BASE}/memories/people?recent=${recent}`);
+    if (!res.ok) throw new Error("Failed to list people memory");
+    return (await res.json()) as PeopleMemory;
+  })();
+  const entry = { recent, promise, settledAt: null as number | null };
+  peopleMemoryShared = entry;
+  promise.then(
+    () => {
+      entry.settledAt = Date.now();
+    },
+    () => {
+      // A failure must not be served to the next caller.
+      if (peopleMemoryShared === entry) peopleMemoryShared = null;
+    },
+  );
+  return promise;
 }
 
 export interface ScheduledAction {
