@@ -6,6 +6,7 @@ import {
   listAdvice,
   listDecisions,
   listInitiatives,
+  listPeopleMemory,
   listScheduledActions,
   type DailyActivityCount,
   type ScheduledAction,
@@ -24,7 +25,10 @@ import {
 // Executive's self-initiated activity over the last 90 days. Every metric is
 // derived from data the page already needs (pending scheduled actions + the
 // three memory lists); only the per-day heatmap requires its own endpoint,
-// since /today/activity returns the last-N items, not a daily timeline.
+// since /today/activity returns the last-N items, not a daily timeline. Peer
+// memory is optional and remote, so it is fetched apart from the gating
+// batch: the strip renders from local data and the tile folds the peer notes
+// in when (and only if) they arrive.
 
 const HEATMAP_DAYS = 90;
 
@@ -37,6 +41,23 @@ interface HeaderData {
 export default function PulseHeader() {
   const [data, setData] = useState<HeaderData | null>(null);
   const [loading, setLoading] = useState(true);
+  // null until peer memory answers (or fails / is disabled): the tile then
+  // shows the local counts alone, which is not the same as "zero peer notes".
+  const [peerNotes, setPeerNotes] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    listPeopleMemory()
+      .then((people) => {
+        if (!cancelled && people.status === "ok") setPeerNotes(people.conclusion_total);
+      })
+      .catch(() => {
+        /* the tile simply shows the local counts */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -71,7 +92,7 @@ export default function PulseHeader() {
     };
   }, []);
 
-  const stats = useMemo(() => (data ? deriveStats(data) : null), [data]);
+  const stats = useMemo(() => (data ? deriveStats(data, peerNotes) : null), [data, peerNotes]);
 
   return (
     <header className="space-y-6">
@@ -133,7 +154,10 @@ interface Stat {
   tone?: "default" | "accent" | "emerald" | "amber";
 }
 
-function deriveStats({ pending, memoriesTotal, heatmap }: HeaderData): Stat[] {
+function deriveStats(
+  { pending, memoriesTotal, heatmap }: HeaderData,
+  peerNotes: number | null,
+): Stat[] {
   const groups = groupByRhythm(pending);
   const followups = pending.filter((a) => a.kind === "ad_hoc").length;
 
@@ -155,7 +179,19 @@ function deriveStats({ pending, memoriesTotal, heatmap }: HeaderData): Stat[] {
     { label: "Daily rhythms", value: groups.daily.length },
     { label: "Dept check-ins", value: groups.departments.length },
     { label: "Follow-ups", value: followups },
-    { label: "Memories", value: memoriesTotal },
+    // Three episodic lists plus what peer memory has learned about people;
+    // the hint says how much of the number is peer notes so it reconciles
+    // with the tabs (the People tab badge counts people, not notes).
+    {
+      label: "Memories",
+      value: memoriesTotal + (peerNotes ?? 0),
+      hint:
+        peerNotes === null
+          ? undefined
+          : peerNotes > 0
+            ? `incl. ${peerNotes} peer notes`
+            : "no peer notes yet",
+    },
   ];
 }
 

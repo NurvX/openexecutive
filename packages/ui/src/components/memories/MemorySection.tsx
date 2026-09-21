@@ -8,18 +8,24 @@ import {
   listAdvice,
   listDecisions,
   listInitiatives,
+  listPeopleMemory,
   updateAdvice,
   updateDecision,
   updateInitiative,
   type Advice,
   type Decision,
   type Initiative,
+  type PeopleMemory,
+  type PersonMemory,
 } from "@/lib/api";
 import { DOMAINS, STATUSES, EmptyState, formatDate } from "./shared";
 
-type MemoryTab = "decisions" | "initiatives" | "advice";
+type MemoryTab = "decisions" | "initiatives" | "advice" | "people";
 
 const MEMORY_EMPTY = "No memories yet — they're extracted automatically after chats.";
+const PEOPLE_EMPTY =
+  "Nothing learned about anyone yet — peer memory fills in as people talk with the Executive.";
+const PEOPLE_UNAVAILABLE = "Peer memory is unavailable right now.";
 
 // ---------------------------------------------------------------------------
 // Section shell — the "what it knows" half of the Pulse page.
@@ -35,7 +41,12 @@ export default function MemorySection() {
     decisions: null,
     initiatives: null,
     advice: null,
+    people: null,
   });
+  // Peer memory is optional: until its status is known the People tab shows
+  // (so the bar does not jump on installs that have it); once the backend says
+  // "disabled" the tab goes away for good.
+  const [peopleEnabled, setPeopleEnabled] = useState<boolean | null>(null);
   // Stable per-tab callbacks — these are passed to the (always-mounted) tabs as
   // `onCount`, which lives in each tab's `refresh` useCallback deps. They MUST
   // keep a constant identity across renders, or the tab's refresh→useEffect
@@ -44,12 +55,29 @@ export default function MemorySection() {
   const onCountDecisions = useCallback((n: number) => setCounts((c) => ({ ...c, decisions: n })), []);
   const onCountInitiatives = useCallback((n: number) => setCounts((c) => ({ ...c, initiatives: n })), []);
   const onCountAdvice = useCallback((n: number) => setCounts((c) => ({ ...c, advice: n })), []);
+  const onCountPeople = useCallback(
+    (n: number | null) => setCounts((c) => ({ ...c, people: n })),
+    [],
+  );
+  const onPeopleStatus = useCallback(
+    (s: PeopleMemory["status"]) => setPeopleEnabled(s !== "disabled"),
+    [],
+  );
+
+  useEffect(() => {
+    if (peopleEnabled === false && tab === "people") setTab("decisions");
+  }, [peopleEnabled, tab]);
+
+  const tabs: MemoryTab[] =
+    peopleEnabled === false
+      ? ["decisions", "initiatives", "advice"]
+      : ["decisions", "initiatives", "advice", "people"];
 
   return (
     <div className="rounded-xl border border-line bg-surface-elevated p-4">
       <div className="mb-3">
         <div className="flex gap-1 p-1 bg-surface-overlay/60 rounded-xl w-fit border border-line-strong/50">
-          {(["decisions", "initiatives", "advice"] as MemoryTab[]).map((t) => (
+          {tabs.map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -70,7 +98,7 @@ export default function MemorySection() {
         </div>
       </div>
 
-      {/* One scroll region shared by all three (always-mounted) tabs, mirroring
+      {/* One scroll region shared by all (always-mounted) tabs, mirroring
           the Recent activity card — the list scrolls instead of growing. */}
       <div className="max-h-[32rem] overflow-y-auto pr-1">
         <div className={tab === "decisions" ? "" : "hidden"}>
@@ -81,6 +109,9 @@ export default function MemorySection() {
         </div>
         <div className={tab === "advice" ? "" : "hidden"}>
           <AdviceTab onCount={onCountAdvice} />
+        </div>
+        <div className={tab === "people" ? "" : "hidden"}>
+          <PeopleTab onCount={onCountPeople} onStatus={onPeopleStatus} />
         </div>
       </div>
     </div>
@@ -547,6 +578,105 @@ function AdviceRow({
           <div className="text-sm text-fg line-clamp-2" title={advice.advice_summary}>{advice.advice_summary}</div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// People — peer memory. What the Executive has learned about each person,
+// derived server-side from their conversations. Read-only: unlike the three
+// lists above this is not the Executive's own record to edit, and the header
+// counts its notes alongside them.
+// ---------------------------------------------------------------------------
+
+function PeopleTab({
+  onCount,
+  onStatus,
+}: {
+  onCount: (n: number | null) => void;
+  onStatus: (s: PeopleMemory["status"]) => void;
+}) {
+  const [data, setData] = useState<PeopleMemory | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setFailed(false);
+    try {
+      const res = await listPeopleMemory();
+      setData(res);
+      onStatus(res.status);
+      // The badge counts people, not notes (the header carries the notes).
+      // Unavailable is not zero: leave the badge blank rather than claim 0.
+      onCount(res.status === "ok" ? res.people.length : null);
+    } catch {
+      // Unlike the other tabs, an error here must not masquerade as "nothing
+      // known": the read crosses to another service.
+      setFailed(true);
+      onCount(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [onCount, onStatus]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  if (loading) return <div className="text-fg-muted text-sm">Loading…</div>;
+  if (failed || !data || data.status === "error") {
+    return <div className="text-fg-muted text-sm">{PEOPLE_UNAVAILABLE}</div>;
+  }
+  if (data.status === "disabled") return null;
+  if (data.people.length === 0) return <EmptyState message={PEOPLE_EMPTY} />;
+
+  return (
+    <div className="divide-y divide-line">
+      {data.people.map((p) => (
+        <PersonMemoryRow key={p.person_id} item={p} />
+      ))}
+    </div>
+  );
+}
+
+function PersonMemoryRow({ item }: { item: PersonMemory }) {
+  const notes = `${item.conclusion_count} ${item.conclusion_count === 1 ? "note" : "notes"}`;
+  const learned = item.last_observed_at ? ` · learned ${formatDate(item.last_observed_at)}` : "";
+  const nothingYet = !item.error && item.conclusion_count === 0 && item.card.length === 0;
+  return (
+    <div className="py-3">
+      <div className="flex items-start justify-between gap-2">
+        <div className="text-sm font-semibold text-fg flex items-center gap-2">
+          {item.full_name}
+          {item.is_principal && (
+            <span className="inline-block px-1.5 py-0.5 rounded border text-[10px] font-medium bg-violet-500/20 text-violet-300 border-violet-500/30">
+              Principal
+            </span>
+          )}
+          {/* The notes below name people by their bare peer id; this is the key. */}
+          <span className="text-[10px] font-normal text-fg-subtle">peer {item.person_id}</span>
+        </div>
+        <div className="text-xs text-fg-muted tabular-nums shrink-0">
+          {item.error ? "couldn't read" : `${notes}${learned}`}
+        </div>
+      </div>
+      {item.card.length > 0 && (
+        <div className="mt-1 text-xs text-fg-muted">{item.card.join(" · ")}</div>
+      )}
+      {item.recent.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {item.recent.map((c, i) => (
+            <li key={`${c.created_at}-${i}`} className="text-sm text-fg-muted flex gap-2">
+              <span className="text-[10px] text-fg-subtle tabular-nums shrink-0 pt-0.5">
+                {formatDate(c.created_at)}
+              </span>
+              <span>{c.content}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {nothingYet && <div className="mt-1 text-xs text-fg-subtle">Nothing learned yet.</div>}
     </div>
   );
 }

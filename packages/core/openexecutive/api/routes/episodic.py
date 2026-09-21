@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel
 
 from openexecutive.memory.episodic import (
@@ -20,6 +20,7 @@ from openexecutive.memory.episodic import (
     update_decision,
     update_initiative,
 )
+from openexecutive.memory.honcho_client import PeopleMemory, people_overview
 
 router = APIRouter()
 
@@ -117,3 +118,14 @@ def remove_advice(advice_id: int) -> Response:
     if not delete_advice(advice_id):
         raise HTTPException(status_code=404, detail="Advice not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- People (peer memory) ---
+
+
+@router.get("/memories/people", response_model=PeopleMemory)
+async def list_people_memory(recent: int = Query(5, ge=1, le=50)) -> PeopleMemory:
+    """What peer memory knows about each rostered person: card, conclusion
+    count, last-learned time and the ``recent`` newest conclusions. Read-only
+    and LLM-free; ``status`` is ``disabled`` when peer memory is off."""
+    return await people_overview(recent=recent)
