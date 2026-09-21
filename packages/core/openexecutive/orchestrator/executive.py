@@ -22,6 +22,10 @@ from openexecutive.audit.usage import log_model_usage
 from openexecutive.config import get_settings
 from openexecutive.memory.honcho_client import ReasoningLevel as HonchoReasoningLevel
 from openexecutive.orchestrator.action_chips import summarize_action
+from openexecutive.orchestrator.activity_labels import (
+    fallback_activity,
+    summarize_activity,
+)
 from openexecutive.orchestrator.alert_tools import (
     CREATE_ALERT_TOOL,
     handle_create_alert,
@@ -1471,6 +1475,23 @@ class Executive:
                     ],
                 })
                 yield debug_collector.to_sse_dict(evt)
+
+            # Name the round before the sentinel, so an ordered consumer has
+            # the label in hand by the time it switches its in-flight
+            # indicator on. Never fatal: a labelling bug must not take the
+            # turn down with it.
+            try:
+                activity = summarize_activity(tool_uses, iteration=iteration)
+            except Exception:
+                logger.warning(
+                    "activity_label_failed iteration=%d", iteration, exc_info=True
+                )
+                activity = None
+            # Exactly one activity per sentinel, unconditionally. Skipping it
+            # on the None/raise paths would leave a client that keeps the last
+            # label it saw captioning this round with the previous round's
+            # work; an honest "Working…" beats a stale name.
+            yield activity or fallback_activity(iteration=iteration)
 
             # Signal that tool calls are in flight so the client can show progress.
             yield self._THINKING

@@ -1677,7 +1677,8 @@ chat:
   endpoint: POST /chat — server-sent events stream of the live turn.
   sse_event_types:
     - "chunk — one text delta from the assistant response stream. Fields: type, content, session_id."
-    - "thinking — keepalive emitted between specialist rounds so the UI can show a Consulting specialists indicator. Fields: type, session_id."
+    - "thinking — keepalive emitted at the start of EVERY tool-use round, not just specialist ones. Fields: type, session_id. It carries no tool information, so the UI uses it purely as an in-flight boolean and takes the wording from the `activity` event that immediately precedes it. It used to be the sole driver of a hardcoded 'Consulting specialists…' string, which is why an MCP or calendar round looked like a specialist fan-out."
+    - "activity — names the tool round that is in flight. Fields: type, label, tool, iteration. Emitted once per tool-use iteration, always immediately before `thinking`, so an ordered consumer has the label before it turns its indicator on. `label` is present-progressive, already ends in an ellipsis, and is capped at 60 chars for the one-line indicator — render it verbatim. `tool` is the canonical tool behind the label; for MCP `call_tool` it is the UNDERLYING tool name (matching the `action_taken` convention), sanitized and truncated to 48 chars because it is model-authored text bound for the DOM. Labels come from `openexecutive.orchestrator.activity_labels._LABELS`; an unmapped tool falls back to 'Working…' rather than going silent. A mixed round collapses to ONE label by priority rank (`_PRIORITY`), never by joining clauses — the indicator is a single muted line. Rank 0 is `consult_specialist`, so a round containing a real fan-out always renders the generic 'Consulting specialists…' and NEVER names an individual specialist (the one-voice invariant). Ephemeral: unlike `action_taken` it is progress only and is never persisted with the assistant message."
     - "phase — committee phase transition (drafting | reviewing | finalizing) when committee_review=true. Fields: type, phase, session_id."
     - "committee_critique — severity preview from a committee reviewer. Fields: type, reviewer, severity."
     - "action_taken — emitted whenever the Executive's tool-use loop completes a side-effecting tool call. Fields: type, tool, summary (≤80 chars, human-readable), target (person / channel ref / resource), link (optional in-app path the UI drills into), iteration. See `openexecutive.orchestrator.action_chips.SIDE_EFFECTING_TOOLS` for the canonical instrumented set; read-only tools (consult_specialist, lookup_person, list_people, search_skills, load_skill, search_tools, web_search, ask_about_person, list_workflows) never emit this event. The chip is suppressed when the handler returned an error payload — no green ✓ over a red outcome."
@@ -1700,6 +1701,32 @@ chat:
     prefix, so conditional inclusion would invalidate the cache whenever
     panel and non-panel turns alternate. Guarded by
     tests/unit/test_executive_form_patch.py::test_tool_list_is_cache_stable_and_includes_form_tool.
+  activity_labels: |
+    The in-flight progress line. `orchestrator/activity_labels.py` is the
+    sibling of `action_chips.py`: same tool -> phrase mapping, but
+    present-progressive, covering every tool including read-only ones,
+    because it describes work that has not finished yet.
+
+    Emission is one place — the agent loop, immediately before it yields the
+    `_THINKING` sentinel. The call is wrapped in try/except: a labelling bug
+    costs the label, never the turn (the UI then falls back to "Working…").
+    The sentinel itself is deliberately unchanged; it is also the
+    "don't accumulate this into full_response" marker read by
+    `stream_chat`, the committee draft pass, and the non-streaming `.chat()`
+    wrapper that every channel adapter uses.
+
+    Rendered in `packages/ui/src/components/Chat.tsx` with precedence
+    committeePhase > activity label > nothing, and in
+    `components/askoe/AskOEPanel.tsx`, where it fills the streaming
+    placeholder that used to be a bare ellipsis. The label clears on the
+    first text chunk, on a committee phase change, at turn start, and in the
+    turn's finally — but deliberately NOT on `action_taken`, since a chip can
+    land while the same round is still running.
+
+    Known limitation: `Chat.tsx` gates the whole indicator row on
+    `!streamingContent`, so a tool round that happens AFTER prose has started
+    streaming shows nothing. Pre-existing, and unchanged by the label work.
+
   action_taken_chips: |
     Rendered as inline pills under each assistant message in
     `packages/ui/src/components/Message.tsx`. Each chip shows a ✓
