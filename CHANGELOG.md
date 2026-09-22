@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The API image installs the CPU-only build of torch.** torch is only
+  present because `sentence-transformers` needs it, and the container runs on
+  CPU hosts, but the default Linux wheel is the CUDA build and pulled in
+  fifteen NVIDIA packages plus triton — about 2.6 GB of compressed wheels the
+  image never used. torch now resolves from PyTorch's CPU index (2.13.0 →
+  2.14.0+cpu in the lock) and the Dockerfile passes that index to the install.
+  Expect the API image to shrink by several GB and cold builds and pulls to
+  get much faster. Local `uv sync` gets the same CPU wheel; a GPU deployment
+  would need to override the index, which nothing in the repo does today.
+
 ## [0.2.0] - 2026-09-22
 
 ### Security

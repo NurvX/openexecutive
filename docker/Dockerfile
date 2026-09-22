@@ -37,8 +37,19 @@ COPY packages/core/pyproject.toml packages/core/uv.lock ./
 # masked failures while also needing README.md copied here — which busts the
 # cache (full dep install + baked embedding models below) on every README
 # edit (#81). Let a real break fail loudly.
+# torch is pinned to the CPU-only build (`+cpu`, see [tool.uv.sources] in
+# pyproject.toml), which lives on PyTorch's own index, not PyPI. `uv export`
+# does not write index URLs into requirements.txt, so the install has to be
+# told where to look. `unsafe-best-match` is required alongside the extra
+# index: uv's default first-index strategy stops at PyPI as soon as it sees
+# any torch release there and never reaches the `+cpu` wheel. The exported
+# `--hash` lines still verify every download, so the strategy name is scarier
+# than the effect.
 RUN uv export --locked --no-dev --no-emit-project -q -o requirements.txt \
-    && uv pip install --system -r requirements.txt
+    && uv pip install --system \
+        --index-strategy unsafe-best-match \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r requirements.txt
 
 # Bake the embedding model the MCP gateway loads at startup
 # (sentence-transformers/all-MiniLM-L6-v2). Without this the ~90 MB model is

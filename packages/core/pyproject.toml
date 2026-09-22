@@ -22,6 +22,9 @@ dependencies = [
     "slack-bolt>=1.18.0",
     "discord.py>=2.4.0",
     "sentence-transformers>=3.0.0",
+    # Declared directly only so the [tool.uv.sources] entry below applies;
+    # uv honours sources for direct dependencies, not transitive ones.
+    "torch>=2.0",
     "httpx>=0.27.0",
     "aiofiles>=23.2.0",
     "python-multipart>=0.0.9",
@@ -73,6 +76,19 @@ python_version = "3.11"
 strict = false
 ignore_missing_imports = true
 exclude = ["tests/"]
+
+# torch is only here because sentence-transformers needs it, and the API runs
+# on CPU hosts. The default PyPI wheel on Linux is the CUDA build, which drags
+# in ~2.6 GB of NVIDIA libraries the container never uses and roughly triples
+# the image. Resolve torch alone from PyTorch's CPU-only index instead.
+# `explicit = true` keeps every other package on PyPI.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
