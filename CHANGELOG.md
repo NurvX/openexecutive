@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `curl -f http://localhost:8000/health` inside the API container, but the
   image never installed `curl`, so the check failed on every run and compose
   reported a working API as unhealthy. The API image now includes `curl`.
+- **The People tab shows the newest notes about a person** (#174). Its
+  "recent" list and "learned" date asked Honcho for conclusions with
+  `reverse=True`, which returns the oldest page, so a person's correction
+  made in chat never appeared there. It now reads the newest page.
 
 ## [0.2.1] - 2026-09-22
 
