@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-22
+
 ### Changed
 - **The MCP gateway runs a pinned extensible-mcp commit.** It was launched from
   the repo's default branch, so every container start ran whatever that
@@ -25,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `curl -f http://localhost:8000/health` inside the API container, but the
   image never installed `curl`, so the check failed on every run and compose
   reported a working API as unhealthy. The API image now includes `curl`.
+- **The People tab shows the newest notes about a person** (#174). Its
+  "recent" list and "learned" date asked Honcho for conclusions with
+  `reverse=True`, which returns the oldest page, so a person's correction
+  made in chat never appeared there. It now reads the newest page.
 
 ## [0.2.1] - 2026-09-22
 
@@ -403,7 +409,8 @@ Initial public release.
 - Open-source project setup: Apache-2.0 license, contribution guide, code of
   conduct, security policy, issue/PR templates, and CI.
 
-[Unreleased]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/SenteLabsAI/OpenExecutive/releases/tag/v0.1.0
