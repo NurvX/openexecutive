@@ -110,7 +110,16 @@ class _ConclusionsAio:
 
     async def list(self, page: int = 1, size: int = 50, session: Any = None, *, reverse: bool = False) -> _Page:
         self._calls.append({"size": size, "reverse": reverse})
-        return _Page(self._conclusions[:size], self._total, no_total=self._no_total)
+        # Mirrors the real server: the default (reverse=False) is newest-first
+        # ("ordered by recency unless reverse is true"), so the list passed to
+        # `_Peer(conclusions=...)` IS taken as that default order, whatever
+        # order a given test happens to author it in — several tests
+        # deliberately author it non-chronologically to exercise the client-
+        # side re-sort. `reverse=True` inverts whatever was supplied. This is
+        # what would have caught the production bug where the code asked for
+        # `reverse=True` and silently got the oldest page every time.
+        ordered = list(reversed(self._conclusions)) if reverse else self._conclusions
+        return _Page(ordered[:size], self._total, no_total=self._no_total)
 
 
 class _Conclusions:
@@ -246,7 +255,7 @@ def test_ok_maps_rostered_peers_principal_first(
     assert [c["content"] for c in top["recent"]] == ["3 prefers a short table", "3 runs 48 units"]
     assert top["error"] is None
     assert body["conclusion_total"] == 14
-    assert principal.calls == [{"size": 2, "reverse": True}], "newest first, capped by ?recent="
+    assert principal.calls == [{"size": 2, "reverse": False}], "newest first, capped by ?recent="
     assert client.aio.peer_calls == [], "a read-only page must never get-or-create a peer"
 
     audit = [r for r in audit_rows if r["event_type"] == "peer_memory"]
@@ -417,6 +426,34 @@ def test_conclusions_are_newest_first_whatever_the_server_order(roster: dict[str
     person = body["people"][0]
     assert [c["content"] for c in person["recent"]] == ["newer", "older"]
     assert person["last_observed_at"] == _T2.isoformat()
+
+
+def test_the_newest_page_is_requested_not_the_oldest(roster: dict[str, int]) -> None:
+    """Regression for a bug where the code called `reverse=True`, which
+    Honcho's conclusions/list treats as the OPPOSITE of its documented default
+    ("ordered by recency unless reverse is true") — silently fetching the
+    OLDEST page instead of the newest. With more conclusions than fit on one
+    page, client-side re-sorting cannot recover from that: it only reorders
+    whichever items the wrong page happened to contain, so the newest item
+    (the one never fetched at all) is the one that stays missing, not merely
+    misplaced. Only a case where the total exceeds `recent` exercises this —
+    every earlier test's conclusions all fit on one page, which is why the
+    bug shipped without a test catching it."""
+    conclusions = [
+        _Conclusion("newest", _T2),
+        _Conclusion("middle", datetime(2026, 9, 20, 15, 0, tzinfo=UTC)),
+        _Conclusion("oldest", _T1),
+    ]
+    client = _Client([_Peer(str(roster["member"]), conclusions=conclusions, total=3)])
+    with _with_client(client):
+        body = _client().get("/memories/people?recent=2").json()
+    person = body["people"][0]
+    assert [c["content"] for c in person["recent"]] == ["newest", "middle"], (
+        "reverse=True would silently fetch the oldest page ('oldest','middle') and, "
+        "after the client-side re-sort, return them as ['middle','oldest']"
+    )
+    assert person["last_observed_at"] == _T2.isoformat()
+
 
 
 def test_ordering_is_by_instant_not_by_string(roster: dict[str, int]) -> None:
