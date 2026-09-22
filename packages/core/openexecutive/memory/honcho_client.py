@@ -2291,11 +2291,20 @@ async def _person_memory(person: Any, peer: Any, *, recent: int) -> PersonMemory
     total, and the card without the identity lines the roster already
     supplies. Every line goes through ``_block_safe_line`` because the text
     was derived from what people wrote, inbound email included."""
-    page = await peer.conclusions.aio.list(size=recent, reverse=True)
-    # `reverse=True` asks the server for its newest page; the order within
-    # that page is sorted here by instant so the first item is the newest
-    # whatever the server's default. When the page carries no total, the
-    # count is at best the page length.
+    page = await peer.conclusions.aio.list(size=recent, reverse=False)
+    # The server's own default is newest-first ("ordered by recency unless
+    # reverse is true" — Honcho's server-side conclusions/list route
+    # docstring); `reverse=True` would flip that to oldest-first, which is
+    # not what this function wants. The symptom, if this regresses: a
+    # person's newest notes never surface past the `size`-bounded page
+    # boundary, however recently they were added — the re-sort below only
+    # reorders whatever the wrong page happened to contain, it cannot
+    # recover items the page never fetched. The order within the returned
+    # page is
+    # still re-sorted here by instant, since ties and near-boundary
+    # timestamps are not guaranteed to already match this function's
+    # definition of "newest". When the page carries no total, the count is
+    # at best the page length.
     items = sorted(page.items, key=lambda c: _as_instant(c.created_at), reverse=True)
     total = getattr(page, "total", None)
     if total is None:
