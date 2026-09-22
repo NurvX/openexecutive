@@ -85,6 +85,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and no persistence.
 
 ### Added
+- **Versioned container images on GitHub Container Registry** (#142). Every
+  push to `main` publishes `ghcr.io/sentelabsai/openexecutive-api:main` and
+  `…/openexecutive-ui:main`; pushing a `vX.Y.Z` git tag publishes `X.Y.Z`,
+  `X.Y` and `latest`. Deployments can pull a pinned version instead of
+  building from source. See `docs/deployment.md` → Images.
 - **Stop button in chat.** A reply can now be halted mid-stream, from the main
   chat composer and the Ask OE side panel (Escape works too). Whatever the
   Executive had written is kept, persisted and marked *Stopped by you*, so a

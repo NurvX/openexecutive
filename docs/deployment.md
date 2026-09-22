@@ -26,10 +26,10 @@ containers. The UI is stateless and scales freely.
 
 ## Topology
 
-| Component | Image | State |
-|---|---|---|
-| API | [docker/Dockerfile](../docker/Dockerfile) | One persistent volume at `/data` |
-| UI | [docker/Dockerfile.ui](../docker/Dockerfile.ui) | Stateless |
+| Component | Dockerfile | Published image | State |
+|---|---|---|---|
+| API | [docker/Dockerfile](../docker/Dockerfile) | `ghcr.io/sentelabsai/openexecutive-api` | One persistent volume at `/data` |
+| UI | [docker/Dockerfile.ui](../docker/Dockerfile.ui) | `ghcr.io/sentelabsai/openexecutive-ui` | Stateless |
 
 The UI never talks to the API directly from the browser. It proxies through its
 own server (`/api/backend/*`), stamping the shared secret on each upstream call,
@@ -41,6 +41,39 @@ so the UI origin is the only one that *needs* to be public. See [auth.md](auth.m
 > internet-reachable — set `BACKEND_SHARED_SECRET` **and** `OE_PUBLIC_DEPLOYMENT=1`
 > before you do. Neither is set by default, and without them the API serves every
 > route unauthenticated with only a log line to say so.
+
+## Images
+
+[.github/workflows/release-images.yml](../.github/workflows/release-images.yml)
+builds both images from the Dockerfiles above and pushes them to GitHub
+Container Registry. The published image is the same artifact `make docker`
+builds at that commit — nothing is added or configured in CI.
+
+| Tag | Set by | Meaning |
+|---|---|---|
+| `X.Y.Z`, `X.Y` | pushing git tag `vX.Y.Z` | A release. Pin deployments to one of these. |
+| `latest` | pushing git tag `vX.Y.Z` | The newest release. |
+| `main` | every push to `main` | Current head of `main`; not a release. |
+| `sha-<short>` | every push | The exact commit, for tracing an image back to source. |
+
+**Cutting a release** is pushing a tag from a commit on `main` that CI has
+already passed:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The workflow runs on the tag push and publishes the versioned tags. Nothing
+bumps the version strings in `packages/core/pyproject.toml` or
+`packages/ui/package.json` for you; update them in the release commit.
+
+The images are `linux/amd64` only. The API image bakes the embedding models at
+build time (see the Dockerfile), which makes an emulated arm64 build
+impractically slow.
+
+> **First publish:** GitHub creates each package as private. An org admin makes
+> `openexecutive-api` and `openexecutive-ui` public once under the org's
+> Packages settings; until then `docker pull` needs a token with `read:packages`.
 
 ---
 
@@ -185,7 +218,8 @@ docker compose exec api sqlite3 /data/episodic_memory.db \
   "SELECT id, kind, status, run_at FROM scheduled_actions WHERE status='pending' LIMIT 10;"
 ```
 
-**Rollback** is an image-tag rollback: redeploy the previous tag. The volume is
+**Rollback** is an image-tag rollback: redeploy the previous release tag
+(see [Images](#images)). The volume is
 not versioned with the image, so a release that migrates schema forward is not
 undone by rolling the image back — check what changed under `*/store.py` before
 relying on it. Additive column migrations (the common case — every column has a

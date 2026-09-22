@@ -293,6 +293,18 @@ volume at `/data`. [docker/docker-compose.yml](docker/docker-compose.yml) is the
 reference topology and also what `make docker` runs locally, so the local and
 deployed shapes match.
 
+Versioned images are published to GitHub Container Registry on every release,
+so a deployment can pull instead of building:
+
+```bash
+docker pull ghcr.io/sentelabsai/openexecutive-api:0.1.0
+docker pull ghcr.io/sentelabsai/openexecutive-ui:0.1.0
+```
+
+Tags: `X.Y.Z` and `X.Y` for a release, `latest` for the newest release, and
+`main` for the current head of `main`. See
+[docs/deployment.md](docs/deployment.md#images) for how releases are cut.
+
 > **⚠️ Single-instance only**: the scheduler claims rows via `UPDATE … RETURNING`,
 > which is not safe across processes. A second API replica double-fires every
 > scheduled action. Pin the API to one instance. The UI is stateless.
