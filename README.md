@@ -297,12 +297,13 @@ Versioned images are published to GitHub Container Registry on every release,
 so a deployment can pull instead of building:
 
 ```bash
-docker pull ghcr.io/sentelabsai/openexecutive-api:0.1.0
-docker pull ghcr.io/sentelabsai/openexecutive-ui:0.1.0
+docker pull ghcr.io/sentelabsai/openexecutive-api:<version>
+docker pull ghcr.io/sentelabsai/openexecutive-ui:<version>
 ```
 
 Tags: `X.Y.Z` and `X.Y` for a release, `latest` for the newest release, and
-`main` for the current head of `main`. See
+`main` for the current head of `main`. The available versions are listed on
+each package's page under the repository's Packages. See
 [docs/deployment.md](docs/deployment.md#images) for how releases are cut.
 
 > **⚠️ Single-instance only**: the scheduler claims rows via `UPDATE … RETURNING`,

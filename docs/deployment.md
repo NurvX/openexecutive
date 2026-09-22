@@ -45,27 +45,34 @@ so the UI origin is the only one that *needs* to be public. See [auth.md](auth.m
 ## Images
 
 [.github/workflows/release-images.yml](../.github/workflows/release-images.yml)
-builds both images from the Dockerfiles above and pushes them to GitHub
-Container Registry. The published image is the same artifact `make docker`
-builds at that commit — nothing is added or configured in CI.
+builds both images from the Dockerfiles above, with the repo root as build
+context, and pushes them to GitHub Container Registry. Nothing is added or
+configured in CI. Note that `make docker` builds only the API image — the
+compose file runs the UI as a `next dev` server — so this workflow is the only
+thing that builds `Dockerfile.ui`.
 
 | Tag | Set by | Meaning |
 |---|---|---|
 | `X.Y.Z`, `X.Y` | pushing git tag `vX.Y.Z` | A release. Pin deployments to one of these. |
 | `latest` | pushing git tag `vX.Y.Z` | The newest release. |
 | `main` | every push to `main` | Current head of `main`; not a release. |
-| `sha-<short>` | every push | The exact commit, for tracing an image back to source. |
+| `sha-<short>` | every push | The commit the image was built from. |
+| `buildcache` | every push | BuildKit layer cache. Not an image; ignore it. |
 
-**Cutting a release** is pushing a tag from a commit on `main` that CI has
-already passed:
+**Cutting a release** is pushing a `vX.Y.Z` tag:
 
 ```bash
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-The workflow runs on the tag push and publishes the versioned tags. Nothing
-bumps the version strings in `packages/core/pyproject.toml` or
-`packages/ui/package.json` for you; update them in the release commit.
+The workflow runs on the tag push and publishes the versioned tags. It does
+not check CI: it publishes whatever commit the tag points at, and the `main`
+tag is published in parallel with CI on every push, so tag only a commit on
+`main` that CI has passed. The two images are separate jobs, so a release is
+not atomic — if one fails, check the package pages and re-run the failed job
+from the Actions UI. Nothing bumps the version strings in
+`packages/core/pyproject.toml` or `packages/ui/package.json` for you; update
+them in the release commit.
 
 The images are `linux/amd64` only. The API image bakes the embedding models at
 build time (see the Dockerfile), which makes an emulated arm64 build

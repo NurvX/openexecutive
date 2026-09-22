@@ -1,34 +1,49 @@
 # Publish the API and UI container images to GitHub Container Registry.
 #
-# Every push to main refreshes the rolling `main` tag; pushing a `v*` git tag
-# (e.g. `git tag v0.2.0 && git push origin v0.2.0`) publishes the versioned
-# `X.Y.Z`, `X.Y` and `latest` tags. Both images are built from the same
-# Dockerfiles `make docker` and a platform deploy use, so the published image is
-# the same artifact a local build produces at that commit.
+# Every push to main refreshes the rolling `main` tag; pushing a `vX.Y.Z` git
+# tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`) publishes the versioned
+# `X.Y.Z`, `X.Y` and `latest` tags. Both images are built from the Dockerfiles
+# under docker/ with the repo root as context. Note that `make docker` builds
+# only the API image (compose runs the UI as a dev server), so this workflow
+# is the only thing that builds docker/Dockerfile.ui.
+#
+# Publishing is not gated on ci.yml: the `main` tag is published in parallel
+# with CI, and a tag publishes whatever commit it points at. Tag only commits
+# on main that CI has passed. The two images are separate matrix jobs, so a
+# release is not atomic — if one job fails, the other's tags still exist.
 #
 # The job is guarded to this repository: the saas fork syncs with
 # `git merge upstream/main` and would otherwise run this on every push to its
-# own main, and a third-party fork would try to push under its own account.
-# A fork that wants its own images changes the guard and the image names.
+# own main, and a third-party fork would fail with a 403 pushing to the
+# hardcoded ghcr.io/sentelabsai/* names. A fork that wants its own images
+# changes the guard and the image names.
 #
 # linux/amd64 only. The API image bakes torch plus two embedding-model caches
 # (see docker/Dockerfile); building that under arm64 emulation is impractically
 # slow. Multi-arch is a follow-up.
 name: Publish images
 
+# No workflow_dispatch: `type=ref,event=branch` below would publish a tag
+# named after whatever branch it was dispatched from. Re-run a failed run from
+# the Actions UI instead.
 on:
   push:
     branches: [main]
-    tags: ["v*"]
-  workflow_dispatch:
+    # Semver only. A bare `v*` would accept `v0.2` or `vnext`, which
+    # metadata-action's semver rules ignore, giving a green run that
+    # published no release tags.
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
 
 permissions:
   contents: read
   packages: write
 
+# Keyed on the commit, not the ref: `git push origin main v0.2.0` delivers a
+# branch push and a tag push for the same SHA, and both write `sha-<short>`.
+# Serialising them keeps that tag pointing at one build. Never cancel a
+# half-pushed release.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  # Never cancel a half-pushed release.
+  group: ${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -75,13 +90,22 @@ jobs:
             type=ref,event=branch
             type=sha
 
+      # Layer cache lives in the registry under a `buildcache` tag, not the
+      # Actions cache: the API image's dependency layers (torch and CUDA
+      # wheels, two baked embedding models) run to several GB, and the Actions
+      # cache is 10 GB per repository, so a `type=gha,mode=max` export would
+      # evict itself and the UI's cache on every run.
+      # provenance=false keeps each tag a plain single-platform image; the
+      # default attestation manifest shows up as an `unknown/unknown` row on
+      # the package page.
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
+          provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          cache-from: type=registry,ref=${{ matrix.image }}:buildcache
+          cache-to: type=registry,ref=${{ matrix.image }}:buildcache,mode=max
