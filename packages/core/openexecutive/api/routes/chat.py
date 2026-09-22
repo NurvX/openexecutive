@@ -807,6 +807,9 @@ async def _run_chat_turn(
         )
 
         full_response = ""
+        # Row id of the persisted assistant reply, handed to the client on
+        # `done` so it can attach 👍/👎 without a second roundtrip.
+        persisted: dict[str, int] = {}
         chunk_count = 0
         exec_t0 = time.monotonic()
         timed_out = False
@@ -878,8 +881,10 @@ async def _run_chat_turn(
                     return
                 if not is_first_turn:
                     update_session_timestamp(session.session_id)
-                save_message(session.session_id, "user", message)
                 save_message(
+                    session.session_id, "user", message, sender_person_id=caller_person_id
+                )
+                persisted["assistant_message_id"] = save_message(
                     session.session_id,
                     "assistant",
                     full_response,
@@ -1109,7 +1114,10 @@ async def _run_chat_turn(
             })
             yield f"data: {json.dumps(collector.to_sse_dict(complete_evt))}\n\n"
 
-            done = json.dumps({"type": "done", "session_id": session.session_id})
+            done_payload: dict[str, Any] = {"type": "done", "session_id": session.session_id}
+            if persisted.get("assistant_message_id"):
+                done_payload["message_id"] = persisted["assistant_message_id"]
+            done = json.dumps(done_payload)
             yield f"data: {done}\n\n"
 
         except Exception:

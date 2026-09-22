@@ -54,6 +54,8 @@ export interface ChatChunk {
     | "stopped";
   content?: string;
   session_id?: string;
+  // On `done`: row id of the persisted assistant reply, used to attach 👍/👎.
+  message_id?: number;
   message?: string;
   // committee fields (when type === "phase" or "committee_critique")
   phase?: CommitteePhase;
@@ -2466,6 +2468,53 @@ export async function updatePerson(id: number, patch: PersonPatch): Promise<Pers
 export async function archivePerson(id: number): Promise<void> {
   const res = await fetch(`${API_BASE}/people/${id}/archive`, { method: "POST" });
   if (!res.ok) throw new Error(`Failed to archive person: ${res.statusText}`);
+}
+
+// Attunement — open loops: things a person committed to or was asked for in
+// conversation and hasn't reported done. Overdue ones are chased by the
+// nudge engine; closing one stops the chase.
+export interface OpenLoop {
+  loop_id: number;
+  owner_person_id: number;
+  owner_name: string;
+  description: string;
+  due_at: string;
+  created_at: string;
+}
+
+export async function getPersonOpenLoops(id: number): Promise<OpenLoop[]> {
+  const res = await fetch(`${API_BASE}/people/${id}/open-loops`);
+  if (!res.ok) throw new Error(`Failed to load open loops: ${res.statusText}`);
+  return res.json();
+}
+
+export async function closeOpenLoop(
+  loopId: number,
+  reason: "done" | "not_needed" | "cancelled" = "done",
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/open-loops/${loopId}/close`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+  if (!res.ok) throw new Error(`Failed to close open loop: ${res.statusText}`);
+}
+
+// Explicit 👍/👎 on one assistant reply (null clears it).
+export async function setMessageFeedback(
+  sessionId: string,
+  messageId: number,
+  feedback: "up" | "down" | null,
+): Promise<void> {
+  const res = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/messages/${messageId}/feedback`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ feedback }),
+    },
+  );
+  if (!res.ok) throw new Error(`Failed to save feedback: ${res.statusText}`);
 }
 
 // ---------------------------------------------------------------------------

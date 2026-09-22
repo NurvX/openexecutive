@@ -73,6 +73,8 @@ _LABELS: dict[str, str] = {
     "archive_person": "Updating the people roster…",
     "set_department_head": "Updating the org chart…",
     "ask_about_person": "Checking what I know about someone…",
+    "list_open_loops": "Checking what people owe…",
+    "close_open_loop": "Closing an open loop…",
 
     # Departments
     "list_department_goals": "Reviewing department goals…",
@@ -146,6 +148,7 @@ _PRIORITY: tuple[frozenset[str], ...] = (
         "archive_person",
         "set_department_head",
         "update_department_goal",
+        "close_open_loop",
     }),
     frozenset({
         "create_alert",

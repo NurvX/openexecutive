@@ -110,6 +110,7 @@ def _persist_turn(
     user_text: str,
     assistant_text: str,
     also_session_id: str | None = None,
+    sender_person_id: int | None = None,
 ) -> None:
     """Write one Q+A to the session store, best-effort.
 
@@ -129,7 +130,7 @@ def _persist_turn(
             continue
         try:
             create_session(sid, title, created_at, caller_person_id=owner_person_id)
-            save_message(sid, "user", user_text)
+            save_message(sid, "user", user_text, sender_person_id=sender_person_id)
             save_message(sid, "assistant", assistant_text)
             update_session_timestamp(sid)
         except Exception:
@@ -702,6 +703,7 @@ async def create_slack_app():
                     user_text=_format_user_content(cleaned, speaker),
                     assistant_text=response,
                     also_session_id=also_session_id,
+                    sender_person_id=sender_person.id,
                 )
 
         except Exception as exc:

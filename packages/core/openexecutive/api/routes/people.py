@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import date
 
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 from openexecutive.people import registry as people_registry
@@ -167,4 +167,66 @@ def archive_person(person_id: int) -> Response:
         raise HTTPException(status_code=404, detail="Person not found")
     people_store.archive_person(person_id)
     people_registry.invalidate()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------------------------- #
+# Open loops (attunement) — what each person owes
+# --------------------------------------------------------------------------- #
+
+class OpenLoopOut(BaseModel):
+    loop_id: int
+    owner_person_id: int
+    owner_name: str
+    description: str
+    due_at: str
+    created_at: str
+
+
+class OpenLoopClose(BaseModel):
+    reason: str = Field(default="done", pattern="^(done|not_needed|cancelled)$")
+
+
+def _require_principal_or(person_id: int, request: Request) -> int:
+    """The resolved caller, if it is ``person_id`` or the principal; else 403."""
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    caller = _resolve_caller_person_id(request)
+    if caller is None or not people_store.is_principal_or_self(caller, person_id):
+        raise HTTPException(status_code=403, detail="Only the principal or the owner")
+    return int(caller)
+
+
+@router.get("/people/{person_id}/open-loops", response_model=list[OpenLoopOut])
+def get_person_open_loops(person_id: int, request: Request) -> list[OpenLoopOut]:
+    """Open loops this person owns, soonest due first. The principal or that
+    person only — what someone owes is not roster-public."""
+    from openexecutive.attunement.open_loops import list_open_loops
+
+    if people_store.get_person(person_id) is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+    _require_principal_or(person_id, request)
+    return [
+        OpenLoopOut(
+            loop_id=loop.id,
+            owner_person_id=loop.owner_person_id,
+            owner_name=loop.owner_name,
+            description=loop.description,
+            due_at=loop.due_at,
+            created_at=loop.created_at,
+        )
+        for loop in list_open_loops(person_id=person_id, limit=100)
+    ]
+
+
+@router.post("/open-loops/{loop_id}/close", status_code=status.HTTP_204_NO_CONTENT)
+def close_open_loop_route(loop_id: int, body: OpenLoopClose, request: Request) -> Response:
+    """Close one open loop. Only the principal or the loop's owner may."""
+    from openexecutive.attunement.open_loops import close_open_loop, get_open_loop
+
+    loop = get_open_loop(loop_id)
+    if loop is None:
+        raise HTTPException(status_code=404, detail="Open loop not found")
+    caller = _require_principal_or(loop.owner_person_id, request)
+    close_open_loop(loop_id, reason=body.reason, closed_by_person_id=caller)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

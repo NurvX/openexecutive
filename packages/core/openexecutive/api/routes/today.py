@@ -985,7 +985,7 @@ def _build_activity(
         if d.config.authority_level == "propose_only"
     }
 
-    for action in list_scheduled_actions(status="done", limit=pool):
+    for action in list_scheduled_actions(status="done", limit=pool, exclude_internal=True):
         if action.kind == "nudge_scan" or action.channel == "__internal__":
             continue
         # `created_at` is when the action was queued, not when it fired.

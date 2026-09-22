@@ -291,6 +291,8 @@ _KNOWN_READ_ONLY_TOOLS: frozenset[str] = frozenset({
     # people_tools
     "list_people",
     "ask_about_person",
+    # open_loop_tools
+    "list_open_loops",
     # department_tools
     "list_department_goals",
     # skills_tools
@@ -313,6 +315,7 @@ def _all_registered_tool_names() -> set[str]:
     from openexecutive.orchestrator.broadcast_tools import BROADCAST_TOOL_HANDLERS
     from openexecutive.orchestrator.department_tools import DEPARTMENT_TOOL_HANDLERS
     from openexecutive.orchestrator.mcp_gateway import MCP_TOOL_NAMES
+    from openexecutive.orchestrator.open_loop_tools import OPEN_LOOP_TOOL_HANDLERS
     from openexecutive.orchestrator.people_tools import PEOPLE_TOOL_HANDLERS
     from openexecutive.orchestrator.schedule_tools import SCHEDULE_TOOL_HANDLERS
     from openexecutive.orchestrator.skills_tools import SKILL_TOOL_HANDLERS
@@ -321,6 +324,7 @@ def _all_registered_tool_names() -> set[str]:
     return (
         set(SCHEDULE_TOOL_HANDLERS)
         | set(PEOPLE_TOOL_HANDLERS)
+        | set(OPEN_LOOP_TOOL_HANDLERS)
         | set(DEPARTMENT_TOOL_HANDLERS)
         | set(SKILL_TOOL_HANDLERS)
         | set(BROADCAST_TOOL_HANDLERS)

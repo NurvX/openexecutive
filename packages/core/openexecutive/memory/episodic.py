@@ -276,6 +276,22 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
                 if "duplicate column" not in str(exc).lower():
                     raise
 
+        # Attunement: who actually sent each message (the resolved rostered
+        # Person, never the session owner's principal fallback) and the
+        # explicit thumbs up/down on an assistant reply. Both nullable; legacy
+        # rows stay NULL and are never used for per-person learning.
+        for col, ddl in (
+            ("sender_person_id", "INTEGER"),
+            ("feedback", "TEXT"),
+            ("feedback_note", "TEXT"),
+        ):
+            if col not in _cm_existing:
+                try:
+                    conn.execute(f"ALTER TABLE chat_messages ADD COLUMN {col} {ddl}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+
         # Phase 4 additive columns for scheduled_actions only.
         _sa_existing = {
             row["name"]
@@ -310,6 +326,24 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
             "CREATE INDEX IF NOT EXISTS idx_scheduled_scope_key "
             "ON scheduled_actions(scope_key, created_at DESC) "
             "WHERE scope_key IS NOT NULL"
+        )
+
+        # Attunement: per-UTC-day ceiling on open-loop extraction model calls.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS attunement_usage ("
+            "  day TEXT PRIMARY KEY,"
+            "  calls INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+
+        # Attunement open loops: at most one OPEN loop per scope_key. Closing a
+        # loop clears awaiting_response_since, which takes it out of the index,
+        # so the same ask can be reopened later. The insert path relies on this
+        # to dedupe concurrent extraction passes (INSERT hits IntegrityError).
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_open_loop_scope "
+            "ON scheduled_actions(scope_key) "
+            "WHERE kind = 'open_loop' AND awaiting_response_since IS NOT NULL"
         )
 
         # Multi-user scoping: tag each session with the Person who started it
@@ -1415,9 +1449,14 @@ def list_scheduled_actions(
     status: str | None = None,
     limit: int = 100,
     order: str = "asc",
+    exclude_internal: bool = False,
     db_path: Path | None = None,
 ) -> list[ScheduledAction]:
     """List scheduled actions, optionally filtered by status.
+
+    ``exclude_internal`` drops ``__internal__``-channel rows in SQL, so a
+    caller that only wants real sends (the activity feed) is not starved by
+    internal rows — open loops, heartbeats — filling its ``limit``.
 
     `order` sorts by `run_at`: "asc" (default) puts the soonest-due pending
     rows first — the right default for the upcoming queue; "desc" puts the
@@ -1430,17 +1469,19 @@ def list_scheduled_actions(
     resolved = _resolve_db_path(db_path)
     if not resolved.exists():
         return []
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    if exclude_internal:
+        clauses.append("channel != '__internal__'")
+    where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
     with _get_conn(resolved) as conn:
-        if status is None:
-            rows = conn.execute(
-                f"SELECT * FROM scheduled_actions ORDER BY run_at {direction} LIMIT ?",
-                (limit,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                f"SELECT * FROM scheduled_actions WHERE status = ? ORDER BY run_at {direction} LIMIT ?",
-                (status, limit),
-            ).fetchall()
+        rows = conn.execute(
+            f"SELECT * FROM scheduled_actions {where}ORDER BY run_at {direction} LIMIT ?",
+            (*params, limit),
+        ).fetchall()
     return [ScheduledAction(**dict(row)) for row in rows]
 
 
@@ -1507,7 +1548,12 @@ def list_awaiting_replies_by_person(
             "  AND assigned_to_person_id IS NOT NULL "
             "  AND status IN ('pending', 'done') "
             "  AND kind != 'proactive_nudge' "
-            "GROUP BY assigned_to_person_id"
+            # An open loop's awaiting_response_since is its DUE time: until
+            # then nobody is waiting on the owner (the nudge engine uses the
+            # same cut-off).
+            "  AND NOT (kind = 'open_loop' AND awaiting_response_since > ?) "
+            "GROUP BY assigned_to_person_id",
+            (datetime.now(UTC).isoformat(),),
         ).fetchall()
     return {int(r["pid"]): (int(r["cnt"]), r["oldest"]) for r in rows}
 
@@ -1533,6 +1579,10 @@ def last_contact_at_by_person(
             "FROM scheduled_actions "
             "WHERE assigned_to_person_id IS NOT NULL "
             "  AND status = 'done' "
+            # An open loop is a record of what someone owes, not a message
+            # we sent them — counting it would report contact that never
+            # happened.
+            "  AND kind != 'open_loop' "
             "GROUP BY assigned_to_person_id"
         ).fetchall()
     return {int(r["pid"]): r["last"] for r in rows}

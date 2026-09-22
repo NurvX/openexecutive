@@ -19,6 +19,42 @@ interface MessageProps {
   // answer isn't read as a complete one — on reload too, since the flag is
   // persisted with the message.
   stopped?: boolean;
+  // Explicit 👍/👎 on a persisted reply. Rendered only when `onFeedback` is
+  // given (the reply has a stored id) and the reply has finished streaming.
+  feedback?: "up" | "down" | null;
+  onFeedback?: (value: "up" | "down" | null) => void;
+}
+
+function FeedbackButtons({
+  value,
+  onChange,
+}: {
+  value: "up" | "down" | null | undefined;
+  onChange: (value: "up" | "down" | null) => void;
+}) {
+  const button = (kind: "up" | "down", glyph: string, label: string) => {
+    const active = value === kind;
+    return (
+      <button
+        type="button"
+        aria-label={label}
+        aria-pressed={active}
+        title={label}
+        onClick={() => onChange(active ? null : kind)}
+        className={`px-1.5 py-0.5 rounded text-xs transition-colors ${
+          active ? "bg-surface-overlay text-fg" : "text-fg-muted hover:text-fg"
+        }`}
+      >
+        {glyph}
+      </button>
+    );
+  };
+  return (
+    <div className="mt-2 flex gap-1" aria-label="Rate this reply">
+      {button("up", "👍", "Helpful")}
+      {button("down", "👎", "Not helpful")}
+    </div>
+  );
 }
 
 function ActionChip({ action }: { action: ActionTaken }) {
@@ -38,7 +74,15 @@ function ActionChip({ action }: { action: ActionTaken }) {
   return inner;
 }
 
-export default function Message({ role, content, isStreaming, actions, stopped }: MessageProps) {
+export default function Message({
+  role,
+  content,
+  isStreaming,
+  actions,
+  stopped,
+  feedback,
+  onFeedback,
+}: MessageProps) {
   if (role === "user") {
     return (
       <div className="flex justify-end mb-6">
@@ -91,6 +135,10 @@ export default function Message({ role, content, isStreaming, actions, stopped }
 
         {stopped && !isStreaming && (
           <p className="mt-2 text-xs text-fg-muted">Stopped by you</p>
+        )}
+
+        {onFeedback && !isStreaming && (
+          <FeedbackButtons value={feedback} onChange={onFeedback} />
         )}
       </div>
     </div>
