@@ -332,13 +332,13 @@ def close_open_loop(
     # Only the owner's own "it's done" credits the chases. The principal
     # tidying a loop away ("done" is the default in the UI and the tool) says
     # nothing about whether the owner answered.
-    owner_did_it = reason == "reported_done" or (
+    owner_did_it = (
         reason in _DONE_REASONS and closed_by_person_id is not None
         and closed_by_person_id == owner_id
     )
     if closed and owner_did_it:
-        # The chases for this loop landed: the owner (or the principal) says
-        # it's done. Other closures (expiry, archive, cancelled) prove nothing.
+        # The chases for this loop landed: its owner says it's done. Other
+        # closures (expiry, archive, cancelled, a principal tidy-up) prove nothing.
         from openexecutive.attunement.outcomes import OUTCOME_ACTED, resolve_by_ref
 
         resolve_by_ref(f"nudge:commitment:{loop_id}", OUTCOME_ACTED, db_path=db_path)

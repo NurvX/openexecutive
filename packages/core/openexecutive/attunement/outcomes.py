@@ -14,7 +14,8 @@ rostered person and resolves it deterministically, with no model call:
 - **void** — the alert it was about was dismissed or found stale: the DM
   neither landed nor was ignored, so it counts toward neither;
 - **ignored** — nothing of the above within ``ATTUNEMENT_IGNORE_AFTER_HOURS``
-  (swept at the start of each nudge scan and whenever rates are read).
+  (swept at the start of each nudge scan and whenever rates are read). A
+  later acted / void verdict overrides it.
 
 Recording happens at the one place every proactive DM passes through —
 ``orchestrator.schedule_tools._record_outbound_context`` — but only while a
@@ -156,8 +157,18 @@ def _is_principal(person_id: int) -> bool:
         return False
 
 
-def _resolve(where: str, params: tuple[Any, ...], outcome: str, db_path: Path | None) -> int:
-    """Set ``outcome`` on still-open rows matching ``where``. Never raises."""
+def _resolve(
+    where: str,
+    params: tuple[Any, ...],
+    outcome: str,
+    db_path: Path | None,
+    *,
+    override_ignored: bool = False,
+) -> int:
+    """Set ``outcome`` on still-open rows matching ``where`` — and, with
+    ``override_ignored``, on rows already swept to ``ignored``: the thing a
+    DM chased can get done (or be dismissed) days after the 72h sweep, and
+    that later verdict is the truer one. Never raises."""
     try:
         from openexecutive.memory.episodic import _get_conn
 
@@ -165,9 +176,13 @@ def _resolve(where: str, params: tuple[Any, ...], outcome: str, db_path: Path | 
         if not resolved.exists():
             return 0
         with _get_conn(resolved) as conn:
+            open_clause = (
+                "(outcome IS NULL OR outcome = 'ignored')" if override_ignored
+                else "outcome IS NULL"
+            )
             cur = conn.execute(
                 "UPDATE proactive_outcomes SET outcome = ?, resolved_at = ? "
-                f"WHERE outcome IS NULL AND {where}",
+                f"WHERE {open_clause} AND {where}",
                 (outcome, datetime.now(UTC).isoformat(), *params),
             )
             return int(cur.rowcount)
@@ -190,13 +205,18 @@ def resolve_by_ref(
     credits only the ones it now belongs to."""
     if not ref:
         return 0
+    # A later "done" or "didn't matter" overrides an earlier timeout.
+    override = outcome in (OUTCOME_ACTED, OUTCOME_VOID)
     if person_ids is None:
-        return _resolve("ref = ?", (ref,), outcome, db_path)
+        return _resolve("ref = ?", (ref,), outcome, db_path, override_ignored=override)
     ids = sorted(person_ids)
     if not ids:
         return 0
     placeholders = ",".join("?" * len(ids))
-    return _resolve(f"ref = ? AND person_id IN ({placeholders})", (ref, *ids), outcome, db_path)
+    return _resolve(
+        f"ref = ? AND person_id IN ({placeholders})", (ref, *ids), outcome, db_path,
+        override_ignored=override,
+    )
 
 
 def resolve_by_outbound_context(
@@ -213,9 +233,17 @@ def sweep_ignored(
     db_path: Path | None = None,
 ) -> int:
     """Mark outcomes still open after ``after_hours`` as ignored."""
-    from openexecutive.config import get_settings
+    if after_hours is not None:
+        hours = after_hours
+    else:
+        try:
+            from openexecutive.config import get_settings
 
-    hours = after_hours if after_hours is not None else get_settings().attunement_ignore_after_hours
+            hours = get_settings().attunement_ignore_after_hours
+        except Exception:
+            # Runs on read paths too; a settings failure must not 500 a page.
+            logger.warning("outcomes: sweep settings unavailable", exc_info=True)
+            return 0
     if hours <= 0:
         return 0
     cutoff = ((now or datetime.now(UTC)) - timedelta(hours=hours)).isoformat()
@@ -311,7 +339,9 @@ def muted_pairs(
             rows = conn.execute(
                 "SELECT person_id, source, outcome FROM proactive_outcomes "
                 "WHERE created_at >= ? AND outcome IS NOT NULL AND outcome != 'void' "
-                "ORDER BY person_id, source, resolved_at DESC, id DESC",
+                # By when the DM was SENT: an old send swept to "ignored"
+                # after a newer one was answered must not bury that answer.
+                "ORDER BY person_id, source, created_at DESC, id DESC",
                 (since,),
             ).fetchall()
     except Exception:

@@ -9,6 +9,6 @@ here ever reads an outsider's words as someone on the roster.
   on the roster become open loops the nudge engine chases once due, and close
   when the owner says they're done.
 - :mod:`openexecutive.attunement.outcomes` — every proactive DM to a person is
-  resolved replied / acted / dismissed / ignored, and the rates steer which
+  resolved replied / acted / void / ignored, and the rates steer which
   outreach the nudge engine and the morning standup send to whom.
 """

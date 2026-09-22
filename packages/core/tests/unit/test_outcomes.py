@@ -113,8 +113,28 @@ def test_loop_reported_done_resolves_its_chases_acted(team: SimpleNamespace) -> 
                                    due_at=datetime.now(UTC))
     assert loop_id is not None
     _seed(team.sara, outcomes.SOURCE_OPEN_LOOP, None, 1, ref=f"nudge:commitment:{loop_id}")
-    open_loops.close_open_loop(loop_id, reason="reported_done")
+    open_loops.close_open_loop(loop_id, reason="reported_done", closed_by_person_id=team.sara)
     assert _outcome_rows()[0]["outcome"] == "acted"
+
+
+def test_principal_reporting_someone_elses_loop_done_does_not_credit_them(
+    team: SimpleNamespace,
+) -> None:
+    loop_id = open_loops.open_loop(owner_person_id=team.sara, description="send the quote",
+                                   due_at=datetime.now(UTC))
+    assert loop_id is not None
+    _seed(team.sara, outcomes.SOURCE_OPEN_LOOP, None, 1, ref=f"nudge:commitment:{loop_id}")
+    assert open_loops.close_open_loop(loop_id, reason="reported_done",
+                                      closed_by_person_id=team.principal)
+    assert _outcome_rows()[0]["outcome"] is None
+
+
+def test_acted_overrides_an_earlier_ignored_but_a_reply_does_not(team: SimpleNamespace) -> None:
+    _seed(team.sara, outcomes.SOURCE_OPEN_LOOP, "ignored", 1, ref="nudge:commitment:7")
+    _seed(team.sara, outcomes.SOURCE_OPEN_LOOP, "ignored", 1, ref="nudge:commitment:8")
+    outcomes.resolve_by_ref("nudge:commitment:7", outcomes.OUTCOME_ACTED)
+    outcomes.resolve_by_ref("nudge:commitment:8", outcomes.OUTCOME_REPLIED)
+    assert [r["outcome"] for r in _outcome_rows()] == ["acted", "ignored"]
 
 
 def test_loop_expiry_does_not_count_as_acted(team: SimpleNamespace) -> None:
@@ -140,6 +160,14 @@ def test_alert_ack_credits_only_its_owner_and_the_principal(team: SimpleNamespac
     record_ack_feedback(_alert(7, routed_to=team.sara), "ack")  # type: ignore[arg-type]
     # Ben was DM'd on an earlier pass but it isn't his any more.
     assert [r["outcome"] for r in _outcome_rows()] == ["acted", None, "acted"]
+
+
+def test_expired_alert_voids_even_already_ignored_dms(team: SimpleNamespace) -> None:
+    from openexecutive.alerts.lifecycle import resolve_alert_outreach
+
+    _seed(team.sara, outcomes.SOURCE_ALERT_REVIEW, "ignored", 1, ref="alert:11")
+    resolve_alert_outreach(_alert(11), "expired")  # type: ignore[arg-type]
+    assert _outcome_rows()[0]["outcome"] == "void"
 
 
 def test_dismissed_alert_voids_its_dms_and_never_counts_against_anyone(team: SimpleNamespace) -> None:
@@ -176,21 +204,42 @@ async def test_resolved_approval_credits_its_nudges(
     wf_persistence.create_run("run-1", "test_wf", "Test run", {})
     wf_persistence.save_checkpoint("run-1", json.dumps({"channel": "slack", "channel_ref": "U"}),
                                    team.sara, datetime.now(UTC) + timedelta(hours=1))
+    ben = people_store.upsert_person(full_name="Ben Ortiz", slack_user_id="U_BEN")
     _seed(team.sara, outcomes.SOURCE_NUDGE_STALLED, None, 1, ref="nudge:stalled:run-1")
+    _seed(ben, outcomes.SOURCE_NUDGE_STALLED, None, 1, ref="nudge:stalled:run-1")
     resolution = WaitForHumanResolution(
         run_id="run-1", reply_text="approved", source_channel="web", source_message_id="m",
         parsed_decision={"decision": "approve", "note": ""}, person_id=team.sara,
     )
     assert await apply_resolution("run-1", resolution)
-    assert _outcome_rows()[0]["outcome"] == "acted"
+    # Only the approver's nudge landed; Ben's is still open.
+    assert [r["outcome"] for r in _outcome_rows()] == ["acted", None]
 
 
-def test_initiative_update_credits_its_check_ins(team: SimpleNamespace) -> None:
+def test_initiative_update_credits_only_the_updaters_check_ins(team: SimpleNamespace) -> None:
+    episodic.store_initiative("Launch", "active", db_path=episodic.DB_PATH)
+    [init] = episodic.get_active_initiatives(db_path=episodic.DB_PATH)
+    ref = f"nudge:initiative:{init.id}"
+    _seed(team.sara, outcomes.SOURCE_NUDGE_INITIATIVE, None, 1, ref=ref)
+    _seed(team.principal, outcomes.SOURCE_NUDGE_INITIATIVE, None, 1, ref=ref)
+    # A same-status, same-summary re-mention is not an answer.
+    episodic.store_initiative("Launch", "active", db_path=episodic.DB_PATH,
+                              updated_by_person_id=team.sara)
+    assert [r["outcome"] for r in _outcome_rows()] == [None, None]
+    episodic.store_initiative("Launch", "active", summary="on track", db_path=episodic.DB_PATH,
+                              updated_by_person_id=team.sara)
+    assert [r["outcome"] for r in _outcome_rows()] == ["acted", None]
+
+
+def test_anonymous_initiative_edit_credits_nobody(team: SimpleNamespace) -> None:
+    """``PATCH /memories/initiatives/{id}`` has no caller identity and calls
+    ``update_initiative`` without an updater, so an edit through it must not
+    mark anyone's check-ins as answered."""
     episodic.store_initiative("Launch", "active", db_path=episodic.DB_PATH)
     [init] = episodic.get_active_initiatives(db_path=episodic.DB_PATH)
     _seed(team.sara, outcomes.SOURCE_NUDGE_INITIATIVE, None, 1, ref=f"nudge:initiative:{init.id}")
-    episodic.store_initiative("Launch", "active", summary="on track", db_path=episodic.DB_PATH)
-    assert _outcome_rows()[0]["outcome"] == "acted"
+    assert episodic.update_initiative(init.id, summary="x", db_path=episodic.DB_PATH)
+    assert _outcome_rows()[0]["outcome"] is None
 
 
 def test_principal_tidying_a_loop_does_not_credit_the_owner(team: SimpleNamespace) -> None:
@@ -221,6 +270,25 @@ def test_email_cc_is_not_counted_as_outreach(team: SimpleNamespace, monkeypatch:
         with outcomes.tag_proactive(outcomes.SOURCE_NUDGE_COMMITMENT, "nudge:commitment:1"):
             mcp_gateway._record_email_outbound_context(
                 {"to": "sara@acme.test", "cc": ["pat@acme.test"], "body": "Any update?"}
+            )
+    finally:
+        current_session.reset(token)
+    assert [r["person_id"] for r in _outcome_rows()] == [team.sara]
+
+
+def test_email_outcome_goes_to_the_first_rostered_to_address(
+    team: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.orchestrator import mcp_gateway
+    from openexecutive.orchestrator.schedule_tools import current_session
+    from openexecutive.orchestrator.session import Session
+
+    people_store.update_person(team.sara, email="sara@acme.test")
+    token = current_session.set(Session())
+    try:
+        with outcomes.tag_proactive(outcomes.SOURCE_NUDGE_COMMITMENT, "nudge:commitment:1"):
+            mcp_gateway._record_email_outbound_context(
+                {"to": ["vendor@else.test", "sara@acme.test"], "body": "Any update?"}
             )
     finally:
         current_session.reset(token)
@@ -259,6 +327,21 @@ def test_acceptance_counts(team: SimpleNamespace) -> None:
     assert (loops.sent, loops.resolved, loops.positive) == (5, 5, 0)
     refl = stats[(team.sara, outcomes.SOURCE_REFLECTION)]
     assert (refl.sent, refl.resolved, refl.pending) == (4, 3, 1)
+
+
+def test_muted_reads_the_latest_sends_by_time_not_insert_order(team: SimpleNamespace) -> None:
+    now = datetime.now(UTC)
+    with sqlite3.connect(str(episodic.DB_PATH)) as conn:
+        # The reply is the newest send even though its row was written first.
+        for age_h, outcome in [(0, "replied"), (5, "ignored"), (4, "ignored"), (3, "ignored"),
+                               (2, "ignored"), (1, "ignored")]:
+            conn.execute(
+                "INSERT INTO proactive_outcomes (created_at, person_id, source, channel, "
+                "channel_ref, outcome) VALUES (?, ?, ?, 'slack_dm', 'x', ?)",
+                ((now - timedelta(hours=age_h)).isoformat(), team.sara,
+                 outcomes.SOURCE_OPEN_LOOP, outcome),
+            )
+    assert outcomes.muted_pairs(min_sends=5) == set()
 
 
 def test_muted_needs_the_last_n_all_unanswered(team: SimpleNamespace) -> None:

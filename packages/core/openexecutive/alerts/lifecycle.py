@@ -198,12 +198,17 @@ def expire_stale_alerts(
         ]
         if not expired_ids:
             return 0
-        count = len(bulk_set_status(
+        changed = bulk_set_status(
             EXPIRED_STATUS, alert_ids=expired_ids, only_status="unread", db_path=db_path
-        ))
+        )
+        count = len(changed)
     except Exception:
         logger.exception("alerts.lifecycle: expiry sweep failed")
         return 0
+    # An alert nobody acted on before its TTL didn't matter: void the review's
+    # DMs about it rather than leave them counted as ignored.
+    for alert_id in expired_ids:
+        resolve_alert_outreach(_AlertRef(alert_id), EXPIRED_STATUS)
 
     if count:
         try:
@@ -243,7 +248,15 @@ def mute_pattern_for(alert: Alert) -> str | None:
     return tags[0] if tags else None
 
 
-def resolve_alert_outreach(alert: Alert, status: str) -> None:
+class _AlertRef:
+    """Just enough of an Alert for :func:`resolve_alert_outreach` to void it."""
+
+    def __init__(self, alert_id: int) -> None:
+        self.id: int | None = alert_id
+        self.routed_to_person_id: int | None = None
+
+
+def resolve_alert_outreach(alert: Alert | _AlertRef, status: str) -> None:
     """Resolve the Attunement outcome rows for review DMs about ``alert``.
 
     Acknowledged or resolved: the DMs to the person it is routed to (and to

@@ -556,16 +556,21 @@ def store_initiative(
     department: str = "",
     person_id: int | None = None,
     db_path: Path = DB_PATH,
+    updated_by_person_id: int | None = None,
 ) -> None:
     now = datetime.now(UTC).isoformat()
     is_insert = False
     is_status_change = False
+    is_real_update = False
     with _get_conn(db_path) as conn:
         existing = conn.execute(
-            "SELECT id, status FROM initiatives WHERE title = ?", (title,)
+            "SELECT id, status, summary FROM initiatives WHERE title = ?", (title,)
         ).fetchone()
         if existing:
             is_status_change = existing["status"] != status
+            is_real_update = is_status_change or (
+                bool(summary) and summary != (existing["summary"] or "")
+            )
             # Only overwrite an existing department when the caller actually
             # passed a non-empty value — preserves the original tag if the
             # update path is invoked without department context.
@@ -585,8 +590,10 @@ def store_initiative(
                 "INSERT INTO initiatives (title, status, created_at, updated_at, summary, department) VALUES (?, ?, ?, ?, ?, ?)",
                 (title, status, now, now, summary, department),
             )
-    if existing:
-        _resolve_initiative_outreach(int(existing["id"]), db_path)
+    if existing and is_real_update:
+        # Only a real change answers a check-in — a same-status re-mention
+        # during routine extraction does not.
+        _resolve_initiative_outreach(int(existing["id"]), updated_by_person_id, db_path)
     # Mirror only on a new initiative OR a real status transition.
     # Idempotent upserts (same title + same status) don't fire — that
     # would spam the dept peer with redundant notes on every routine
@@ -812,6 +819,7 @@ def update_initiative(
     status: str | None = None,
     summary: str | None = None,
     db_path: Path = DB_PATH,
+    updated_by_person_id: int | None = None,
 ) -> bool:
     fields: list[tuple[str, str]] = []
     if title is not None:
@@ -831,15 +839,38 @@ def update_initiative(
         )
         updated = cursor.rowcount > 0
     if updated:
-        _resolve_initiative_outreach(initiative_id, db_path)
+        _resolve_initiative_outreach(initiative_id, updated_by_person_id, db_path)
     return updated
 
 
-def _resolve_initiative_outreach(initiative_id: int, db_path: Path | None) -> None:
-    """An initiative got an update, so the check-in nudges about it landed."""
+def _principal_person_id() -> int | None:
+    """The principal's roster id, or None when there is none. Never raises."""
+    try:
+        from openexecutive.people.store import find_principal_person
+
+        principal = find_principal_person()
+    except Exception:
+        logger.debug("principal lookup failed", exc_info=True)
+        return None
+    return principal.id if principal is not None else None
+
+
+def _resolve_initiative_outreach(
+    initiative_id: int, updated_by_person_id: int | None, db_path: Path | None
+) -> None:
+    """The person a check-in nudge went to updated the initiative, so it landed.
+
+    Credit goes only to the updater's own pending check-ins. An update from
+    someone else (the principal editing the card, an unauthenticated API call)
+    says nothing about whether the department head answered."""
+    if updated_by_person_id is None:
+        return
     from openexecutive.attunement.outcomes import OUTCOME_ACTED, resolve_by_ref
 
-    resolve_by_ref(f"nudge:initiative:{initiative_id}", OUTCOME_ACTED, db_path=db_path)
+    resolve_by_ref(
+        f"nudge:initiative:{initiative_id}", OUTCOME_ACTED,
+        person_ids={updated_by_person_id}, db_path=db_path,
+    )
 
 
 def update_advice(
@@ -2169,11 +2200,14 @@ def _store_item(
             db_path=db_path,
         )
     elif spec is _INITIATIVES:
+        # Extraction only runs on the principal's own words (should_extract),
+        # so the principal is the one updating it.
         store_initiative(
             title=item["title"],
             status=item.get("status", "active"),
             summary=item["summary"],
             db_path=db_path,
+            updated_by_person_id=_principal_person_id(),
         )
     else:
         store_advice(

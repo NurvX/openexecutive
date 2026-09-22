@@ -581,10 +581,12 @@ def _record_email_outbound_context(arguments: dict[str, Any]) -> None:
 
         from openexecutive.orchestrator.schedule_tools import (
             _record_outbound_context,
+            _resolve_recipient_person_id,
         )
 
         self_addr = get_settings().exec_email_address.lower()
         seen: set[str] = set()
+        primary_taken = False
         for field in _OUTBOUND_CONTEXT_RECIPIENT_FIELDS:
             value = arguments.get(field)
             if not value:
@@ -594,9 +596,13 @@ def _record_email_outbound_context(arguments: dict[str, Any]) -> None:
                 norm = addr.strip().lower()
                 if not norm or norm == self_addr or norm in seen:
                     continue
-                # Only the first "to" address is who the email was addressed
-                # to; every recipient still gets reply linkage.
-                primary = field == "to" and not seen
+                # Only the first rostered "to" address is who the email was
+                # addressed to; every recipient still gets reply linkage.
+                primary = (
+                    field == "to" and not primary_taken
+                    and _resolve_recipient_person_id("email", norm) is not None
+                )
+                primary_taken = primary_taken or primary
                 seen.add(norm)
                 _record_outbound_context(
                     channel="email",

@@ -100,7 +100,11 @@ async def apply_resolution(
     from openexecutive.attunement.outcomes import OUTCOME_ACTED, resolve_by_ref
 
     # The ledger lives in the episodic store, not necessarily at `db_path`.
-    resolve_by_ref(f"nudge:stalled:{run_id}", OUTCOME_ACTED)
+    # Credited to whoever resolved it, like alerts — not to everyone nudged.
+    resolve_by_ref(
+        f"nudge:stalled:{run_id}", OUTCOME_ACTED,
+        person_ids={resolution.person_id} if resolution.person_id is not None else None,
+    )
 
     audit_log(
         "human_resolution",
