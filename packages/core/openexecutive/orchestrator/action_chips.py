@@ -44,6 +44,8 @@ SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({
     "upsert_person",
     "archive_person",
     "set_department_head",
+    # Attunement: closing an open loop stops the nudge engine chasing it
+    "close_open_loop",
     # Department goal mutations (Phase B — chat-driven progress updates)
     "update_department_goal",
     # Skills mutations
@@ -151,6 +153,10 @@ def summarize_action(
         # so we don't paint "Approved proposal #N" over a non-event.
         return None
 
+    if tool_name == "close_open_loop" and (parsed or {}).get("status") != "closed":
+        # Refused, or the loop was no longer open — nothing changed.
+        return None
+
     payload: dict[str, Any] = {
         "type": "action_taken",
         "tool": tool_name,
@@ -202,6 +208,9 @@ def summarize_action(
         payload["target"] = full_name or None
         if isinstance(pid, int):
             payload["link"] = f"/people/{pid}"
+    elif tool_name == "close_open_loop":
+        loop_id = tool_input.get("loop_id")
+        payload["summary"] = f"Closed open loop #{loop_id}" if loop_id else "Closed an open loop"
     elif tool_name == "archive_person":
         pid = tool_input.get("person_id")
         payload["summary"] = f"Archived person #{pid}" if pid else "Archived a person"

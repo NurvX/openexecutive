@@ -917,7 +917,9 @@ async def _handle_message(
                 session.created_at.isoformat(),
                 caller_person_id=session_owner_id,
             )
-            save_message(session_id, "user", formatted_user_text)
+            save_message(
+                session_id, "user", formatted_user_text, sender_person_id=person_id
+            )
             save_message(session_id, "assistant", response)
             update_session_timestamp(session_id)
         except Exception:
@@ -943,7 +945,12 @@ async def _handle_message(
                     session.created_at.isoformat(),
                     caller_person_id=session_owner_id,
                 )
-                save_message(promoted_session_id, "user", formatted_user_text)
+                save_message(
+                    promoted_session_id,
+                    "user",
+                    formatted_user_text,
+                    sender_person_id=person_id,
+                )
                 save_message(promoted_session_id, "assistant", response)
                 update_session_timestamp(promoted_session_id)
             except Exception:

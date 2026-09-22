@@ -473,7 +473,18 @@ def archive_person(person_id: int, db_path: Path | None = None) -> bool:
             "UPDATE people SET archived = 1, updated_at = ? WHERE id = ? AND archived = 0",
             (_now(), person_id),
         )
-        return cursor.rowcount > 0
+        archived = cursor.rowcount > 0
+    if archived and db_path is None:
+        # An archived person can no longer be chased, so their open loops
+        # would otherwise sit in /today forever. Only on the live store: a
+        # caller passing its own db_path owns its own episodic DB too.
+        try:
+            from openexecutive.attunement.open_loops import close_loops_for_person
+
+            close_loops_for_person(person_id, reason="owner_archived")
+        except Exception:
+            logger.warning("archive_person: closing open loops failed", exc_info=True)
+    return archived
 
 
 def find_approvers(

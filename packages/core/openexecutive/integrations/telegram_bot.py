@@ -343,7 +343,7 @@ async def _process_and_reply(
                 session.created_at.isoformat(),
                 caller_person_id=session_owner_id,
             )
-            save_message(session_id, "user", message_text)
+            save_message(session_id, "user", message_text, sender_person_id=person_id)
             save_message(session_id, "assistant", response)
             update_session_timestamp(session_id)
         except Exception:

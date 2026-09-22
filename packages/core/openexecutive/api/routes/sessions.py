@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, HTTPException, Request, Response, status
+from pydantic import BaseModel, Field
 
 from openexecutive.api.models import SessionSummary
 from openexecutive.api.routes.chat import _resolve_caller_person_id
 from openexecutive.memory.session_store import (
     delete_session,
     get_session_metadata,
+    get_session_owner,
     list_sessions,
     load_messages,
+    set_message_feedback,
 )
 
 router = APIRouter()
@@ -46,4 +51,56 @@ def get_session_messages(session_id: str) -> list[dict]:
 def delete_session_route(session_id: str) -> Response:
     if not delete_session(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class MessageFeedback(BaseModel):
+    """👍/👎 on one assistant reply; ``null`` clears it."""
+
+    feedback: Literal["up", "down"] | None
+    note: str | None = Field(default=None, max_length=500)
+
+
+@router.post(
+    "/sessions/{session_id}/messages/{message_id}/feedback",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def post_message_feedback(
+    session_id: str, message_id: int, body: MessageFeedback, request: Request
+) -> Response:
+    """Record explicit feedback on an assistant reply.
+
+    Only the session's own caller, or the principal, may rate it: feedback
+    feeds per-person learning, so a rating left on someone else's session
+    would be read as that person's reaction."""
+    exists, owner = get_session_owner(session_id)
+    if not exists:
+        raise HTTPException(status_code=404, detail="Session not found")
+    caller = _resolve_caller_person_id(request)
+    if caller is None:
+        raise HTTPException(status_code=403, detail="Caller is not on the roster")
+    if caller != owner:
+        from openexecutive.people.store import get_person
+
+        person = get_person(caller)
+        if person is None or not person.is_principal:
+            raise HTTPException(status_code=403, detail="Not your session")
+    if not set_message_feedback(session_id, message_id, body.feedback, body.note):
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    from openexecutive.audit import log_event
+
+    log_event(
+        "attunement",
+        f"feedback={body.feedback or 'cleared'} message_id={message_id}",
+        session_id=session_id,
+        actor="user",
+        details={
+            "op": "feedback",
+            "message_id": message_id,
+            "feedback": body.feedback,
+            "person_id": caller,
+            "has_note": bool(body.note),
+        },
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

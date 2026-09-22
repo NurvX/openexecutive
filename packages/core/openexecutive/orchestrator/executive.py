@@ -54,6 +54,10 @@ from openexecutive.orchestrator.form_tools import (
     build_form_patch_event,
 )
 from openexecutive.orchestrator.mcp_gateway import MCP_TOOL_NAMES, MCP_TOOLS, MCPGateway
+from openexecutive.orchestrator.open_loop_tools import (
+    OPEN_LOOP_TOOL_HANDLERS,
+    OPEN_LOOP_TOOLS,
+)
 from openexecutive.orchestrator.people_tools import (
     PEOPLE_TOOL_HANDLERS,
     PEOPLE_TOOLS,
@@ -316,6 +320,7 @@ _ALL_SKILL_TOOLS = [
     *SCHEDULE_TOOLS,
     *CALENDAR_TOOLS,
     *PEOPLE_TOOLS,
+    *OPEN_LOOP_TOOLS,
     *DEPARTMENT_TOOLS,
     *BROADCAST_TOOLS,
     *WATCHLIST_TOOLS,
@@ -331,6 +336,7 @@ _ALL_SKILL_HANDLERS = {
     **SCHEDULE_TOOL_HANDLERS,
     **CALENDAR_TOOL_HANDLERS,
     **PEOPLE_TOOL_HANDLERS,
+    **OPEN_LOOP_TOOL_HANDLERS,
     **DEPARTMENT_TOOL_HANDLERS,
     **BROADCAST_TOOL_HANDLERS,
     **WATCHLIST_TOOL_HANDLERS,
@@ -656,6 +662,10 @@ class Executive:
         # Expose the current session to tool handlers (e.g. schedule_followup)
         # without threading it through every signature.
         current_session.set(session)
+        # The resolved speaker for THIS turn (None for an unrostered sender),
+        # so tool handlers can tell who is asking — e.g. close_open_loop only
+        # lets the principal or the loop's owner close a loop.
+        session.caller_person_id = person_id
         # Persona and model can be overridden via the Agent Council admin UI.
         # Override is admin-set (not per-request dynamic), so placing it in the
         # cached block is fine — cache misses once on change, then hits normally.
@@ -823,6 +833,17 @@ class Executive:
                     user_message, full_response, session_id=session.session_id
                 )
 
+            # Open loops from ANY rostered speaker (not just the principal):
+            # "I'll send the quote Thursday" becomes a loop the nudge engine
+            # chases once due. `person_id` is the resolved speaker, so an
+            # unrostered sender (None) records nothing.
+            from openexecutive.attunement.open_loops import schedule_open_loop_pass
+
+            schedule_open_loop_pass(
+                user_message, full_response, person_id=person_id,
+                session_id=session.session_id,
+            )
+
             # Mirror the completed exchange into Honcho so its server-side
             # extraction can update the peer card. Fire-and-forget; the
             # wrapper no-ops when person_id is None or Honcho is disabled.
@@ -885,6 +906,10 @@ class Executive:
             extra={"turn_break": True},
         )
         current_session.set(session)
+        # The resolved speaker for THIS turn (None for an unrostered sender),
+        # so tool handlers can tell who is asking — e.g. close_open_loop only
+        # lets the principal or the loop's owner close a loop.
+        session.caller_person_id = person_id
 
         persona_override: str | None = None
         voice_persona_body: str | None = None
@@ -1241,6 +1266,14 @@ class Executive:
             schedule_extraction(
                 user_message, final_response, session_id=session.session_id
             )
+
+        # Open loops — see stream_chat.
+        from openexecutive.attunement.open_loops import schedule_open_loop_pass
+
+        schedule_open_loop_pass(
+            user_message, final_response, person_id=person_id,
+            session_id=session.session_id,
+        )
 
         # Mirror the completed exchange into Honcho (see stream_chat for
         # rationale). Fire-and-forget; no-ops when person_id is None.

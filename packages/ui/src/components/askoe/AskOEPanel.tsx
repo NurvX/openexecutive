@@ -6,7 +6,7 @@ import Icon from "@/components/Icon";
 import Message from "@/components/Message";
 import { useAskOE } from "@/components/askoe/AskOEContext";
 import type { ActionTaken, FormPatch } from "@/lib/api";
-import { streamChat } from "@/lib/api";
+import { setMessageFeedback, streamChat } from "@/lib/api";
 import { isAbortError, useStoppableTurn } from "@/lib/use-stoppable-turn";
 
 // One proposal card per form_patch event: what was applied/skipped, the
@@ -28,6 +28,9 @@ interface PanelMessage {
   patches?: PatchCardData[];
   /** The user stopped this reply mid-stream. */
   stopped?: boolean;
+  /** Persisted row id (from `done`), needed to rate the reply. */
+  messageId?: number;
+  feedback?: "up" | "down" | null;
 }
 
 function PatchCard({
@@ -148,6 +151,7 @@ export default function AskOEPanel() {
 
       let content = "";
       let wasStopped = false;
+      let messageId: number | undefined;
       const actions: ActionTaken[] = [];
       const patches: PatchCardData[] = [];
       try {
@@ -185,6 +189,7 @@ export default function AskOEPanel() {
             // a turn that ends without `done` would otherwise leave the panel
             // pointing at no session.
             setSessionId(item.session_id);
+            if (item.type === "done" && item.message_id) messageId = item.message_id;
           }
           // thinking / phase / debug_event: no panel surface needed.
           // `activity` is surfaced — it fills the streaming placeholder.
@@ -208,6 +213,7 @@ export default function AskOEPanel() {
               actions: actions.length ? actions : undefined,
               patches: patches.length ? patches : undefined,
               stopped: wasStopped || undefined,
+              messageId,
             },
           ]);
         }
@@ -219,6 +225,24 @@ export default function AskOEPanel() {
       }
     },
     [beginTurn, ctx, endTurn, handlePatch, serverAcknowledgedStop, sessionId, streaming]
+  );
+
+  const rate = useCallback(
+    (msgIdx: number, value: "up" | "down" | null) => {
+      const target = messages[msgIdx];
+      if (!sessionId || !target?.messageId) return;
+      const previous = target.feedback ?? null;
+      const apply = (v: "up" | "down" | null) =>
+        setMessages((prev) =>
+          prev.map((m, i) => (i === msgIdx ? { ...m, feedback: v } : m))
+        );
+      apply(value);
+      setMessageFeedback(sessionId, target.messageId, value).catch(() => {
+        apply(previous);
+        setError("Couldn't save your rating.");
+      });
+    },
+    [messages, sessionId]
   );
 
   const undoPatch = useCallback(
@@ -333,6 +357,12 @@ export default function AskOEPanel() {
                 content={m.content}
                 actions={m.actions}
                 stopped={m.stopped}
+                feedback={m.feedback}
+                onFeedback={
+                  m.role === "assistant" && m.messageId && sessionId
+                    ? (v) => rate(i, v)
+                    : undefined
+                }
               />
               {m.patches?.map((card, j) => (
                 <PatchCard key={j} card={card} onUndo={() => undoPatch(i, j)} />

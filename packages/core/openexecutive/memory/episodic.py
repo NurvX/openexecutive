@@ -276,6 +276,22 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
                 if "duplicate column" not in str(exc).lower():
                     raise
 
+        # Attunement: who actually sent each message (the resolved rostered
+        # Person, never the session owner's principal fallback) and the
+        # explicit thumbs up/down on an assistant reply. Both nullable; legacy
+        # rows stay NULL and are never used for per-person learning.
+        for col, ddl in (
+            ("sender_person_id", "INTEGER"),
+            ("feedback", "TEXT"),
+            ("feedback_note", "TEXT"),
+        ):
+            if col not in _cm_existing:
+                try:
+                    conn.execute(f"ALTER TABLE chat_messages ADD COLUMN {col} {ddl}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+
         # Phase 4 additive columns for scheduled_actions only.
         _sa_existing = {
             row["name"]
@@ -310,6 +326,24 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
             "CREATE INDEX IF NOT EXISTS idx_scheduled_scope_key "
             "ON scheduled_actions(scope_key, created_at DESC) "
             "WHERE scope_key IS NOT NULL"
+        )
+
+        # Attunement: per-UTC-day ceiling on open-loop extraction model calls.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS attunement_usage ("
+            "  day TEXT PRIMARY KEY,"
+            "  calls INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+
+        # Attunement open loops: at most one OPEN loop per scope_key. Closing a
+        # loop clears awaiting_response_since, which takes it out of the index,
+        # so the same ask can be reopened later. The insert path relies on this
+        # to dedupe concurrent extraction passes (INSERT hits IntegrityError).
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_scheduled_open_loop_scope "
+            "ON scheduled_actions(scope_key) "
+            "WHERE kind = 'open_loop' AND awaiting_response_since IS NOT NULL"
         )
 
         # Multi-user scoping: tag each session with the Person who started it
@@ -1533,6 +1567,10 @@ def last_contact_at_by_person(
             "FROM scheduled_actions "
             "WHERE assigned_to_person_id IS NOT NULL "
             "  AND status = 'done' "
+            # An open loop is a record of what someone owes, not a message
+            # we sent them — counting it would report contact that never
+            # happened.
+            "  AND kind != 'open_loop' "
             "GROUP BY assigned_to_person_id"
         ).fetchall()
     return {int(r["pid"]): r["last"] for r in rows}

@@ -5,9 +5,12 @@ import { type ReactNode, useEffect, useState } from "react";
 
 import {
   archivePerson,
+  closeOpenLoop,
   getPerson,
+  getPersonOpenLoops,
   updatePerson,
   type AvailabilityWindow,
+  type OpenLoop,
   type Person,
 } from "@/lib/api";
 
@@ -28,6 +31,82 @@ const ALL_SCOPES = [
 ];
 
 const CHANNELS = ["any", "slack", "discord", "telegram", "email"];
+
+// ---------------------------------------------------------------------------
+// Open loops — what this person owes (attunement)
+// ---------------------------------------------------------------------------
+
+function OpenLoopsSection({ personId }: { personId: number }) {
+  const [loops, setLoops] = useState<OpenLoop[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [closing, setClosing] = useState<number | null>(null);
+
+  useEffect(() => {
+    getPersonOpenLoops(personId)
+      .then(setLoops)
+      .catch((e) => setError(e instanceof Error ? e.message : "Failed to load"));
+  }, [personId]);
+
+  async function close(loopId: number) {
+    setClosing(loopId);
+    setError(null);
+    try {
+      await closeOpenLoop(loopId, "done");
+      setLoops((prev) => (prev ?? []).filter((l) => l.loop_id !== loopId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to close");
+    } finally {
+      setClosing(null);
+    }
+  }
+
+  const now = Date.now();
+  return (
+    <section className="mb-6">
+      <h2 className="text-xs font-semibold uppercase tracking-wide text-fg-muted mb-1">
+        Open loops
+      </h2>
+      <p className="text-xs text-fg-muted mb-3">
+        Things they committed to or were asked for in conversation. Overdue ones are
+        followed up automatically; close one once it&apos;s done.
+      </p>
+      {error && <p className="text-xs text-rose-300 mb-2">{error}</p>}
+      {loops === null ? (
+        !error && <p className="text-sm text-fg-muted">Loading…</p>
+      ) : loops.length === 0 ? (
+        <p className="text-sm text-fg-muted">Nothing open.</p>
+      ) : (
+        <div className="space-y-2">
+          {loops.map((l) => {
+            const overdue = new Date(l.due_at).getTime() <= now;
+            return (
+              <div
+                key={l.loop_id}
+                className="flex items-start justify-between gap-3 px-4 py-2.5 rounded-lg border border-line bg-surface-elevated text-sm"
+              >
+                <div className="min-w-0">
+                  <p className="text-fg">{l.description}</p>
+                  <p className={`text-xs mt-0.5 ${overdue ? "text-amber-300" : "text-fg-muted"}`}>
+                    {overdue ? "Overdue since " : "Due "}
+                    {new Date(l.due_at).toLocaleDateString()}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={closing === l.loop_id}
+                  onClick={() => close(l.loop_id)}
+                  className="flex-shrink-0 text-xs text-indigo-400 hover:text-indigo-300 disabled:opacity-50"
+                >
+                  {closing === l.loop_id ? "Closing…" : "Mark done"}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
 
 const WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
@@ -642,6 +721,8 @@ export default function PersonDetailPage() {
                   </div>
                 )}
               </section>
+
+              {!person.archived && <OpenLoopsSection personId={personId} />}
 
               {/* Archive */}
               {!person.is_principal && !person.archived && (

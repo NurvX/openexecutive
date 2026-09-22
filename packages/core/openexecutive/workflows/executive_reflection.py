@@ -146,6 +146,10 @@ def _build_reflection_system(configured: set[str], has_roster: bool = True) -> s
         "on the previous run. Do NOT re-act on or re-notify anyone about a "
         "signal listed there unless the input shows it changed since — "
         "repeating a DM or a proposal a day later is noise, not diligence. "
+        "OPEN LOOPS are commitments and asks people made in conversation; "
+        "the nudge engine already chases overdue ones, so don't DM about a "
+        "loop just because it's overdue — use them to connect signals or to "
+        "flag a slipped promise that matters for the brief. "
         "Open alerts carry the review verdict of your alert-review job "
         "(relevant / changed / likely_stale) and its recommended move; you "
         "never close alerts here (that job does, with evidence).\n\n"
@@ -178,6 +182,7 @@ def _render_reflection_context(
     recent_alerts: list[dict[str, Any]],
     external_signals: list[dict[str, Any]],
     previous_reflection: str | None = None,
+    open_loops: list[str] | None = None,
 ) -> str:
     """Pack /today + activity + open alerts + external signals into a
     single user-turn block for the LLM to reason over.
@@ -255,6 +260,14 @@ def _render_reflection_context(
             parts.append(line)
         parts.append("")
 
+    if open_loops:
+        # Pre-rendered, soonest-due first (attunement.open_loops). Overdue
+        # ones are already chased by the nudge engine; listing them lets the
+        # standup connect a slipped promise to the rest of the org state.
+        parts.append("OPEN LOOPS (what people owe, soonest due first):")
+        parts.extend(open_loops)
+        parts.append("")
+
     if previous_reflection:
         parts.append("YESTERDAY'S STANDUP (already handled — do not repeat):")
         parts.append(previous_reflection.strip()[:_PREVIOUS_REFLECTION_CHARS])
@@ -313,6 +326,17 @@ def _previous_reflection_artifact() -> str | None:
     except Exception:
         logger.debug("reflection: previous artifact lookup failed", exc_info=True)
         return None
+
+
+def _open_loop_lines() -> list[str]:
+    """Open loops for the standup; a lookup failure just omits the block."""
+    try:
+        from openexecutive.attunement.open_loops import render_for_reflection
+
+        return render_for_reflection(limit=10)
+    except Exception:
+        logger.debug("reflection: open loops lookup failed", exc_info=True)
+        return []
 
 
 class ExecutiveReflectionWorkflow(Workflow):
@@ -483,6 +507,7 @@ class ExecutiveReflectionWorkflow(Workflow):
             recent_alerts=recent_alerts,
             external_signals=external_signals,
             previous_reflection=_previous_reflection_artifact(),
+            open_loops=_open_loop_lines(),
         )
         roster = _render_team_roster(people)
         if roster:
@@ -527,6 +552,9 @@ class ExecutiveReflectionWorkflow(Workflow):
             "send_discord_dm",
             "send_telegram_message",
             "ack_alert",
+            # Same reasoning as ack_alert: loop descriptions are quoted from
+            # what people wrote, and nobody is watching this pass.
+            "close_open_loop",
         }
         tools = sorted(
             (t for t in _ALL_SKILL_TOOLS if t["name"] not in _excluded_dm),

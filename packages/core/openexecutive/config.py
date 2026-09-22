@@ -710,6 +710,24 @@ class Settings(BaseSettings):
     # for one scope_key, the scan stops emitting for it. 0 disables the cap.
     nudge_max_per_scope: int = Field(3, alias="NUDGE_MAX_PER_SCOPE")
 
+    # Attunement — per-person open loops. A teammate's "I'll send the quote by
+    # Thursday" (or the principal's "Sara will send it Monday") becomes an open
+    # loop the nudge engine's commitment source chases once it is due, and a
+    # later "sent it" from the same person closes it. Rows live in
+    # scheduled_actions (kind="open_loop"); see attunement/open_loops.py.
+    attunement_enabled: bool = Field(True, alias="ATTUNEMENT_ENABLED")
+    attunement_open_loops_enabled: bool = Field(True, alias="ATTUNEMENT_OPEN_LOOPS_ENABLED")
+    # When no due date is stated, the loop is due this many days after it opens.
+    attunement_loop_default_due_days: int = Field(2, alias="ATTUNEMENT_LOOP_DEFAULT_DUE_DAYS")
+    # Open loops older than this are closed as expired so a forgotten promise
+    # cannot sit in /today (and the nudge queue) forever.
+    attunement_loop_ttl_days: int = Field(21, alias="ATTUNEMENT_LOOP_TTL_DAYS")
+    attunement_max_open_loops_per_person: int = Field(
+        15, alias="ATTUNEMENT_MAX_OPEN_LOOPS_PER_PERSON"
+    )
+    # Ceiling on open-loop extraction model calls per UTC day, across everyone.
+    attunement_max_calls_per_day: int = Field(200, alias="ATTUNEMENT_MAX_CALLS_PER_DAY")
+
     # External-condition monitoring — heartbeat that polls source adapters
     # (vendor_status in PR-A; RSS + stock in PR-B) and emits external_signals
     # rows, then promotes qualifying signals into the existing alerts pipeline

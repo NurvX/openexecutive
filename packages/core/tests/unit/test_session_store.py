@@ -44,7 +44,8 @@ def test_save_and_load_messages(db: Path) -> None:
     msgs = load_messages("s1", db_path=db)
     assert len(msgs) == 2
     assert msgs[0] == {"role": "user", "content": "Hello there"}
-    assert msgs[1] == {"role": "assistant", "content": "Hi! How can I help?"}
+    assert msgs[1]["role"] == "assistant" and msgs[1]["content"] == "Hi! How can I help?"
+    assert isinstance(msgs[1]["id"], int)
 
 
 def test_message_count_in_list(db: Path) -> None:

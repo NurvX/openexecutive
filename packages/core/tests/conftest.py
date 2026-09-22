@@ -32,6 +32,22 @@ def reset_active_gateway():
     set_active_gateway(None)
 
 
+@pytest.fixture(autouse=True)
+def _no_background_open_loop_pass(monkeypatch: pytest.MonkeyPatch):
+    """Keep the post-turn open-loop pass from firing in unrelated tests.
+
+    Every Executive turn schedules it fire-and-forget; left live it would make
+    a provider call with the fake key and write audit / usage rows into the
+    default ``./episodic_memory.db`` (the audit-pollution trap in CLAUDE.md).
+    Tests of the pass itself call ``run_open_loop_pass`` directly, or undo
+    this patch."""
+    monkeypatch.setattr(
+        "openexecutive.attunement.open_loops.schedule_open_loop_pass",
+        lambda *args, **kwargs: None,
+    )
+    yield
+
+
 @pytest.fixture
 def install_source_feed(monkeypatch: pytest.MonkeyPatch):
     """Point one monitoring source adapter's bounded fetch at a canned body.

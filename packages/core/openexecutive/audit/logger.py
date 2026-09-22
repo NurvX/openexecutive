@@ -60,6 +60,7 @@ EVENT_TYPES: tuple[str, ...] = (
     "committee_review",     # committee-reviewed draft + critiques (pre-existing emit, now declared)
     "peer_memory",          # Honcho per-person memory — prefetch + sync_turn outcomes
     "memory_extraction",    # episodic extractor — proposed / stored / dropped per pass
+    "attunement",           # open loops opened / closed / expired, 👍/👎 on replies
 )
 
 

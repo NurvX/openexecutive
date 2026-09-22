@@ -1453,6 +1453,90 @@ peer_memory:
     - "Session ids passed to the provider must match ^[a-zA-Z0-9_-]+$; the wrapper sanitizes channel-shaped ids before send."
     - "Fire-and-forget background tasks (sync_turn, sync_department_turn, append_department_note) snapshot the audit ContextVars (session_id, turn_id) at scheduling time and re-bind inside the coroutine — without this, the audit rows land with session_id=NULL and are invisible in the per-session view."
 
+attunement:
+  what: |
+    The Executive adapting to each person it works with
+    (`openexecutive.attunement`). First piece: open loops — commitments and
+    asks from ANYONE on the roster, tracked until done and chased when they
+    slip. Complements Honcho (facts / stated preferences) rather than
+    duplicating it; works with HONCHO_ENABLED=false (the default).
+  why: |
+    Commitments used to be captured only from the principal's words
+    (`episodic.should_extract` requires is_principal) because stored messages
+    didn't record who said them, and nothing in production set
+    `scheduled_actions.awaiting_response_since`, so the nudge engine's
+    commitment source never fired on a real install.
+  attribution: |
+    `chat_messages.sender_person_id` = the RESOLVED rostered sender of a user
+    message, never the session owner (Discord/Telegram sessions from
+    unrostered senders are owned by the principal for sidebar visibility;
+    attribution keeps outsiders' words from being read as the principal's).
+    Web passes `_resolve_caller_person_id` (header-less = principal's CLI/API
+    surface; unrostered email header = None); Slack/Discord/Telegram pass the
+    sender they resolved. `Executive.stream_chat` / committee set
+    `Session.caller_person_id = person_id` every turn for tool handlers.
+    Email / Google Chat don't persist chat_messages (known gap) but the
+    open-loop hook lives in the Executive, so they still open/close loops.
+  feedback: |
+    `chat_messages.feedback` up|down (+ `feedback_note`) via
+    POST /sessions/{id}/messages/{message_id}/feedback — session's own caller
+    or the principal only (403 otherwise). SSE `done` carries `message_id`;
+    AskOEPanel renders 👍/👎. `load_messages` adds `id` (+ `feedback`) to
+    assistant rows only. Audited as event_type `attunement`, op=feedback.
+    Stored for later per-person learning; nothing consumes it yet.
+  open_loops:
+    module: openexecutive.attunement.open_loops
+    pass: |
+      `schedule_open_loop_pass` after every turn with a resolved rostered,
+      non-archived speaker (both Executive paths, beside
+      schedule_extraction). Keyword prefilter → atomic daily budget
+      (`attunement_usage`, ATTUNEMENT_MAX_CALLS_PER_DAY=200) → one forced
+      `record_open_loops` tool call (routing model). Opens: commitment by the
+      speaker (owner=speaker); ask of a named rostered person; principal-
+      attributed commitment of a teammate. Closes: loops the speaker reports
+      done — own loops, or any when the principal speaks.
+    gates: |
+      Enforced in code: verbatim quote from the speaker's own message
+      (commitments via `_is_valid_user_commitment`, asks/closures by
+      normalized substring); owner resolves to exactly one rostered,
+      non-archived person; teammates can't attribute commitments to others
+      (hearsay); principal's own commitments left to the episodic extractor;
+      close ids must be in the closable set; per-owner cap
+      ATTUNEMENT_MAX_OPEN_LOOPS_PER_PERSON=15; due date clamped to 60 days,
+      default ATTUNEMENT_LOOP_DEFAULT_DUE_DAYS=2, date-only = 17:00 in
+      USER_TIMEZONE. Prompt says messages are data, not instructions.
+    storage: |
+      `scheduled_actions` row: kind='open_loop', channel='__internal__',
+      channel_ref='person:{id}', status inserted as 'done' (runner never
+      dispatches), assigned_to_person_id=owner, awaiting_response_since=due,
+      scope_key='loop:{owner}:{sha1(text)[:16]}'. Partial UNIQUE index
+      `idx_scheduled_open_loop_scope` (kind='open_loop' AND awaiting NOT
+      NULL) dedupes concurrent passes. Closing clears
+      awaiting_response_since (reopenable later).
+    readers: |
+      nudge_engine commitment source (chased once overdue);
+      `list_awaiting_replies_by_person` (/today awaiting counts, reflection's
+      people-waiting); excluded from `last_contact_at_by_person`;
+      `executive_reflection` OPEN LOOPS block (≤10, overdue flagged).
+    closing: |
+      Owner reports done (extraction pass); `close_open_loop` chat tool or
+      POST /open-loops/{id}/close (principal or owner only — unresolved
+      speakers and unattended sessions refused; tool withheld from
+      reflection); People page "Mark done"; `people.store.archive_person`
+      closes the owner's loops (live store only); TTL expiry
+      (ATTUNEMENT_LOOP_TTL_DAYS=21) at the start of every nudge scan.
+      Every open/close audited as event_type `attunement`.
+    tools: list_open_loops, close_open_loop (orchestrator/open_loop_tools.py)
+    api: GET /people/{id}/open-loops, POST /open-loops/{loop_id}/close
+    reset: |
+      Loops live in scheduled_actions and attribution in chat_messages (both
+      already wiped by client-slot switches and reset_all_state);
+      `attunement_usage` added to `_BLANK_WIPE_TABLES` and reset_all_state.
+    tests: |
+      tests/conftest.py no-ops `schedule_open_loop_pass` for every test so
+      Executive turns don't call a provider or write default-DB rows; tests
+      of the pass call `run_open_loop_pass` directly.
+
 departments:
   module: openexecutive.departments
   store: openexecutive.departments.store (SQLite, shares episodic_memory.db)
@@ -1659,6 +1743,11 @@ scheduler:
          `updated_at` is older than NUDGE_STALLED_MIN_QUIET_HOURS.
       b) Stale commitments — `scheduled_actions` rows whose
          `awaiting_response_since` is older than NUDGE_COMMITMENT_STALE_DAYS.
+         `kind='open_loop'` rows (see `attunement:`) use it as a DUE time
+         and are chased as soon as it passes, with a check-in intent to
+         the loop's owner. Each scan first expires loops older than
+         ATTUNEMENT_LOOP_TTL_DAYS. Before open loops, nothing in
+         production set `awaiting_response_since`, so this source was idle.
       c) Idle initiatives — active initiatives untouched for
          NUDGE_INITIATIVE_IDLE_DAYS, owner resolved via the department's
          `head_person_id`. Skipped when the owning department's
