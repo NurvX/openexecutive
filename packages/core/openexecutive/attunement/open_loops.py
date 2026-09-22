@@ -84,6 +84,9 @@ _CLOSE_HINT = re.compile(
 
 _SELF_OWNER = {"me", "i", "myself", "self"}
 
+# Closure reasons that mean the thing was actually done.
+_DONE_REASONS = frozenset({"reported_done", "done"})
+
 # Attachment text is inlined into the message (``integrations.attachments``
 # labels each document "[Attached: <name>]"), before the words on some
 # channels and after on others. A quote found there is a document's words, not
@@ -315,12 +318,30 @@ def close_open_loop(
     if not resolved.exists():
         return False
     with _get_conn(resolved) as conn:
+        owner_row = conn.execute(
+            "SELECT assigned_to_person_id FROM scheduled_actions WHERE id = ? AND kind = ?",
+            (loop_id, OPEN_LOOP_KIND),
+        ).fetchone()
         cur = conn.execute(
             "UPDATE scheduled_actions SET awaiting_response_since = NULL "
             "WHERE id = ? AND kind = ? AND awaiting_response_since IS NOT NULL",
             (loop_id, OPEN_LOOP_KIND),
         )
         closed = cur.rowcount > 0
+    owner_id = owner_row["assigned_to_person_id"] if owner_row else None
+    # Only the owner's own "it's done" credits the chases. The principal
+    # tidying a loop away ("done" is the default in the UI and the tool) says
+    # nothing about whether the owner answered.
+    owner_did_it = reason == "reported_done" or (
+        reason in _DONE_REASONS and closed_by_person_id is not None
+        and closed_by_person_id == owner_id
+    )
+    if closed and owner_did_it:
+        # The chases for this loop landed: the owner (or the principal) says
+        # it's done. Other closures (expiry, archive, cancelled) prove nothing.
+        from openexecutive.attunement.outcomes import OUTCOME_ACTED, resolve_by_ref
+
+        resolve_by_ref(f"nudge:commitment:{loop_id}", OUTCOME_ACTED, db_path=db_path)
     if closed:
         _audit(
             f"open loop #{loop_id} closed ({reason})",

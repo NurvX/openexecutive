@@ -230,3 +230,37 @@ def close_open_loop_route(loop_id: int, body: OpenLoopClose, request: Request) -
     caller = _require_principal_or(loop.owner_person_id, request)
     close_open_loop(loop_id, reason=body.reason, closed_by_person_id=caller)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class OutreachStat(BaseModel):
+    source: str
+    label: str
+    sent: int
+    replied: int
+    acted: int
+    ignored: int
+    pending: int
+
+
+@router.get("/people/{person_id}/outreach", response_model=list[OutreachStat])
+def get_person_outreach(person_id: int, request: Request) -> list[OutreachStat]:
+    """How this person responded to proactive outreach over the last 30 days,
+    per kind of outreach. The principal or that person only."""
+    from openexecutive.attunement import outcomes
+
+    # Authorize first, so a non-principal can't probe which ids exist.
+    _require_principal_or(person_id, request)
+    if people_store.get_person(person_id) is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+    rows: list[OutreachStat] = []
+    for (_, source), s in sorted(outcomes.acceptance(person_id=person_id).items()):
+        rows.append(OutreachStat(
+            source=source,
+            label=outcomes.SOURCE_LABELS.get(source, source),
+            sent=s.sent,
+            replied=s.counts.get(outcomes.OUTCOME_REPLIED, 0),
+            acted=s.counts.get(outcomes.OUTCOME_ACTED, 0),
+            ignored=s.counts.get(outcomes.OUTCOME_IGNORED, 0),
+            pending=s.pending,
+        ))
+    return rows

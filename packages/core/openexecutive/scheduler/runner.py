@@ -793,12 +793,16 @@ async def _execute_action(
         )
 
         executive = Executive(mcp_gateway=gateway)
-        await executive.chat(
-            user_message=synthetic_message,
-            session=session,
-            retrieved_context=retrieved_context,
-            episodic_context=episodic_context,
-        )
+        from openexecutive.attunement.outcomes import tag_proactive
+
+        source, ref = _outreach_source(action)
+        with tag_proactive(source, ref):
+            await executive.chat(
+                user_message=synthetic_message,
+                session=session,
+                retrieved_context=retrieved_context,
+                episodic_context=episodic_context,
+            )
 
     except Exception as exc:
         logger.exception("scheduler: action %d failed", action.id)
@@ -1275,6 +1279,37 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
     # tick re-attempts on the same shape of input.
     mark_action_done(action.id)
     _enqueue_next_principal_brief(kind, after=datetime.now(UTC))
+
+
+def _outreach_source(action: ScheduledAction) -> tuple[str, str]:
+    """``(source, ref)`` for the outcome ledger of one dispatched action.
+
+    A nudge is keyed by its scope key (``nudge:<source>:<id>``) so closing the
+    thing it chased resolves it; a commitment nudge whose target is an open
+    loop is reported as an open-loop chase. Anything else is a scheduled
+    follow-up."""
+    from openexecutive.attunement import outcomes
+
+    if action.kind != "proactive_nudge" or not action.scope_key:
+        return outcomes.SOURCE_FOLLOWUP, f"action:{action.id}"
+    scope = action.scope_key
+    parts = scope.split(":")
+    kind = parts[1] if len(parts) > 2 else ""
+    if kind == "commitment":
+        from openexecutive.memory.episodic import get_scheduled_action
+
+        try:
+            target = get_scheduled_action(int(parts[2]))
+        except Exception:
+            # A malformed id or a lookup failure just means "not a loop".
+            target = None
+        if target is not None and target.kind == "open_loop":
+            return outcomes.SOURCE_OPEN_LOOP, scope
+        return outcomes.SOURCE_NUDGE_COMMITMENT, scope
+    return {
+        "stalled": outcomes.SOURCE_NUDGE_STALLED,
+        "initiative": outcomes.SOURCE_NUDGE_INITIATIVE,
+    }.get(kind, outcomes.SOURCE_FOLLOWUP), scope
 
 
 # --------------------------------------------------------------------------- #

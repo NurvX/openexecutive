@@ -61,7 +61,12 @@ def audit_events(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict]]
 def dms(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, str]]:
     sent: list[tuple[int, str]] = []
 
-    async def fake_dm(person_id: int, text: str, *, headline: str = "") -> tuple[bool, str]:
+    async def fake_dm(
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None
+    ) -> tuple[bool, str]:
+        # Every review DM must say which alert it is about, so acking or
+        # dismissing that alert can resolve it in the outcome ledger.
+        assert alert_id is not None
         sent.append((person_id, text))
         return True, "sent"
 
@@ -839,7 +844,9 @@ def test_draft_is_idempotent_across_passes(db: Path, monkeypatch) -> None:
 def test_failed_escalation_dm_is_not_counted_and_is_retried(db: Path, audit_events, monkeypatch) -> None:
     attempts: list[int] = []
 
-    async def flaky_dm(person_id: int, text: str, *, headline: str = "") -> tuple[bool, str]:
+    async def flaky_dm(
+        person_id: int, text: str, *, headline: str = "", alert_id: int | None = None
+    ) -> tuple[bool, str]:
         attempts.append(person_id)
         return (len(attempts) > 1), "ok" if len(attempts) > 1 else "no channel"
 

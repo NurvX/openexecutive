@@ -95,6 +95,13 @@ async def apply_resolution(
         logger.info("resumer.apply_resolution: run %s not awaiting_human (no-op)", run_id)
         return False
 
+    # The approver decided — however they did it (web, Slack, a reply) — so
+    # the nudges chasing this approval landed.
+    from openexecutive.attunement.outcomes import OUTCOME_ACTED, resolve_by_ref
+
+    # The ledger lives in the episodic store, not necessarily at `db_path`.
+    resolve_by_ref(f"nudge:stalled:{run_id}", OUTCOME_ACTED)
+
     audit_log(
         "human_resolution",
         f"WaitForHuman resolved: run_id={run_id} person={resolution.person_id} "

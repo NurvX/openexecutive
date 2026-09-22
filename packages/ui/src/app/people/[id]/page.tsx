@@ -8,9 +8,11 @@ import {
   closeOpenLoop,
   getPerson,
   getPersonOpenLoops,
+  getPersonOutreach,
   updatePerson,
   type AvailabilityWindow,
   type OpenLoop,
+  type OutreachStat,
   type Person,
 } from "@/lib/api";
 
@@ -31,6 +33,51 @@ const ALL_SCOPES = [
 ];
 
 const CHANNELS = ["any", "slack", "discord", "telegram", "email"];
+
+// ---------------------------------------------------------------------------
+// How they respond to outreach (attunement outcome ledger)
+// ---------------------------------------------------------------------------
+
+function OutreachSection({ personId }: { personId: number }) {
+  const [rows, setRows] = useState<OutreachStat[] | null>(null);
+
+  useEffect(() => {
+    getPersonOutreach(personId)
+      .then(setRows)
+      .catch(() => setRows([]));
+  }, [personId]);
+
+  if (!rows || rows.length === 0) return null;
+  return (
+    <section className="mb-6">
+      <h2 className="text-xs font-semibold uppercase tracking-wide text-fg-muted mb-1">
+        How they respond
+      </h2>
+      <p className="text-xs text-fg-muted mb-3">
+        Proactive messages over the last 30 days. Kinds they reliably ignore are
+        sent less often.
+      </p>
+      <div className="space-y-1.5">
+        {rows.map((r) => {
+          const answered = r.replied + r.acted;
+          const resolved = answered + r.ignored;
+          return (
+            <div
+              key={r.source}
+              className="flex items-center justify-between gap-3 px-4 py-2 rounded-lg border border-line bg-surface-elevated text-sm"
+            >
+              <span className="text-fg capitalize">{r.label}</span>
+              <span className="text-xs text-fg-muted">
+                {resolved > 0 ? `${answered} of ${resolved} answered` : "no answers yet"}
+                {r.pending > 0 ? ` · ${r.pending} pending` : ""}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Open loops — what this person owes (attunement)
@@ -723,6 +770,7 @@ export default function PersonDetailPage() {
               </section>
 
               {!person.archived && <OpenLoopsSection personId={personId} />}
+              {!person.archived && <OutreachSection personId={personId} />}
 
               {/* Archive */}
               {!person.is_principal && !person.archived && (

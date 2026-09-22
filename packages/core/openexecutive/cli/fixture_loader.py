@@ -773,15 +773,16 @@ async def reset_all_state(
             ),
         )
 
-        # Attunement's daily call counter. Created by initialize_db, which an
+        # Attunement's daily call counter and outcome ledger. Created by initialize_db, which an
         # older DB may not have run yet, so guarded per table (the helper
         # above only guards the file).
         if EPISODIC_DB_PATH.exists():
             with sqlite3.connect(str(EPISODIC_DB_PATH)) as _conn:
-                if _conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='attunement_usage'"
-                ).fetchone():
-                    _conn.execute("DELETE FROM attunement_usage")
+                for _table in ("attunement_usage", "proactive_outcomes"):
+                    if _conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_table,)
+                    ).fetchone():
+                        _conn.execute(f"DELETE FROM {_table}")
 
         # 3c. Knowledge review state (same DB as the episodic rows above). A
         # "factory reset" that keeps the previous operator's approvals,

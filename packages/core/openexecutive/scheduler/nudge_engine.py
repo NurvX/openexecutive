@@ -81,6 +81,9 @@ class NudgeCandidate:
     # fall back to the channel the original action already used.
     fallback_channel: str | None = None
     fallback_channel_ref: str | None = None
+    # Outcome-ledger source (attunement.outcomes.SOURCE_*) this nudge counts
+    # under, so the scan can rank by how this person answers that source.
+    outcome_source: str = ""
 
 
 @dataclass
@@ -159,6 +162,7 @@ def _select_stalled_workflow_candidates(
                 urgency_seconds=(awaiting_until - now).total_seconds(),
                 cooldown=cooldown,
                 person_id=int(person_id),
+                outcome_source="nudge_stalled",
             )
         )
     return out
@@ -239,6 +243,9 @@ def _select_stale_commitment_candidates(
                 department=r["department"] or "",
                 fallback_channel=r["channel"],
                 fallback_channel_ref=r["channel_ref"],
+                outcome_source=(
+                    "open_loop" if r["kind"] == "open_loop" else "nudge_commitment"
+                ),
             )
         )
     return out
@@ -333,6 +340,7 @@ def _select_idle_initiative_candidates(
                 cooldown=cooldown,
                 person_id=person_id,
                 department=slug,
+                outcome_source="nudge_initiative",
             )
         )
     return out
@@ -468,18 +476,53 @@ def _static_channel_for_person(
 # Scan orchestration
 # ---------------------------------------------------------------------------
 
+def _apply_outcome_feedback(
+    candidates: list[NudgeCandidate],
+    settings: Any,
+    *,
+    db_path: Path | None = None,
+) -> tuple[list[NudgeCandidate], set[str]]:
+    """Demote nudges a person reliably ignores, using the outcome ledger.
+
+    A candidate whose person left their last ``ATTUNEMENT_MUTE_MIN_SENDS``
+    resolved sends of the same source all unanswered gets a cooldown
+    ``ATTUNEMENT_MUTE_COOLDOWN_MULTIPLIER`` times longer and ranks after every
+    other candidate. It is never dropped outright, and a single answer lifts
+    it. Returns the candidates and the scope keys that were demoted."""
+    from dataclasses import replace
+
+    from openexecutive.attunement.outcomes import muted_pairs
+
+    min_sends = int(getattr(settings, "attunement_mute_min_sends", 5))
+    multiplier = max(1, int(getattr(settings, "attunement_mute_cooldown_multiplier", 3)))
+    muted = muted_pairs(min_sends=min_sends, db_path=db_path)
+    if not muted:
+        return candidates, set()
+    out: list[NudgeCandidate] = []
+    demoted: set[str] = set()
+    for c in candidates:
+        if c.person_id is not None and (c.person_id, c.outcome_source) in muted:
+            c = replace(c, cooldown=c.cooldown * multiplier)
+            demoted.add(c.scope_key)
+        out.append(c)
+    return out, demoted
+
+
 def _apply_caps(
     candidates: list[NudgeCandidate],
     *,
     max_total: int,
     max_per_person: int,
+    demoted: set[str] | None = None,
 ) -> list[NudgeCandidate]:
     """Sort by urgency, then truncate by per-person and global caps.
 
     `urgency_seconds` is ascending — smaller first (sooner deadline /
-    older awaiting_response_since / older updated_at).
+    older awaiting_response_since / older updated_at). Candidates in
+    ``demoted`` (sources this person reliably ignores) rank after all others.
     """
-    ranked = sorted(candidates, key=lambda c: c.urgency_seconds)
+    demoted = demoted or set()
+    ranked = sorted(candidates, key=lambda c: (c.scope_key in demoted, c.urgency_seconds))
     per_person: dict[int, int] = defaultdict(int)
     accepted: list[NudgeCandidate] = []
     for c in ranked:
@@ -517,6 +560,14 @@ async def run_nudge_scan(
         expire_open_loops(now, ttl_days=settings.attunement_loop_ttl_days, db_path=db_path)
     except Exception:
         logger.exception("nudge_engine: open-loop expiry failed")
+    # Resolve proactive outreach nobody answered as ignored, so this scan's
+    # ranking sees it.
+    try:
+        from openexecutive.attunement.outcomes import sweep_ignored
+
+        sweep_ignored(now, after_hours=settings.attunement_ignore_after_hours, db_path=db_path)
+    except Exception:
+        logger.exception("nudge_engine: outcome sweep failed")
 
     candidates: list[NudgeCandidate] = []
     try:
@@ -557,10 +608,17 @@ async def run_nudge_scan(
     if not candidates:
         return 0
 
+    demoted: set[str] = set()
+    try:
+        candidates, demoted = _apply_outcome_feedback(candidates, settings, db_path=db_path)
+    except Exception:
+        logger.exception("nudge_engine: outcome feedback failed — ranking by urgency only")
+
     ranked = _apply_caps(
         candidates,
         max_total=settings.nudge_max_per_scan,
         max_per_person=settings.nudge_max_per_person_per_scan,
+        demoted=demoted,
     )
 
     emitted = 0

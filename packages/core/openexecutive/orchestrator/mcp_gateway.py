@@ -594,12 +594,16 @@ def _record_email_outbound_context(arguments: dict[str, Any]) -> None:
                 norm = addr.strip().lower()
                 if not norm or norm == self_addr or norm in seen:
                     continue
+                # Only the first "to" address is who the email was addressed
+                # to; every recipient still gets reply linkage.
+                primary = field == "to" and not seen
                 seen.add(norm)
                 _record_outbound_context(
                     channel="email",
                     channel_ref=norm,
                     text=body,
                     outbound_message_id=None,
+                    record_outcome=primary,
                 )
     except Exception:
         logger.exception(

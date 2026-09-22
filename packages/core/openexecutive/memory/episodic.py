@@ -336,6 +336,36 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
             ")"
         )
 
+        # Attunement outcome ledger: one row per proactive DM to a rostered
+        # person, resolved replied / acted / dismissed / ignored
+        # (attunement/outcomes.py).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS proactive_outcomes ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  created_at TEXT NOT NULL,"
+            "  person_id INTEGER NOT NULL,"
+            "  source TEXT NOT NULL,"
+            "  ref TEXT,"
+            "  channel TEXT NOT NULL,"
+            "  channel_ref TEXT NOT NULL,"
+            "  outbound_context_id INTEGER,"
+            "  outcome TEXT,"
+            "  resolved_at TEXT"
+            ")"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_outcomes_person "
+            "ON proactive_outcomes(person_id, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_outcomes_ref "
+            "ON proactive_outcomes(ref) WHERE ref IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_outcomes_ctx "
+            "ON proactive_outcomes(outbound_context_id) WHERE outbound_context_id IS NOT NULL"
+        )
+
         # Attunement open loops: at most one OPEN loop per scope_key. Closing a
         # loop clears awaiting_response_since, which takes it out of the index,
         # so the same ask can be reopened later. The insert path relies on this
@@ -555,6 +585,8 @@ def store_initiative(
                 "INSERT INTO initiatives (title, status, created_at, updated_at, summary, department) VALUES (?, ?, ?, ?, ?, ?)",
                 (title, status, now, now, summary, department),
             )
+    if existing:
+        _resolve_initiative_outreach(int(existing["id"]), db_path)
     # Mirror only on a new initiative OR a real status transition.
     # Idempotent upserts (same title + same status) don't fire — that
     # would spam the dept peer with redundant notes on every routine
@@ -797,7 +829,17 @@ def update_initiative(
         cursor = conn.execute(
             f"UPDATE initiatives SET {set_clause} WHERE id = ?", values
         )
-        return cursor.rowcount > 0
+        updated = cursor.rowcount > 0
+    if updated:
+        _resolve_initiative_outreach(initiative_id, db_path)
+    return updated
+
+
+def _resolve_initiative_outreach(initiative_id: int, db_path: Path | None) -> None:
+    """An initiative got an update, so the check-in nudges about it landed."""
+    from openexecutive.attunement.outcomes import OUTCOME_ACTED, resolve_by_ref
+
+    resolve_by_ref(f"nudge:initiative:{initiative_id}", OUTCOME_ACTED, db_path=db_path)
 
 
 def update_advice(
@@ -1012,7 +1054,13 @@ def mark_outbound_context_consumed(
             "WHERE id = ? AND status = 'open'",
             (datetime.now(UTC).isoformat(), context_id),
         )
-        return cursor.rowcount > 0
+        consumed = cursor.rowcount > 0
+    if consumed:
+        # A matched reply is the clearest sign a proactive DM landed.
+        from openexecutive.attunement.outcomes import OUTCOME_REPLIED, resolve_by_outbound_context
+
+        resolve_by_outbound_context(context_id, OUTCOME_REPLIED, db_path=db_path)
+    return consumed
 
 
 def scope_key_in_use(scope_key: str, db_path: Path | None = None) -> bool:
