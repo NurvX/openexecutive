@@ -36,8 +36,8 @@ COPY packages/core/pyproject.toml packages/core/uv.lock ./
 # README.md out of it — copying it here busts the cache for the full dep
 # install and the baked models below on every README edit, #81); the project
 # itself is registered further down. `--inexact` stops uv removing packages
-# the lock does not know about — `uv` itself was pip-installed above and the
-# fastembed warm-up below adds more. UV_PROJECT_ENVIRONMENT=/usr/local targets
+# the lock does not know about — at this point that is `uv` itself (pip-
+# installed above) plus pip and setuptools. UV_PROJECT_ENVIRONMENT=/usr/local targets
 # the system interpreter's prefix, so the packages land in system
 # site-packages exactly as before: the model bakes below and the runtime CMD
 # rely on that.

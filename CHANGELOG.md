@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   present because `sentence-transformers` needs it, and the container runs on
   CPU hosts, but the default Linux wheel is the CUDA build and pulled in
   nineteen packages the image never used — fifteen `nvidia-*` libraries,
-  three `cuda-*` shims and triton, about 2.6 GB of compressed wheels. torch
+  three `cuda-*` shims and triton, about 2.2 GB of compressed wheels. torch
   now resolves from PyTorch's CPU index (2.13.0 → 2.14.0+cpu on Linux, plain
   2.14.0 on macOS, both from that index) and the Dockerfile installs from the
   lock with `uv sync` instead of an exported requirements file, so each

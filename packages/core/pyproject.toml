@@ -79,8 +79,8 @@ exclude = ["tests/"]
 
 # torch is only here because sentence-transformers needs it, and the API runs
 # on CPU hosts. The default PyPI wheel on Linux is the CUDA build, which drags
-# in ~2.6 GB of NVIDIA libraries the container never uses and roughly triples
-# the image. Resolve torch alone from PyTorch's CPU-only index instead.
+# in ~2.2 GB of wheels the container never uses (~2.0 GB of NVIDIA libraries,
+# plus triton) and roughly triples the image. Resolve torch alone from PyTorch's CPU-only index instead.
 # `explicit = true` keeps every other package on PyPI.
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
