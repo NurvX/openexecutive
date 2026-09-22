@@ -22,34 +22,30 @@ RUN uvx --from git+https://github.com/SenteLabsAI/extensible-mcp extensible-mcp 
     || true
 
 COPY packages/core/pyproject.toml packages/core/uv.lock ./
-# Install exactly what uv.lock pins. `uv pip install -r pyproject.toml` never
-# reads the lockfile — it re-resolves the loose ranges in pyproject.toml
-# against PyPI at build time, so the image drifted from the versions CI
-# tests (#87). `--locked` (NOT `--frozen`, which skips the check) fails the
-# build if uv.lock is stale relative to pyproject.toml — run `uv lock` and
-# commit. The exported `--hash` lines are verified by `uv pip install`; `-q`
-# stops uv echoing the whole export into the build log. Stay on `--system`:
-# the model bakes below and the runtime CMD rely on system site-packages.
-# (The fastembed install further down is a separate, unpinned resolution
-# into the same env; today it moves nothing because the locked versions
-# already satisfy its constraints.)
-# No fallback and no README.md in this layer: a silent fallback previously
-# masked failures while also needing README.md copied here — which busts the
-# cache (full dep install + baked embedding models below) on every README
-# edit (#81). Let a real break fail loudly.
-# torch is pinned to the CPU-only build (`+cpu`, see [tool.uv.sources] in
-# pyproject.toml), which lives on PyTorch's own index, not PyPI. `uv export`
-# does not write index URLs into requirements.txt, so the install has to be
-# told where to look. `unsafe-best-match` is required alongside the extra
-# index: uv's default first-index strategy stops at PyPI as soon as it sees
-# any torch release there and never reaches the `+cpu` wheel. The exported
-# `--hash` lines still verify every download, so the strategy name is scarier
-# than the effect.
-RUN uv export --locked --no-dev --no-emit-project -q -o requirements.txt \
-    && uv pip install --system \
-        --index-strategy unsafe-best-match \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
-        -r requirements.txt
+# Install exactly what uv.lock pins, straight from the lock. `uv sync` honours
+# the lock's per-package index (torch comes from PyTorch's CPU-only index,
+# everything else from PyPI — see [tool.uv.sources] in pyproject.toml) and
+# verifies the lock's hashes, so no index or strategy flags are needed here.
+# The previous `uv export` + `uv pip install -r` shape could not do this:
+# the export carries no index URLs, and adding the CPU index at install time
+# made uv fetch every package that mirror also hosts (numpy, sympy, jinja2,
+# requests, ...) from download.pytorch.org instead of PyPI.
+# `--locked` (NOT `--frozen`, which skips the check) fails the build if
+# uv.lock is stale relative to pyproject.toml — run `uv lock` and commit.
+# `--no-install-project`: the source is not in this layer yet (and this keeps
+# README.md out of it — copying it here busts the cache for the full dep
+# install and the baked models below on every README edit, #81); the project
+# itself is registered further down. `--inexact` stops uv removing packages
+# the lock does not know about — `uv` itself was pip-installed above and the
+# fastembed warm-up below adds more. UV_PROJECT_ENVIRONMENT=/usr/local targets
+# the system interpreter's prefix, so the packages land in system
+# site-packages exactly as before: the model bakes below and the runtime CMD
+# rely on that.
+# (The fastembed install further down is a separate, unpinned resolution into
+# the same env; today it moves nothing because the locked versions already
+# satisfy its constraints.)
+RUN UV_PROJECT_ENVIRONMENT=/usr/local \
+    uv sync --locked --no-dev --no-install-project --inexact
 
 # Bake the embedding model the MCP gateway loads at startup
 # (sentence-transformers/all-MiniLM-L6-v2). Without this the ~90 MB model is
