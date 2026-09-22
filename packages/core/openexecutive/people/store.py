@@ -466,6 +466,23 @@ def list_people(
         return [_row_to_person(row, conn) for row in rows]
 
 
+def is_principal_or_self(
+    caller_person_id: int | None, person_id: int | None, db_path: Path | None = None
+) -> bool:
+    """Whether ``caller_person_id`` may act on something ``person_id`` owns:
+    it is that person, or the principal. An unresolved caller never may, and
+    something with no owner (``person_id`` None) is the principal's alone.
+
+    The one authorization rule behind closing an open loop and rating a reply,
+    kept here so the chat tools and the HTTP routes cannot drift apart."""
+    if caller_person_id is None:
+        return False
+    if person_id is not None and caller_person_id == person_id:
+        return True
+    caller = get_person(caller_person_id, db_path=db_path)
+    return bool(caller is not None and caller.is_principal and not caller.archived)
+
+
 def archive_person(person_id: int, db_path: Path | None = None) -> bool:
     """Soft-delete a person. Returns True if a row was found and archived."""
     with _get_conn(db_path) as conn:

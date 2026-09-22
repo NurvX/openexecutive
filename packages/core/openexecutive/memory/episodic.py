@@ -1449,9 +1449,14 @@ def list_scheduled_actions(
     status: str | None = None,
     limit: int = 100,
     order: str = "asc",
+    exclude_internal: bool = False,
     db_path: Path | None = None,
 ) -> list[ScheduledAction]:
     """List scheduled actions, optionally filtered by status.
+
+    ``exclude_internal`` drops ``__internal__``-channel rows in SQL, so a
+    caller that only wants real sends (the activity feed) is not starved by
+    internal rows — open loops, heartbeats — filling its ``limit``.
 
     `order` sorts by `run_at`: "asc" (default) puts the soonest-due pending
     rows first — the right default for the upcoming queue; "desc" puts the
@@ -1464,17 +1469,19 @@ def list_scheduled_actions(
     resolved = _resolve_db_path(db_path)
     if not resolved.exists():
         return []
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    if exclude_internal:
+        clauses.append("channel != '__internal__'")
+    where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
     with _get_conn(resolved) as conn:
-        if status is None:
-            rows = conn.execute(
-                f"SELECT * FROM scheduled_actions ORDER BY run_at {direction} LIMIT ?",
-                (limit,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                f"SELECT * FROM scheduled_actions WHERE status = ? ORDER BY run_at {direction} LIMIT ?",
-                (status, limit),
-            ).fetchall()
+        rows = conn.execute(
+            f"SELECT * FROM scheduled_actions {where}ORDER BY run_at {direction} LIMIT ?",
+            (*params, limit),
+        ).fetchall()
     return [ScheduledAction(**dict(row)) for row in rows]
 
 
@@ -1541,7 +1548,12 @@ def list_awaiting_replies_by_person(
             "  AND assigned_to_person_id IS NOT NULL "
             "  AND status IN ('pending', 'done') "
             "  AND kind != 'proactive_nudge' "
-            "GROUP BY assigned_to_person_id"
+            # An open loop's awaiting_response_since is its DUE time: until
+            # then nobody is waiting on the owner (the nudge engine uses the
+            # same cut-off).
+            "  AND NOT (kind = 'open_loop' AND awaiting_response_since > ?) "
+            "GROUP BY assigned_to_person_id",
+            (datetime.now(UTC).isoformat(),),
         ).fetchall()
     return {int(r["pid"]): (int(r["cnt"]), r["oldest"]) for r in rows}
 

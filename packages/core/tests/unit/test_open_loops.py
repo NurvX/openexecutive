@@ -365,13 +365,82 @@ async def test_close_tool_requires_principal_or_owner(team: SimpleNamespace) -> 
     assert await call_as(team.principal) == "closed"
 
 
-async def test_list_tool_returns_loops(team: SimpleNamespace) -> None:
+async def _list_as(caller: int | None, *, session_id: str = "s", web: bool = False,
+                   person_id: int | None = None) -> dict[str, Any]:
     from openexecutive.orchestrator.open_loop_tools import handle_list_open_loops
+    from openexecutive.orchestrator.schedule_tools import current_session
+    from openexecutive.orchestrator.session import Session
 
+    token = current_session.set(
+        Session(session_id=session_id, caller_person_id=caller, from_web_chat=web)
+    )
+    try:
+        args = {} if person_id is None else {"person_id": person_id}
+        result: dict[str, Any] = json.loads(await handle_list_open_loops(args))
+        return result
+    finally:
+        current_session.reset(token)
+
+
+def _owners(result: dict[str, Any]) -> set[int]:
+    return {lp["owner_person_id"] for lp in result.get("open_loops", [])}
+
+
+async def test_list_tool_principal_sees_all_only_in_private(team: SimpleNamespace) -> None:
     open_loops.open_loop(owner_person_id=team.sara, description="send the quote", due_at=datetime.now(UTC))
-    out = json.loads(await handle_list_open_loops({"person_id": team.sara}))
-    assert out["open_loops"][0]["owner"] == "Sara Kim"
-    assert json.loads(await handle_list_open_loops({"person_id": team.ben}))["open_loops"] == []
+    open_loops.open_loop(owner_person_id=team.ben, description="send the plan", due_at=datetime.now(UTC))
+    everyone = {team.sara, team.ben}
+    assert _owners(await _list_as(team.principal, web=True)) == everyone
+    assert _owners(await _list_as(team.principal, session_id="slack:dm:U_PAT")) == everyone
+    assert _owners(await _list_as(team.principal, session_id="discord:dm:1")) == everyone
+    assert _owners(await _list_as(team.principal, session_id="telegram:42")) == everyone
+    # Shared surfaces: a list there is read by everyone present.
+    for shared in ("slack:channel:C1:U_PAT", "slack:thread:C1:1.2", "discord:thread:9",
+                   "telegram:-100", "email:thread-1", "google_chat:spaces/x:t"):
+        assert _owners(await _list_as(team.principal, session_id=shared)) == set(), shared
+
+
+async def test_list_tool_teammate_sees_only_their_own(team: SimpleNamespace) -> None:
+    open_loops.open_loop(owner_person_id=team.sara, description="send the quote", due_at=datetime.now(UTC))
+    open_loops.open_loop(owner_person_id=team.ben, description="send the plan", due_at=datetime.now(UTC))
+    assert _owners(await _list_as(team.sara, web=True)) == {team.sara}
+    assert _owners(await _list_as(team.sara, session_id="slack:dm:U_SARA")) == {team.sara}
+    assert (await _list_as(team.sara, web=True, person_id=team.ben))["status"] == "refused"
+    assert (await _list_as(None, web=True))["status"] == "refused"
+
+
+async def test_paraphrased_loop_text_is_dropped(
+    team: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The quote is verbatim but the stored text is the model's own wording.
+    _install_provider(monkeypatch, {"loops": [{
+        "owner": "me", "kind": "commitment", "text": "deliver pricing to the vendor",
+        "due_date": None, "quote": "I'll send the vendor quote by Thursday",
+    }], "closed": []})
+    counts = await _run("I'll send the vendor quote by Thursday.", team.sara)
+    assert counts == {"opened": 0, "closed": 0, "dropped": 1}
+
+
+def test_open_loops_route_is_principal_or_owner(
+    team: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi import HTTPException
+
+    from openexecutive.api.routes import chat as chat_route
+    from openexecutive.api.routes import people as route
+
+    def call(caller: int | None) -> int:
+        monkeypatch.setattr(chat_route, "_resolve_caller_person_id", lambda req: caller)
+        try:
+            route.get_person_open_loops(team.sara, request=None)  # type: ignore[arg-type]
+            return 200
+        except HTTPException as exc:
+            return exc.status_code
+
+    assert call(team.sara) == 200
+    assert call(team.principal) == 200
+    assert call(team.ben) == 403
+    assert call(None) == 403
 
 
 def test_reflection_is_not_given_the_close_tool() -> None:
@@ -389,10 +458,10 @@ def test_feedback_route_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(route, "get_session_owner", lambda sid: (True, 5))
     monkeypatch.setattr(route, "set_message_feedback", lambda *a, **k: True)
-    principal = SimpleNamespace(is_principal=True)
-    teammate = SimpleNamespace(is_principal=False)
+    principal = SimpleNamespace(is_principal=True, archived=False)
+    teammate = SimpleNamespace(is_principal=False, archived=False)
     monkeypatch.setattr("openexecutive.people.store.get_person",
-                        lambda pid: principal if pid == 1 else teammate)
+                        lambda pid, db_path=None: principal if pid == 1 else teammate)
     body = route.MessageFeedback(feedback="down")
 
     def call(caller: int | None) -> int:
@@ -417,3 +486,91 @@ def test_close_open_loop_chip_only_when_closed() -> None:
     for status in ("refused", "not_open", "not_found"):
         assert summarize_action(tool_name="close_open_loop", tool_input={"loop_id": 4},
                                 tool_result=json.dumps({"status": status})) is None
+
+
+def test_close_route_is_principal_or_owner(
+    team: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi import HTTPException
+
+    from openexecutive.api.routes import chat as chat_route
+    from openexecutive.api.routes import people as route
+
+    def call(caller: int | None) -> int:
+        loop_id = open_loops.open_loop(owner_person_id=team.sara, description="send the quote",
+                                       due_at=datetime.now(UTC))
+        assert loop_id is not None
+        monkeypatch.setattr(chat_route, "_resolve_caller_person_id", lambda req: caller)
+        try:
+            route.close_open_loop_route(loop_id, route.OpenLoopClose(), request=None)  # type: ignore[arg-type]
+            return 204
+        except HTTPException as exc:
+            open_loops.close_open_loop(loop_id, reason="cleanup")
+            return exc.status_code
+
+    assert call(team.ben) == 403
+    assert call(None) == 403
+    assert call(team.sara) == 204
+    assert call(team.principal) == 204
+
+
+def test_is_principal_or_self(team: SimpleNamespace) -> None:
+    assert people_store.is_principal_or_self(team.sara, team.sara)
+    assert people_store.is_principal_or_self(team.principal, team.sara)
+    assert not people_store.is_principal_or_self(team.ben, team.sara)
+    assert not people_store.is_principal_or_self(None, team.sara)
+    # Something with no owner belongs to the principal alone.
+    assert people_store.is_principal_or_self(team.principal, None)
+    assert not people_store.is_principal_or_self(team.sara, None)
+
+
+def test_owner_resolution_never_falls_back_from_an_unknown_full_name(team: SimpleNamespace) -> None:
+    roster = people_store.list_people()
+    speaker = people_store.get_person(team.principal)
+    assert open_loops._resolve_owner("Ben", speaker=speaker, roster=roster).id == team.ben
+    assert open_loops._resolve_owner("ben ortiz", speaker=speaker, roster=roster).id == team.ben
+    # "Ben Jones from Acme" is not the rostered Ben Ortiz.
+    assert open_loops._resolve_owner("Ben Jones", speaker=speaker, roster=roster) is None
+
+
+def test_turn_with_attached_document_is_skipped() -> None:
+    doc = "summarise this\n\n[Attached: plan.pdf]\nSara will send the numbers Monday."
+    assert not open_loops.should_run(doc, has_open_loops=True)
+    assert not open_loops.should_run("[Attached: a.pdf]\nI'll send it Friday\n\nthoughts?",
+                                     has_open_loops=False)
+
+
+def test_not_yet_due_loop_is_not_awaiting(team: SimpleNamespace) -> None:
+    open_loops.open_loop(owner_person_id=team.sara, description="send the quote",
+                         due_at=datetime.now(UTC) + timedelta(days=2))
+    assert team.sara not in episodic.list_awaiting_replies_by_person()
+    open_loops.open_loop(owner_person_id=team.ben, description="send the plan",
+                         due_at=datetime.now(UTC) - timedelta(hours=1))
+    assert episodic.list_awaiting_replies_by_person()[team.ben][0] == 1
+
+
+def test_activity_listing_can_skip_internal_rows(team: SimpleNamespace) -> None:
+    for i in range(5):
+        open_loops.open_loop(owner_person_id=team.sara, description=f"send item {i}",
+                             due_at=datetime.now(UTC))
+    episodic.insert_scheduled_action(run_at=datetime.now(UTC).isoformat(), channel="slack_dm",
+                                     channel_ref="U_SARA", intent_text="ping", status="done")
+    rows = episodic.list_scheduled_actions(status="done", limit=1, order="desc", exclude_internal=True)
+    assert [r.channel for r in rows] == ["slack_dm"]
+
+
+def test_engagement_followups_ignore_open_loops(team: SimpleNamespace) -> None:
+    open_loops.open_loop(owner_person_id=team.sara, description="send the quote", due_at=datetime.now(UTC))
+    with sqlite3.connect(str(episodic.DB_PATH)) as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM scheduled_actions WHERE status = 'done' AND kind != 'open_loop'"
+        ).fetchone()[0]
+    assert n == 0
+
+
+def test_get_open_loop_and_archive_close_beyond_list_limit(team: SimpleNamespace) -> None:
+    ids = [open_loops.open_loop(owner_person_id=team.sara, description=f"deliver thing {i}",
+                                due_at=datetime.now(UTC)) for i in range(3)]
+    assert open_loops.get_open_loop(ids[-1]).owner_person_id == team.sara  # type: ignore[union-attr]
+    assert open_loops.close_loops_for_person(team.sara, reason="owner_archived") == 3
+    assert open_loops.get_open_loop(ids[-1]) is None

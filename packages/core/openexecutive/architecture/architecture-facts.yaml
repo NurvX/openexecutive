@@ -1496,6 +1496,12 @@ attunement:
       attributed commitment of a teammate. Closes: loops the speaker reports
       done — own loops, or any when the principal speaks.
     gates: |
+      Turns carrying an attached document ("[Attached: …]") are skipped: its
+      text is inlined into the message (prepended on Telegram/Discord,
+      appended on web), so a quote could be the document's words.
+      Owner resolution: exact full name, or a UNIQUE first name only when the
+      model gave a single token — never a first-name fallback from an unknown
+      full name.
       Enforced in code: verbatim quote from the speaker's own message
       (commitments via `_is_valid_user_commitment`, asks/closures by
       normalized substring); owner resolves to exactly one rostered,
@@ -1516,7 +1522,10 @@ attunement:
     readers: |
       nudge_engine commitment source (chased once overdue);
       `list_awaiting_replies_by_person` (/today awaiting counts, reflection's
-      people-waiting); excluded from `last_contact_at_by_person`;
+      people-waiting) — only once due; excluded from
+      `last_contact_at_by_person`, engagement_activity followups_completed,
+      and the /today activity feed (`list_scheduled_actions(exclude_internal=
+      True)` filters in SQL so loops can't starve its window);
       `executive_reflection` OPEN LOOPS block (≤10, overdue flagged).
     closing: |
       Owner reports done (extraction pass); `close_open_loop` chat tool or
@@ -1526,8 +1535,25 @@ attunement:
       closes the owner's loops (live store only); TTL expiry
       (ATTUNEMENT_LOOP_TTL_DAYS=21) at the start of every nudge scan.
       Every open/close audited as event_type `attunement`.
-    tools: list_open_loops, close_open_loop (orchestrator/open_loop_tools.py)
-    api: GET /people/{id}/open-loops, POST /open-loops/{loop_id}/close
+    tools: |
+      list_open_loops, close_open_loop (orchestrator/open_loop_tools.py).
+      Visibility: the principal sees everyone's loops only on a private surface
+      (web chat, slack:dm:, discord:dm:, telegram:<positive id>); shared
+      channels/threads, Telegram groups, Google Chat spaces and email threads
+      show only the caller's own; unresolved caller refused. Security review
+      finding (PR #175): an ungated list leaked what everyone owed into
+      public channels.
+    authorization: |
+      One helper, `people.store.is_principal_or_self(caller, owner)`, backs
+      close_open_loop, list visibility, GET /people/{id}/open-loops,
+      POST /open-loops/{id}/close and the feedback route. Owner None =
+      principal only.
+    verbatim_text: |
+      The stored loop `text` must itself appear verbatim in the speaker's
+      message (drop reason `text_not_verbatim`): it is re-injected into the
+      nudge intent a tool-using turn executes, so a model paraphrase could
+      smuggle instructions. The nudge intent also says to treat it as data.
+    api: GET /people/{id}/open-loops, POST /open-loops/{loop_id}/close (both principal-or-owner)
     reset: |
       Loops live in scheduled_actions and attribution in chat_messages (both
       already wiped by client-slot switches and reset_all_state);

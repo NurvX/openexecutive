@@ -15,6 +15,7 @@ from openexecutive.memory.session_store import (
     load_messages,
     set_message_feedback,
 )
+from openexecutive.people.store import is_principal_or_self
 
 router = APIRouter()
 
@@ -77,14 +78,8 @@ def post_message_feedback(
     if not exists:
         raise HTTPException(status_code=404, detail="Session not found")
     caller = _resolve_caller_person_id(request)
-    if caller is None:
-        raise HTTPException(status_code=403, detail="Caller is not on the roster")
-    if caller != owner:
-        from openexecutive.people.store import get_person
-
-        person = get_person(caller)
-        if person is None or not person.is_principal:
-            raise HTTPException(status_code=403, detail="Not your session")
+    if not is_principal_or_self(caller, owner):
+        raise HTTPException(status_code=403, detail="Not your session")
     if not set_message_feedback(session_id, message_id, body.feedback, body.note):
         raise HTTPException(status_code=404, detail="Message not found")
 
