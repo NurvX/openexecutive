@@ -6,8 +6,9 @@ disk will host it: `docker compose` on a single box, a container platform, or a
 Kubernetes deployment.
 
 [docker/docker-compose.yml](../docker/docker-compose.yml) is the reference
-topology. It is also what `make docker` runs locally, so the local and deployed
-shapes are the same.
+topology. It is also what `make docker` runs locally, with one difference: the
+compose UI is a `next dev` server on a bind mount, not the production image
+from `Dockerfile.ui`.
 
 ---
 
@@ -54,7 +55,7 @@ thing that builds `Dockerfile.ui`.
 | Tag | Set by | Meaning |
 |---|---|---|
 | `X.Y.Z`, `X.Y` | pushing git tag `vX.Y.Z` | A release. Pin deployments to one of these. |
-| `latest` | pushing git tag `vX.Y.Z` | The newest release. |
+| `latest` | pushing git tag `vX.Y.Z` | The most recently published release, by push order, not the highest version. Pushing a `v0.2.1` patch after `v0.3.0` moves `latest` back to `0.2.1`. |
 | `main` | every push to `main` | Current head of `main`; not a release. |
 | `sha-<short>` | every push | The commit the image was built from. |
 | `buildcache` | every push | BuildKit layer cache. Not an image; ignore it. |

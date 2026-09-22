@@ -31,19 +31,22 @@ on:
     branches: [main]
     # Semver only. A bare `v*` would accept `v0.2` or `vnext`, which
     # metadata-action's semver rules ignore, giving a green run that
-    # published no release tags.
-    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
+    # published no release tags. In these patterns `*` is any run of
+    # characters and `+` means one-or-more of the preceding class, so
+    # `[0-9]+` is what pins each component to digits.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
 
 permissions:
   contents: read
   packages: write
 
-# Keyed on the commit, not the ref: `git push origin main v0.2.0` delivers a
-# branch push and a tag push for the same SHA, and both write `sha-<short>`.
-# Serialising them keeps that tag pointing at one build. Never cancel a
-# half-pushed release.
+# Keyed on the ref so consecutive pushes to main run in order and a slow
+# older build cannot overwrite the `main` tag after a faster newer one.
+# (`git push origin main v0.2.0` starts a branch run and a tag run for the
+# same commit in different groups; both write `sha-<short>` from the same
+# source, which is harmless.) Never cancel a half-pushed release.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.sha }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
