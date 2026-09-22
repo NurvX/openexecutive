@@ -94,10 +94,11 @@ jobs:
             type=sha
 
       # Layer cache lives in the registry under a `buildcache` tag, not the
-      # Actions cache: the API image's dependency layers (torch and CUDA
-      # wheels, two baked embedding models) run to several GB, and the Actions
-      # cache is 10 GB per repository, so a `type=gha,mode=max` export would
-      # evict itself and the UI's cache on every run.
+      # Actions cache: the API image's dependency layers (torch, two baked
+      # embedding models, a second venv) still run to well over a GB even on
+      # the CPU-only torch build, and the Actions cache is 10 GB per
+      # repository shared across everything, so a `type=gha,mode=max` export
+      # would churn it and evict the UI's cache.
       # provenance=false keeps each tag a plain single-platform image; the
       # default attestation manifest shows up as an `unknown/unknown` row on
       # the package page.
