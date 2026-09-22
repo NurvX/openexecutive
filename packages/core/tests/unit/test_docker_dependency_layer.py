@@ -48,6 +48,7 @@ DEPENDENCY_LAYER_SOURCES = frozenset({"packages/core/pyproject.toml", "packages/
 SYSTEM_PREFIX = "/usr/local"
 ENV_ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(\S*)$")
 # `name==version` as `uv sync --dry-run` plans it (`torch==2.14.0+cpu`).
+CPU_TORCH_INDEX = "https://download.pytorch.org/whl/cpu"
 PLAN_LINE = re.compile(r"^\s*\+\s+([A-Za-z0-9_.-]+)==(\S+)$")
 
 
@@ -250,13 +251,32 @@ def test_plan_pins_every_runtime_dependency_with_a_hashed_lock_entry(
 
 
 def test_plan_installs_the_cpu_only_torch_build(planned: dict[str, str]) -> None:
-    """The container runs on CPU hosts; the CUDA build is ~2.6 GB of wheels it never uses."""
+    """The container runs on CPU hosts; the CUDA build is ~2.2 GB of wheels it never uses.
+
+    The dry run resolves for the machine running the test, so the planned torch
+    version differs by host: ``2.14.0+cpu`` on Linux (CI, the image), plain
+    ``2.14.0`` on macOS, where PyTorch's CPU index publishes no ``+cpu`` tag.
+    Asserting ``+cpu`` on the plan failed every Mac run. What must hold on every
+    host is that torch resolves from the CPU-only index, and that the Linux
+    entry — the one the image installs — is the ``+cpu`` build.
+    """
     assert "torch" in planned, sorted(planned)
-    assert planned["torch"].endswith("+cpu"), (
-        f"torch resolved to {planned['torch']!r}, not the CPU-only build; check [tool.uv.sources] "
-        "in pyproject.toml and that torch is still a direct dependency (uv ignores sources for "
+    torch_entries = [p for p in _lock()["package"] if _normalize(p["name"]) == "torch"]
+    assert torch_entries, "torch is missing from uv.lock"
+    not_cpu_index = sorted(
+        entry["version"]
+        for entry in torch_entries
+        if entry.get("source", {}).get("registry") != CPU_TORCH_INDEX
+    )
+    assert not not_cpu_index, (
+        f"torch {not_cpu_index} resolves from outside {CPU_TORCH_INDEX}; check [tool.uv.sources] in "
+        "pyproject.toml and that torch is still a direct dependency (uv ignores sources for "
         "transitive packages)"
     )
+    assert any(entry["version"].endswith("+cpu") for entry in torch_entries), (
+        f"no +cpu torch build in uv.lock for Linux: {[e['version'] for e in torch_entries]}"
+    )
+    assert planned["torch"] in {entry["version"] for entry in torch_entries}, planned["torch"]
     gpu_only = sorted(name for name in planned if name.startswith("nvidia-") or name in {"triton"})
     assert not gpu_only, f"GPU-only packages would ship in the image: {gpu_only}"
 

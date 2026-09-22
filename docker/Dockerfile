@@ -18,11 +18,17 @@ RUN pip install uv
 
 # Pre-warm the extensible-mcp gateway so the API does not have to clone
 # from GitHub on every cold start. We use the EXACT invocation the
-# gateway uses at runtime (`uvx --from git+...`) — `uv tool install`
-# populates a different cache and does not help here. `|| true` keeps
-# the build green if GitHub is briefly unreachable; uvx will retry at
-# runtime.
-RUN uvx --from git+https://github.com/SenteLabsAI/extensible-mcp extensible-mcp --help \
+# gateway uses at runtime (`uvx --from git+...@<commit>`) — `uv tool install`
+# populates a different cache and does not help here. The arguments must match
+# _EXTENSIBLE_MCP_LAUNCH_ARGS in orchestrator/mcp_gateway.py (a unit test
+# enforces it): the commit pins extensible-mcp's code and --exclude-newer pins
+# the resolution of its dependencies, so the cache holds exactly what the
+# runtime launches and the gateway can start with no network. That holds only
+# if this step succeeded: `|| true` keeps the build green if GitHub is briefly
+# unreachable, and such an image fetches the commit — and needs network — on
+# its first gateway start. `uv` itself (installed above) is not pinned.
+RUN uvx --exclude-newer 2026-09-22T00:00:00Z \
+        --from git+https://github.com/SenteLabsAI/extensible-mcp@ac2001a09646a8044210042e12e62974f4c9687c extensible-mcp --help \
     || true
 
 COPY packages/core/pyproject.toml packages/core/uv.lock ./

@@ -3621,6 +3621,21 @@ integrations:
     the child's env block from its own environment. No separate service, deploy
     credential, or deploy job. See docs/deployment.md.
 
+    Pinned gateway: extensible-mcp is launched as `uvx --exclude-newer <cutoff>
+    --from git+...@<commit>` (_EXTENSIBLE_MCP_LAUNCH_ARGS in
+    orchestrator/mcp_gateway.py), and docker/Dockerfile pre-warms with the same
+    arguments. The commit fixes extensible-mcp's code; the cutoff fixes its ~94
+    transitive dependencies, which uvx otherwise re-resolves against PyPI on
+    every networked start. INVARIANT: runtime and pre-warm args must match —
+    tests/unit/test_extensible_mcp_pin.py enforces it. Unpinned, uvx resolved
+    `main` on GitHub at every start: a push to extensible-mcp changed every
+    running deployment on restart, an image rollback did not roll the gateway
+    back, and a start without network failed. The no-network start holds only
+    when the build-time pre-warm succeeded: it is `|| true`, so an image built
+    during a GitHub outage fetches the commit at first start. uv itself is
+    unpinned (`pip install uv`). The repo has no tags; bump the commit and
+    cutoff together. Dependabot does not track git URLs.
+
     Cold-start embedding cache: extensible-mcp runs as a uvx subprocess and
     builds a tool-search vector index with fastembed, which loads
     Qdrant/all-MiniLM-L6-v2-onnx (fastembed remaps the name
