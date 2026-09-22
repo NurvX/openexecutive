@@ -15,8 +15,35 @@ from openexecutive.config import get_settings, mcp_config_file_present
 logger = logging.getLogger(__name__)
 
 _UVX_CMD = "uvx"
-_EXTENSIBLE_MCP_GIT = "git+https://github.com/SenteLabsAI/extensible-mcp"
+# Pinned to a commit, not the default branch. Unpinned, uvx resolved `main` on
+# GitHub at every container start, so a published image ran whatever the
+# gateway repo held that day: a push there changed every deployment on its next
+# restart, rolling back an image tag did not roll the gateway back, and a start
+# with no network failed outright because only GitHub can say what `main` is.
+# The repo has no release tags, so a commit is the only stable ref.
+#
+# The commit alone fixes extensible-mcp's own code, not its dependencies: uvx
+# re-resolves its ~94 transitive packages against PyPI's version ranges on
+# every networked start, so a new release of any of them would still reach
+# running deployments on restart. `--exclude-newer` freezes that resolution to
+# packages published before the cutoff, which also makes the Dockerfile's
+# pre-warm cache exactly what the runtime resolves — so a start needs no
+# network when that best-effort pre-warm succeeded. Bump the commit and the
+# cutoff together, deliberately; tests/unit/
+# test_extensible_mcp_pin.py fails if docker/Dockerfile's pre-warm drifts from
+# _EXTENSIBLE_MCP_LAUNCH_ARGS.
+_EXTENSIBLE_MCP_REV = "ac2001a09646a8044210042e12e62974f4c9687c"
+_EXTENSIBLE_MCP_EXCLUDE_NEWER = "2026-09-22T00:00:00Z"
+_EXTENSIBLE_MCP_GIT = f"git+https://github.com/SenteLabsAI/extensible-mcp@{_EXTENSIBLE_MCP_REV}"
 _EXTENSIBLE_MCP_CMD = "extensible-mcp"
+# Everything after `uvx` up to the command, shared with docker/Dockerfile's pre-warm.
+_EXTENSIBLE_MCP_LAUNCH_ARGS = (
+    "--exclude-newer",
+    _EXTENSIBLE_MCP_EXCLUDE_NEWER,
+    "--from",
+    _EXTENSIBLE_MCP_GIT,
+    _EXTENSIBLE_MCP_CMD,
+)
 
 # Env vars forwarded into the extensible-mcp subprocess. The MCP stdio client
 # (mcp.client.stdio) does NOT pass our environment through: when
@@ -668,7 +695,7 @@ class MCPGateway:
         forwarded_env = {k: os.environ[k] for k in _FORWARDED_ENV_VARS if k in os.environ}
         params = StdioServerParameters(
             command=_UVX_CMD,
-            args=["--from", _EXTENSIBLE_MCP_GIT, _EXTENSIBLE_MCP_CMD, "--config", str(config_path)],
+            args=[*_EXTENSIBLE_MCP_LAUNCH_ARGS, "--config", str(config_path)],
             env=forwarded_env or None,
         )
         self._stdio_cm = stdio_client(params)

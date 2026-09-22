@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The MCP gateway runs a pinned extensible-mcp commit.** It was launched from
+  the repo's default branch, so every container start ran whatever that
+  branch held that day: a versioned image did not pin its gateway, rolling
+  back an image did not roll the gateway back, and a start without network
+  failed. The gateway and the image's pre-warm now launch the same commit
+  with the same `--exclude-newer` cutoff, which also freezes extensible-mcp's
+  own dependencies (uvx re-resolved those against PyPI on every start), and a
+  unit test keeps the two in step. An image whose pre-warm succeeded now
+  starts the gateway without network; the pre-warm is still best-effort, so
+  a build during a GitHub outage ships an image that fetches it at first
+  start. Updating the gateway is a deliberate bump of the commit and cutoff.
+
 ## [0.2.1] - 2026-09-22
 
 ### Changed
