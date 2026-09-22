@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The compose health check no longer fails on a healthy API.** It runs
+  `curl -f http://localhost:8000/health` inside the API container, but the
+  image never installed `curl`, so the check failed on every run and compose
+  reported a working API as unhealthy. The API image now includes `curl`.
+
 ## [0.2.1] - 2026-09-22
 
 ### Changed

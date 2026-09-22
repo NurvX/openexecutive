@@ -6,8 +6,12 @@ WORKDIR /app
 # `uvx --from git+...`, which clones the repo. Without git, MCP startup
 # fails with "Git executable not found" and uvicorn exits before the
 # health check passes.
+# curl is required by the health check in docker/docker-compose.yml
+# (`curl -f http://localhost:8000/health`). python:3.11-slim does not ship it,
+# so that check failed on every run and compose marked a working API
+# unhealthy. git already pulls in libcurl, so this adds only the binary.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
+    && apt-get install -y --no-install-recommends git curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install uv
