@@ -21,10 +21,12 @@ Honcho knows about the person and this block carries only what their own
 reactions show.
 
 **Style only.** Rules come from what people wrote, so they are validated in
-code before they are stored: a length cap, one line, and a deny-list that
-rejects anything that reads as an instruction to act (send, approve, pay…),
-names a tool or a person on the roster, or carries a URL, handle, amount or
-markup. The block says the current request always wins and that the rules
+code before they are stored: a length cap, one line of Latin-script text, a
+deny-list that rejects anything that reads as an instruction to act (send,
+approve, pay…) or to act without checking (skip confirming, proceed), names
+a tool or a person on the roster, or carries a URL, handle, amount or
+markup — and an allowlist: the rule must name some aspect of how a reply
+reads (length, format, tone, detail, what to lead with…). The block says the current request always wins and that the rules
 never authorize an action, and it only ever reaches that person's own turns.
 
 **Pacing.** A pass runs in the background after an attributed turn once
@@ -99,7 +101,37 @@ _DENY_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"prompt|prompts|tool|tools|jailbreak)\b",
         re.IGNORECASE,
     ),
+    # Nudges toward acting without checking — "skip confirming and just
+    # proceed" names no action verb but loosens every tool-capable turn.
+    re.compile(
+        r"\b(confirm\w*|permission\w*|proceed\w*|autonom\w*|judg(e)?ment|"
+        r"go ahead|without (asking|checking)|ask(ing)? first|check(ing)? (with|first)|"
+        r"act|acts|acting|action|actions|decide|decides|deciding|decision|decisions|"
+        r"authori[sz]\w*|allow\w*|always do|do it)\b",
+        re.IGNORECASE,
+    ),
 )
+
+# ...and must be about the writing: every rule names at least one aspect of
+# how a reply looks or reads.
+_STYLE_TOPIC = re.compile(
+    r"\b(reply|replies|answer|answers|response|responses|message|messages|"
+    r"summar\w*|bullet\w*|list|lists|table|tables|heading\w*|headline\w*|"
+    r"paragraph\w*|sentence\w*|word|words|length|long|longer|short|shorter|brief|"
+    r"concise|terse|verbose|detail\w*|depth|format\w*|structure\w*|tone|formal|"
+    r"casual|friendly|direct|blunt|plain|jargon|technical|explain\w*|example\w*|"
+    r"preamble|recap\w*|context|number|numbers|figures|data|lead|first|up front|"
+    r"recommendation\w*|options|emoji\w*|language|wording|simple|clear)\b",
+    re.IGNORECASE,
+)
+
+
+def _non_latin_letter(text: str) -> bool:
+    """Letters outside the Latin script — look-alikes (Cyrillic "а" in
+    "аpprove") would otherwise slip a denied word past the regexes."""
+    return any(
+        ch.isalpha() and not unicodedata.name(ch, "").startswith("LATIN") for ch in text
+    )
 
 _SYSTEM = """You maintain a short working-style profile for one person who talks \
 to an executive assistant: how the assistant's replies should be written for \
@@ -326,9 +358,13 @@ def rule_rejection(text: str, *, roster_names: list[str] | None = None) -> str |
         return "too_short"
     if len(text) > RULE_MAX_CHARS:
         return "too_long"
+    if _non_latin_letter(text):
+        return "non_latin_letters"
     for pattern in _DENY_PATTERNS:
         if pattern.search(text):
             return "denied_content"
+    if not _STYLE_TOPIC.search(text):
+        return "not_about_style"
     lowered = text.lower()
     for name in roster_names if roster_names is not None else _roster_names():
         if re.search(rf"\b{re.escape(name)}\b", lowered):
@@ -561,6 +597,24 @@ async def _call_model(model: str, turn: str) -> dict[str, Any]:
     return {}
 
 
+def _accept_rules(
+    payload: dict[str, Any], evidence: dict[int, _Evidence]
+) -> tuple[list[StyleRule], list[dict[str, str]]]:
+    """The model's rules that pass validation (deduped, at most MAX_RULES),
+    and why each of the others was dropped."""
+    roster = _roster_names()
+    kept: list[StyleRule] = []
+    dropped: list[dict[str, str]] = []
+    raw_rules = payload.get("rules")
+    for item in raw_rules if isinstance(raw_rules, list) else []:
+        accepted = _accept_rule(item, evidence, roster)
+        if isinstance(accepted, str):
+            dropped.append({"reason": accepted})
+        elif len(kept) < MAX_RULES and accepted.text.lower() not in {r.text.lower() for r in kept}:
+            kept.append(accepted)
+    return kept, dropped
+
+
 def _style_enabled(settings: Any) -> bool:
     return bool(settings.attunement_enabled and settings.attunement_style_enabled)
 
@@ -608,16 +662,7 @@ async def run_style_pass(
                session_id=session_id or None)
         return result
 
-    roster = _roster_names()
-    kept: list[StyleRule] = []
-    dropped: list[dict[str, str]] = []
-    raw_rules = payload.get("rules")
-    for item in raw_rules if isinstance(raw_rules, list) else []:
-        accepted = _accept_rule(item, by_id, roster)
-        if isinstance(accepted, str):
-            dropped.append({"reason": accepted})
-        elif len(kept) < MAX_RULES and accepted.text.lower() not in {r.text.lower() for r in kept}:
-            kept.append(accepted)
+    kept, dropped = _accept_rules(payload, by_id)
     # An empty answer means "nothing clear", not "forget everything": a
     # flaky call must not wipe rules the evidence supported yesterday.
     replace = bool(kept) and [r.text for r in kept] != [r.text for r in profile.rules]

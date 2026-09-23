@@ -88,6 +88,7 @@ function OutreachSection({ personId }: { personId: number }) {
 // ---------------------------------------------------------------------------
 
 const MAX_STYLE_RULES = 4;
+const STYLE_TEXTAREA_ROWS = 4;
 
 function WorkingStyleSection({ personId }: { personId: number }) {
   const [style, setStyle] = useState<WorkingStyle | null>(null);
@@ -183,7 +184,7 @@ function WorkingStyleSection({ personId }: { personId: number }) {
           <textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            rows={MAX_STYLE_RULES}
+            rows={STYLE_TEXTAREA_ROWS}
             placeholder="One rule per line, e.g. Lead with the recommendation, then the numbers."
             className="w-full px-3 py-2 rounded-lg border border-line bg-surface-elevated text-sm text-fg"
           />

@@ -1627,10 +1627,15 @@ attunement:
       carries a reaction; basis stated → quote verbatim (NFKC, casefold) in a
       cited message. Honcho is not read or written.
     validation: |
-      rule_rejection(): 8-160 chars; deny-list (URLs/domains, @handles,
-      currency, <>{}[]`, snake_case, action verbs send/approve/pay/schedule/
-      delete..., ignore/override/instructions/prompt/tool, secrets) and roster
-      names (full and first names >=3 chars). PUT edits use the same check
+      rule_rejection(): 8-160 chars; Latin-script letters only (confusables
+      like Cyrillic "а" would dodge the regexes); deny-list (URLs/domains,
+      @handles, currency, <>{}[]`, snake_case, action verbs send/approve/pay/
+      schedule/delete..., act-without-checking words confirm/proceed/go ahead/
+      judgment/decide/allow..., ignore/override/instructions/prompt/tool,
+      secrets) and roster names (full and first names >=3 chars); allowlist
+      _STYLE_TOPIC — must name a reply aspect (length/format/tone/detail/lead...).
+      Security review: a verb deny-list alone let "skip confirming and just
+      proceed" through; the allowlist + act-without-checking list close it. PUT edits use the same check
       (422). build_style_block scrubs with utils.prompt_blocks.scrub_block_line
       (shared with honcho _block_safe_line).
     pacing: |
