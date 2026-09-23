@@ -1,4 +1,5 @@
-# Publish the API and UI container images to GitHub Container Registry.
+# Publish the API and UI container images to GitHub Container Registry, and
+# on a version tag also create the GitHub Release.
 #
 # Every push to main refreshes the rolling `main` tag; pushing a `vX.Y.Z` git
 # tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`) publishes the versioned
@@ -17,6 +18,12 @@
 # own main, and a third-party fork would fail with a 403 pushing to the
 # hardcoded ghcr.io/sentelabsai/* names. A fork that wants its own images
 # changes the guard and the image names.
+#
+# A `vX.Y.Z` tag also creates the GitHub Release once both images are
+# published, using that version's CHANGELOG.md section as the notes, so the
+# changelog entry must be merged before the commit is tagged. A tag alone
+# never shows under Releases. If the images fail, no release is created; if a
+# release for the tag already exists (made by hand), the job leaves it alone.
 #
 # linux/amd64 only. The API image bakes torch plus two embedding-model caches
 # (see docker/Dockerfile); building that under arm64 emulation is impractically
@@ -113,3 +120,39 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ matrix.image }}:buildcache
           cache-to: type=registry,ref=${{ matrix.image }}:buildcache,mode=max
+
+  release:
+    name: GitHub Release
+    needs: publish
+    if: github.repository == 'SenteLabsAI/OpenExecutive' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The notes are the tag's `## [X.Y.Z]` section of CHANGELOG.md, up to
+      # the next heading or the link references at the bottom. A tag with no
+      # changelog section fails here rather than publishing an empty release.
+      - name: Create release from the changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving it as is."
+            exit 0
+          fi
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            found { print }
+          ' CHANGELOG.md | sed '/./,$!d' > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no [$version] section"
+            exit 1
+          fi
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md

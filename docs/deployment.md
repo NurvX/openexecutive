@@ -75,6 +75,13 @@ from the Actions UI. Nothing bumps the version strings in
 `packages/core/pyproject.toml` or `packages/ui/package.json` for you; update
 them in the release commit.
 
+Once both images are published, the same run creates the GitHub Release for
+the tag, with that version's `CHANGELOG.md` section as the notes. So merge the
+changelog entry before tagging: a tag with no `## [X.Y.Z]` section fails that
+job instead of publishing an empty release. If the images fail, no release is
+created; re-running the failed job from the Actions UI creates it once the
+images succeed. A release that already exists for the tag is left alone.
+
 The images are `linux/amd64` only. The API image bakes the embedding models at
 build time (see the Dockerfile), which makes an emulated arm64 build
 impractically slow.
