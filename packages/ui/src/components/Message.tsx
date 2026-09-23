@@ -41,8 +41,13 @@ function FeedbackButtons({
         aria-pressed={active}
         title={label}
         onClick={() => onChange(active ? null : kind)}
-        className={`px-1.5 py-0.5 rounded text-xs transition-colors ${
-          active ? "bg-surface-overlay text-fg" : "text-fg-muted hover:text-fg"
+        // An emoji ignores the text colour, so selection has to show some
+        // other way: unselected ones are greyed out, the selected one is in
+        // full colour on a ringed chip. Sized as a comfortable tap target.
+        className={`min-w-[2rem] min-h-[2rem] px-2 rounded-md text-sm transition-all ${
+          active
+            ? "bg-indigo-500/15 ring-1 ring-indigo-400/70"
+            : "grayscale opacity-50 hover:opacity-100 hover:grayscale-0"
         }`}
       >
         {glyph}
@@ -50,9 +55,14 @@ function FeedbackButtons({
     );
   };
   return (
-    <div className="mt-2 flex gap-1" aria-label="Rate this reply">
+    <div className="mt-2 flex items-center gap-1" aria-label="Rate this reply">
       {button("up", "👍", "Helpful")}
       {button("down", "👎", "Not helpful")}
+      {value && (
+        <span className="ml-1 text-xs text-fg-muted" role="status">
+          {value === "up" ? "Marked helpful" : "Marked not helpful"}
+        </span>
+      )}
     </div>
   );
 }
