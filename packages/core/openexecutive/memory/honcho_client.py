@@ -1288,8 +1288,9 @@ def _block_safe_line(line: str) -> str:
     closing tag. Control and format characters go (the newline is handled by
     the caller), and a literal closing tag is defanged so the block cannot
     be ended early."""
-    cleaned = "".join(ch for ch in line if unicodedata.category(ch) not in ("Cc", "Cf"))
-    return cleaned.replace(_PEER_MEMORY_CLOSE, "<\\/peer_memory>").strip()
+    from openexecutive.utils.prompt_blocks import scrub_block_line
+
+    return scrub_block_line(line, _PEER_MEMORY_CLOSE)
 
 
 def _render_peer_context(card: list[str], representation: str, *, max_chars: int) -> str:

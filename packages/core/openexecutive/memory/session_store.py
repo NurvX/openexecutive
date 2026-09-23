@@ -84,20 +84,24 @@ def set_message_feedback(
     feedback: str | None,
     note: str | None = None,
     db_path: Path = DB_PATH,
+    by_person_id: int | None = None,
 ) -> bool:
     """Record 👍/👎 (or clear it with ``None``) on one assistant message.
 
     Scoped by ``session_id`` as well as the id so a caller cannot rate a
     message in a session it does not own by guessing ids. Returns False when
-    no assistant message matched."""
+    no assistant message matched. ``by_person_id`` is who left it (the
+    resolved caller), so per-person learning reads only a person's own
+    reactions."""
     if feedback is not None and feedback not in FEEDBACK_VALUES:
         raise ValueError(f"feedback must be one of {sorted(FEEDBACK_VALUES)} or None")
     clean_note = (note or "").strip()[:_FEEDBACK_NOTE_MAX] or None
     with _get_conn(db_path) as conn:
         cur = conn.execute(
-            "UPDATE chat_messages SET feedback = ?, feedback_note = ? "
+            "UPDATE chat_messages SET feedback = ?, feedback_note = ?, feedback_by_person_id = ? "
             "WHERE id = ? AND session_id = ? AND role = 'assistant'",
-            (feedback, clean_note if feedback is not None else None, message_id, session_id),
+            (feedback, clean_note if feedback is not None else None,
+             by_person_id if feedback is not None else None, message_id, session_id),
         )
         return cur.rowcount > 0
 

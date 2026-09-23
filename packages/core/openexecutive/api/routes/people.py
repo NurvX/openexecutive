@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
@@ -21,6 +22,9 @@ from openexecutive.people.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from openexecutive.attunement.style import StyleProfile
 
 router = APIRouter()
 
@@ -264,3 +268,93 @@ def get_person_outreach(person_id: int, request: Request) -> list[OutreachStat]:
             pending=s.pending,
         ))
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Working style (attunement) — how this person likes replies
+# ---------------------------------------------------------------------------
+
+
+class WorkingStyleRule(BaseModel):
+    text: str
+    basis: str
+
+
+class WorkingStyleOut(BaseModel):
+    rules: list[WorkingStyleRule]
+    locked: bool
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
+class WorkingStyleIn(BaseModel):
+    rules: list[str] = Field(default_factory=list, max_length=4)
+    locked: bool = False
+
+
+def _style_out(profile: StyleProfile) -> WorkingStyleOut:
+    return WorkingStyleOut(
+        rules=[WorkingStyleRule(text=r.text, basis=r.basis) for r in profile.rules],
+        locked=profile.locked,
+        updated_at=profile.updated_at,
+        updated_by=profile.updated_by,
+    )
+
+
+def _style_person(person_id: int, request: Request) -> int:
+    """Authorize (principal or that person), then 404 an unknown id."""
+    caller = _require_principal_or(person_id, request)
+    if people_store.get_person(person_id) is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+    return caller
+
+
+@router.get("/people/{person_id}/attunement", response_model=WorkingStyleOut)
+def get_person_working_style(person_id: int, request: Request) -> WorkingStyleOut:
+    """The short working-style rules pinned into this person's turns. The
+    principal or that person only."""
+    from openexecutive.attunement.style import get_profile
+
+    _style_person(person_id, request)
+    return _style_out(get_profile(person_id))
+
+
+@router.put("/people/{person_id}/attunement", response_model=WorkingStyleOut)
+def put_person_working_style(
+    person_id: int, body: WorkingStyleIn, request: Request
+) -> WorkingStyleOut:
+    """Replace the rules and set the lock. Rules pass the same style-only
+    checks as learned ones (they reach a tool-capable turn); a locked profile
+    is never rewritten by the learning pass."""
+    from openexecutive.attunement.style import (
+        BASIS_EDITED,
+        StyleRule,
+        save_profile,
+        validate_edited_rule,
+    )
+
+    caller = _style_person(person_id, request)
+    rules: list[StyleRule] = []
+    for raw in body.rules:
+        text, rejection = validate_edited_rule(raw)
+        if rejection:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Rule not accepted ({rejection}): keep each rule to one short "
+                "sentence about how replies are written — no actions, people, links "
+                "or amounts.",
+            )
+        if text.lower() not in {r.text.lower() for r in rules}:
+            rules.append(StyleRule(text=text, basis=BASIS_EDITED))
+    return _style_out(save_profile(person_id, rules, locked=body.locked,
+                                   updated_by=f"person:{caller}"))
+
+
+@router.delete("/people/{person_id}/attunement", status_code=status.HTTP_204_NO_CONTENT)
+def delete_person_working_style(person_id: int, request: Request) -> Response:
+    """Forget the rules and unlock, so they are re-learned from scratch."""
+    from openexecutive.attunement.style import reset_profile
+
+    caller = _style_person(person_id, request)
+    reset_profile(person_id, updated_by=f"person:{caller}")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

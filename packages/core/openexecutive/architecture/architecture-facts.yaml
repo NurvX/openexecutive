@@ -1611,6 +1611,47 @@ attunement:
       GET /people/{id}/outreach (auth before 404) → "How they respond" card.
     table: proactive_outcomes (episodic DB); wiped by slots + reset_all_state.
 
+  style:
+    module: openexecutive.attunement.style
+    why: |
+      Style profiles alone would not make the Executive more proactive, but a
+      few pinned rules per person ("lead with the recommendation") stop it
+      repeating what someone has already thumbed down. Kept deliberately
+      small: max 4 rules, evidence-cited, editable and lockable.
+    evidence: |
+      Last 40 attributed user messages (chat_messages.sender_person_id), each
+      paired with its own reply (the first assistant row before the next
+      user row), with the reaction THE PERSON gave it: feedback where
+      feedback_by_person_id == person (new column; the feedback route stores
+      the rater), feedback_note, stopped. basis feedback → a cited reply
+      carries a reaction; basis stated → quote verbatim (NFKC, casefold) in a
+      cited message. Honcho is not read or written.
+    validation: |
+      rule_rejection(): 8-160 chars; deny-list (URLs/domains, @handles,
+      currency, <>{}[]`, snake_case, action verbs send/approve/pay/schedule/
+      delete..., ignore/override/instructions/prompt/tool, secrets) and roster
+      names (full and first names >=3 chars). PUT edits use the same check
+      (422). build_style_block scrubs with utils.prompt_blocks.scrub_block_line
+      (shared with honcho _block_safe_line).
+    pacing: |
+      schedule_style_pass(person_id) after every Executive turn (stream + committee)
+      and with force=True from the feedback route on a thumbs-down (for the
+      rater). _claim_pass: >=5 total messages; new messages since
+      last_message_id >= ATTUNEMENT_STYLE_TRIGGER_TURNS (10) unless forced;
+      one conditional UPDATE (locked=0, watermark unchanged, last_pass_at
+      older than MIN_INTERVAL_HOURS (2), passes_today < MAX_PER_DAY (4)).
+      Then consume_call_budget (shared ATTUNEMENT_MAX_CALLS_PER_DAY). Write
+      is optimistic: only when updated_at is unchanged and still unlocked;
+      the watermark advances regardless. Empty model answer keeps rules.
+    applying: |
+      Executive computes build_style_block(person_id) once per turn and passes
+      it to _build_messages (<working_style> after <current_speaker>, user
+      turn, never cached) and _emit_memory_snapshot (working_style_chars +
+      full text). person_id is the resolved speaker; archived / unrostered →
+      no block.
+    api: GET/PUT/DELETE /people/{id}/attunement — principal or that person; UI "How I work with them" card.
+    tables: attunement_profiles, attunement_profile_history (episodic DB); wiped by slots + reset_all_state; dropped on archive.
+
 departments:
   module: openexecutive.departments
   store: openexecutive.departments.store (SQLite, shares episodic_memory.db)

@@ -426,6 +426,7 @@ def _emit_memory_snapshot(
     company_profile: Any,
     model: str,
     committee: bool,
+    working_style: str = "",
 ) -> None:
     """One memory_snapshot per turn: what was in the prompt before the API call.
 
@@ -461,6 +462,7 @@ def _emit_memory_snapshot(
             "user_message_preview": user_message[:160],
             "company_profile_hash": profile_hash,
             "system_blocks": _system_block_names(system_blocks),
+            "working_style_chars": len(working_style),
         },
         # Do NOT duplicate the raw user_message here — chat_turn already
         # persists it in its own row. The episodic_context and
@@ -471,6 +473,7 @@ def _emit_memory_snapshot(
             "episodic_context": episodic_context,
             "retrieved_context": retrieved_context,
             "system_blocks": _system_block_names(system_blocks),
+            "working_style": working_style,
         },
     )
 
@@ -523,6 +526,7 @@ class Executive:
         briefing_context: str = "",
         channel_context_block: str = "",
         page_context_block: str = "",
+        working_style: str = "",
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         history = session.get_recent_history()
@@ -548,6 +552,12 @@ class Executive:
         if speaker_block:
             user_content_parts.append(
                 {"type": "text", "text": f"<current_speaker>\n{speaker_block}\n</current_speaker>"}
+            )
+        # How this speaker likes replies (attunement.style) — only ever their
+        # own rules, in the user turn, never a cached system block.
+        if working_style:
+            user_content_parts.append(
+                {"type": "text", "text": f"<working_style>\n{working_style}\n</working_style>"}
             )
 
         if episodic_context:
@@ -730,6 +740,9 @@ class Executive:
                     session_id=session.session_id,
                     reasoning_level=peer_memory_reasoning_level,
                 )
+            from openexecutive.attunement.style import build_style_block
+
+            working_style = build_style_block(person_id)
             messages = self._build_messages(
                 session,
                 user_message,
@@ -741,6 +754,7 @@ class Executive:
                 briefing_context=briefing_context,
                 channel_context_block=channel_context_block,
                 page_context_block=page_context_block,
+                working_style=working_style,
             )
 
             _emit_memory_snapshot(
@@ -754,6 +768,7 @@ class Executive:
                 company_profile=session.company_profile,
                 model=effective_model,
                 committee=False,
+                working_style=working_style,
             )
             consulted: list[str] = []
             async for item in self._stream_agent_loop(
@@ -843,6 +858,11 @@ class Executive:
                 user_message, full_response, person_id=person_id,
                 session_id=session.session_id,
             )
+            # Re-learn this speaker's working style once enough new
+            # messages have arrived (paced and budgeted inside).
+            from openexecutive.attunement.style import schedule_style_pass
+
+            schedule_style_pass(person_id, session_id=session.session_id)
 
             # Mirror the completed exchange into Honcho so its server-side
             # extraction can update the peer card. Fire-and-forget; the
@@ -977,6 +997,9 @@ class Executive:
                 session_id=session.session_id,
                 reasoning_level=peer_memory_reasoning_level,
             )
+        from openexecutive.attunement.style import build_style_block
+
+        working_style = build_style_block(person_id)
         messages = self._build_messages(
             session,
             user_message,
@@ -988,6 +1011,7 @@ class Executive:
             briefing_context=briefing_context,
             channel_context_block=channel_context_block,
             page_context_block=page_context_block,
+            working_style=working_style,
         )
 
         # ----- Phase 1: drafting -----------------------------------------
@@ -1012,6 +1036,7 @@ class Executive:
             company_profile=session.company_profile,
             model=effective_model,
             committee=True,
+            working_style=working_style,
         )
 
         async for item in self._stream_agent_loop(
@@ -1274,6 +1299,9 @@ class Executive:
             user_message, final_response, person_id=person_id,
             session_id=session.session_id,
         )
+        from openexecutive.attunement.style import schedule_style_pass
+
+        schedule_style_pass(person_id, session_id=session.session_id)
 
         # Mirror the completed exchange into Honcho (see stream_chat for
         # rationale). Fire-and-forget; no-ops when person_id is None.

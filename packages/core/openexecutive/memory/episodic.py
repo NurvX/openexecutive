@@ -284,6 +284,10 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
             ("sender_person_id", "INTEGER"),
             ("feedback", "TEXT"),
             ("feedback_note", "TEXT"),
+            # Who left the feedback: the reply's own speaker's reaction is
+            # what their working-style profile learns from; the principal
+            # rating someone else's session is not that person's reaction.
+            ("feedback_by_person_id", "INTEGER"),
         ):
             if col not in _cm_existing:
                 try:
@@ -336,8 +340,40 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
             ")"
         )
 
+        # Attunement working-style profiles: at most a few short style rules
+        # per person, learned from their own reactions and requests, plus
+        # the bookkeeping that paces the learning pass
+        # (attunement/style.py). History keeps every change for review.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS attunement_profiles ("
+            "  person_id INTEGER PRIMARY KEY,"
+            "  rules TEXT NOT NULL DEFAULT '[]',"
+            "  locked INTEGER NOT NULL DEFAULT 0,"
+            "  updated_at TEXT,"
+            "  updated_by TEXT,"
+            "  last_pass_at TEXT,"
+            "  pass_day TEXT,"
+            "  passes_today INTEGER NOT NULL DEFAULT 0,"
+            "  last_message_id INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS attunement_profile_history ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  person_id INTEGER NOT NULL,"
+            "  created_at TEXT NOT NULL,"
+            "  rules TEXT NOT NULL,"
+            "  locked INTEGER NOT NULL DEFAULT 0,"
+            "  updated_by TEXT NOT NULL"
+            ")"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attunement_profile_history_person "
+            "ON attunement_profile_history(person_id, id)"
+        )
+
         # Attunement outcome ledger: one row per proactive DM to a rostered
-        # person, resolved replied / acted / dismissed / ignored
+        # person, resolved replied / acted / void / ignored
         # (attunement/outcomes.py).
         conn.execute(
             "CREATE TABLE IF NOT EXISTS proactive_outcomes ("
