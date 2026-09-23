@@ -26,7 +26,11 @@ deny-list that rejects anything that reads as an instruction to act (send,
 approve, pay…) or to act without checking (skip confirming, proceed), names
 a tool or a person on the roster, or carries a URL, handle, amount or
 markup — and an allowlist: the rule must name some aspect of how a reply
-reads (length, format, tone, detail, what to lead with…). The block says the current request always wins and that the rules
+reads (length, format, tone, detail, what to lead with…). The lists are
+lexical, so they narrow rather than close the space; what bounds the risk is
+that a rule only ever reaches its owner's own turns and is learned from (or
+typed by) that owner or the principal — neither of whom gains anything a
+rule gives that they could not already say in the message itself. The block says the current request always wins and that the rules
 never authorize an action, and it only ever reaches that person's own turns.
 
 **Pacing.** A pass runs in the background after an attributed turn once
@@ -108,6 +112,8 @@ _DENY_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"\b(confirm\w*|permission\w*|proceed\w*|autonom\w*|judg(e)?ment|"
         r"go ahead|without asking|ask(ing)? first|check\w*|verif\w*|pause\w*|"
         r"hesitat\w*|instinct\w*|assum\w*|guess\w*|trust\w*|wait\w*|initiative|"
+        r"yes|agree\w*|caution\w*|careful\w*|risk\w*|safe\w*|speed|slow\w*|hurr\w*|"
+        r"rush\w*|doubt\w*|default\w*|whatever|anything|everything|"
         r"act|acts|acting|action|actions|decide|decides|deciding|decision|decisions|"
         r"authori[sz]\w*|allow\w*|always do|do it)\b",
         re.IGNORECASE,

@@ -1639,8 +1639,12 @@ attunement:
       Round 2 widened that list (check*/verif*/pause*/instinct*/trust*/...)
       and added render-time revalidation: build_style_block drops any stored
       rule that fails rule_rejection today, and PUT without rules drops them
-      too. A deny-list can't be exhaustive; the block header ("style only,
-      never authorizes an action") and the person-only scope remain. PUT edits use the same check
+      too. Round 3 added yes/agree/caution/careful/risk/safe/speed/slow/
+      hurry/rush/doubt/default/whatever/anything/everything. A lexical list
+      can't be exhaustive; the bound is scope: a rule only reaches its
+      owner's turns and comes from that owner (or the principal), who could
+      say the same thing in the message itself. Header ("style only, never
+      authorizes an action") is the other layer. PUT edits use the same check
       (422). build_style_block scrubs with utils.prompt_blocks.scrub_block_line
       (shared with honcho _block_safe_line).
     pacing: |
