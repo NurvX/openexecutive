@@ -106,7 +106,8 @@ _DENY_PATTERNS: tuple[re.Pattern[str], ...] = (
     # proceed" names no action verb but loosens every tool-capable turn.
     re.compile(
         r"\b(confirm\w*|permission\w*|proceed\w*|autonom\w*|judg(e)?ment|"
-        r"go ahead|without (asking|checking)|ask(ing)? first|check(ing)? (with|first)|"
+        r"go ahead|without asking|ask(ing)? first|check\w*|verif\w*|pause\w*|"
+        r"hesitat\w*|instinct\w*|assum\w*|guess\w*|trust\w*|wait\w*|initiative|"
         r"act|acts|acting|action|actions|decide|decides|deciding|decision|decisions|"
         r"authori[sz]\w*|allow\w*|always do|do it)\b",
         re.IGNORECASE,
@@ -796,9 +797,13 @@ def build_style_block(person_id: int | None, *, db_path: Path | None = None) -> 
         person = get_person(person_id)
         if person is None or person.archived:
             return ""
+        # Re-checked on every render, not only when stored: a rule saved under
+        # an older, weaker check never reaches a turn.
+        roster = _roster_names()
         rules = [
             line for line in (scrub_block_line(r.text, _BLOCK_CLOSE)
-                              for r in get_profile(person_id, db_path=db_path).rules[:MAX_RULES])
+                              for r in get_profile(person_id, db_path=db_path).rules[:MAX_RULES]
+                              if rule_rejection(_normalize(r.text), roster_names=roster) is None)
             if line
         ]
         if not rules:

@@ -342,8 +342,11 @@ def put_person_working_style(
 
     caller = _style_person(person_id, request)
     if body.rules is None:
-        return _style_out(save_profile(person_id, get_profile(person_id).rules,
-                                       locked=body.locked, updated_by=f"person:{caller}"))
+        # Only the lock changes; rules stored under an older check that no
+        # longer pass it are dropped rather than carried forward.
+        current = [r for r in get_profile(person_id).rules if validate_edited_rule(r.text)[1] is None]
+        return _style_out(save_profile(person_id, current, locked=body.locked,
+                                       updated_by=f"person:{caller}"))
     rules: list[StyleRule] = []
     for raw in body.rules:
         text, rejection = validate_edited_rule(raw)
