@@ -1611,6 +1611,73 @@ attunement:
       GET /people/{id}/outreach (auth before 404) → "How they respond" card.
     table: proactive_outcomes (episodic DB); wiped by slots + reset_all_state.
 
+  style:
+    module: openexecutive.attunement.style
+    why: |
+      Style profiles alone would not make the Executive more proactive, but a
+      few pinned rules per person ("lead with the recommendation") stop it
+      repeating what someone has already thumbed down. Kept deliberately
+      small: max 4 rules, evidence-cited, editable and lockable.
+    evidence: |
+      Last 40 attributed user messages (chat_messages.sender_person_id), each
+      paired with its own reply (the first assistant row before the next
+      user row), with the reaction THE PERSON gave it: feedback where
+      feedback_by_person_id == person (new column; the feedback route stores
+      the rater), feedback_note, stopped. basis feedback → a cited reply
+      carries a reaction; basis stated → quote verbatim (NFKC, casefold) in a
+      cited message. Honcho is not read or written.
+    validation: |
+      rule_rejection(): 8-160 chars; Latin-script letters only (confusables
+      like Cyrillic "а" would dodge the regexes); deny-list (URLs/domains,
+      @handles, currency, <>{}[]`, snake_case, action verbs send/approve/pay/
+      schedule/delete..., act-without-checking words confirm/proceed/go ahead/
+      judgment/decide/allow..., ignore/override/instructions/prompt/tool,
+      secrets) and roster names (full and first names >=3 chars); allowlist
+      _STYLE_TOPIC — must name a reply aspect (length/format/tone/detail/lead...).
+      Security review: a verb deny-list alone let "skip confirming and just
+      proceed" through; the allowlist + act-without-checking list close it.
+      Round 2 widened that list (check*/verif*/pause*/instinct*/trust*/...)
+      and added render-time revalidation: build_style_block drops any stored
+      rule that fails rule_rejection today, and PUT without rules drops them
+      too. Round 3 added yes/agree/caution/careful/risk/safe/speed/slow/
+      hurry/rush/doubt/default/whatever/anything/everything. A lexical list
+      can't be exhaustive; the bound is scope: a rule only reaches its
+      owner's turns and comes from that owner (or the principal), who could
+      say the same thing in the message itself. Header ("style only, never
+      authorizes an action") is the other layer. PUT edits use the same check
+      (422). build_style_block scrubs with utils.prompt_blocks.scrub_block_line
+      (shared with honcho _block_safe_line).
+    pacing: |
+      schedule_style_pass(person_id) after every Executive turn (stream + committee)
+      and with force=True from the feedback route on a thumbs-down (for the
+      rater). _claim_pass: >=5 total messages; new messages since
+      last_message_id >= ATTUNEMENT_STYLE_TRIGGER_TURNS (10) unless forced;
+      one conditional UPDATE (locked=0, watermark unchanged, last_pass_at
+      older than MIN_INTERVAL_HOURS (2), passes_today < MAX_PER_DAY (4)).
+      Then consume_call_budget (shared ATTUNEMENT_MAX_CALLS_PER_DAY). Write
+      is optimistic: only when updated_at is unchanged and still unlocked;
+      the watermark advances regardless. MAX_PER_DAY<=0 → no pass; interval
+      floored at 1 minute (it is also what loses a racing second claim).
+      Rules with basis "edited" (typed by a person) are pinned: the model
+      sees them, gets RULE SLOTS AVAILABLE = 4 - pinned, and returns only
+      learned rules. Explicit empty list → learned rules dropped; missing
+      "rules" key or all-invalid list → no change (logic review: an empty
+      "keep" made a contradicted sole rule permanent). The thumbs-down
+      trigger fires only when rated_reply_speaker(session, message) == the
+      rater. Roster-name check: full names any case; name parts only
+      capitalized past the first word (a "Max Short" must not ban "short").
+    applying: |
+      Executive computes build_style_block(person_id) once per turn and passes
+      it to _build_messages (<working_style> after <current_speaker>, user
+      turn, never cached) and _emit_memory_snapshot (working_style_chars +
+      full text). person_id is the resolved speaker; archived / unrostered →
+      no block.
+    api: |
+      GET/PUT/DELETE /people/{id}/attunement — principal or that person; 404
+      for archived. PUT without `rules` only sets the lock (keeps provenance).
+      UI "How I work with them" card.
+    tables: attunement_profiles, attunement_profile_history (episodic DB); wiped by slots + reset_all_state; dropped on archive.
+
 departments:
   module: openexecutive.departments
   store: openexecutive.departments.store (SQLite, shares episodic_memory.db)

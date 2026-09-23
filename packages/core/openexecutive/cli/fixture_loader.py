@@ -773,12 +773,13 @@ async def reset_all_state(
             ),
         )
 
-        # Attunement's daily call counter and outcome ledger. Created by initialize_db, which an
+        # Attunement's daily call counter, outcome ledger and working styles. Created by initialize_db, which an
         # older DB may not have run yet, so guarded per table (the helper
         # above only guards the file).
         if EPISODIC_DB_PATH.exists():
             with sqlite3.connect(str(EPISODIC_DB_PATH)) as _conn:
-                for _table in ("attunement_usage", "proactive_outcomes"):
+                for _table in ("attunement_usage", "proactive_outcomes",
+                               "attunement_profiles", "attunement_profile_history"):
                     if _conn.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_table,)
                     ).fetchone():

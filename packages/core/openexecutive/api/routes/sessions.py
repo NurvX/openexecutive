@@ -80,7 +80,9 @@ def post_message_feedback(
     caller = _resolve_caller_person_id(request)
     if not is_principal_or_self(caller, owner):
         raise HTTPException(status_code=403, detail="Not your session")
-    if not set_message_feedback(session_id, message_id, body.feedback, body.note):
+    if not set_message_feedback(
+        session_id, message_id, body.feedback, body.note, by_person_id=caller
+    ):
         raise HTTPException(status_code=404, detail="Message not found")
 
     from openexecutive.audit import log_event
@@ -98,4 +100,13 @@ def post_message_feedback(
             "has_note": bool(body.note),
         },
     )
+    if body.feedback == "down":
+        # A thumbs-down is the clearest style signal there is: re-learn the
+        # speaker's working style now rather than after the next N messages
+        # (still paced and budgeted inside) — but only when they rated a reply
+        # to their own message; anyone else's rating is not evidence about them.
+        from openexecutive.attunement.style import rated_reply_speaker, schedule_style_pass
+
+        if caller is not None and rated_reply_speaker(session_id, message_id) == caller:
+            schedule_style_pass(caller, force=True, session_id=session_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

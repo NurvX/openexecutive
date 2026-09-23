@@ -501,6 +501,12 @@ def archive_person(person_id: int, db_path: Path | None = None) -> bool:
             close_loops_for_person(person_id, reason="owner_archived")
         except Exception:
             logger.warning("archive_person: closing open loops failed", exc_info=True)
+        try:
+            from openexecutive.attunement.style import delete_profile
+
+            delete_profile(person_id)
+        except Exception:
+            logger.warning("archive_person: dropping working style failed", exc_info=True)
     return archived
 
 

@@ -737,6 +737,16 @@ class Settings(BaseSettings):
     attunement_mute_cooldown_multiplier: int = Field(
         3, alias="ATTUNEMENT_MUTE_COOLDOWN_MULTIPLIER"
     )
+    # Working style: a few short "how they like replies" rules per person,
+    # learned from their own reactions and requests (attunement/style.py).
+    # A pass runs after this many new messages from the person (or right
+    # after a thumbs-down), at most once per interval and N times a day.
+    attunement_style_enabled: bool = Field(True, alias="ATTUNEMENT_STYLE_ENABLED")
+    attunement_style_trigger_turns: int = Field(10, alias="ATTUNEMENT_STYLE_TRIGGER_TURNS")
+    attunement_style_min_interval_hours: int = Field(
+        2, alias="ATTUNEMENT_STYLE_MIN_INTERVAL_HOURS"
+    )
+    attunement_style_max_per_day: int = Field(4, alias="ATTUNEMENT_STYLE_MAX_PER_DAY")
 
     # External-condition monitoring — heartbeat that polls source adapters
     # (vendor_status in PR-A; RSS + stock in PR-B) and emits external_signals

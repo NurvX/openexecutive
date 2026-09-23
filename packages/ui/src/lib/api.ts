@@ -2518,6 +2518,47 @@ export async function getPersonOutreach(id: number): Promise<OutreachStat[]> {
   return res.json();
 }
 
+// Attunement working style: a few short "how they like replies" rules pinned
+// into this person's own turns. Learned from their own 👍/👎 and requests;
+// editable, lockable (a locked profile is never re-learned) and resettable.
+export interface WorkingStyle {
+  rules: { text: string; basis: string }[];
+  locked: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+export async function getPersonWorkingStyle(id: number): Promise<WorkingStyle> {
+  const res = await fetch(`${API_BASE}/people/${id}/attunement`);
+  if (!res.ok) throw new Error(`Failed to load working style: ${res.statusText}`);
+  return res.json();
+}
+
+// `rules` null keeps the current rules and only sets the lock.
+export async function savePersonWorkingStyle(
+  id: number,
+  rules: string[] | null,
+  locked: boolean,
+): Promise<WorkingStyle> {
+  const res = await fetch(`${API_BASE}/people/${id}/attunement`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rules, locked }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(
+      typeof body?.detail === "string" ? body.detail : `Failed to save: ${res.statusText}`,
+    );
+  }
+  return res.json();
+}
+
+export async function resetPersonWorkingStyle(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/people/${id}/attunement`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`Failed to reset working style: ${res.statusText}`);
+}
+
 // Explicit 👍/👎 on one assistant reply (null clears it).
 export async function setMessageFeedback(
   sessionId: string,

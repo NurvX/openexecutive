@@ -45,6 +45,12 @@ def _no_background_open_loop_pass(monkeypatch: pytest.MonkeyPatch):
         "openexecutive.attunement.open_loops.schedule_open_loop_pass",
         lambda *args, **kwargs: None,
     )
+    # Same for the working-style pass (attunement.style): tests of it call
+    # run_style_pass directly.
+    monkeypatch.setattr(
+        "openexecutive.attunement.style.schedule_style_pass",
+        lambda *args, **kwargs: None,
+    )
     yield
 
 

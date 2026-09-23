@@ -9,11 +9,15 @@ import {
   getPerson,
   getPersonOpenLoops,
   getPersonOutreach,
+  getPersonWorkingStyle,
+  resetPersonWorkingStyle,
+  savePersonWorkingStyle,
   updatePerson,
   type AvailabilityWindow,
   type OpenLoop,
   type OutreachStat,
   type Person,
+  type WorkingStyle,
 } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
@@ -75,6 +79,147 @@ function OutreachSection({ personId }: { personId: number }) {
           );
         })}
       </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// How I work with them — learned working style (attunement)
+// ---------------------------------------------------------------------------
+
+const MAX_STYLE_RULES = 4;
+const STYLE_TEXTAREA_ROWS = 4;
+
+function WorkingStyleSection({ personId }: { personId: number }) {
+  const [style, setStyle] = useState<WorkingStyle | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getPersonWorkingStyle(personId)
+      .then(setStyle)
+      .catch(() => setStyle(null));
+  }, [personId]);
+
+  async function run(action: () => Promise<WorkingStyle>) {
+    setBusy(true);
+    setError(null);
+    try {
+      setStyle(await action());
+      setEditing(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to save");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!style) return null;
+  const rules = draft
+    .split("\n")
+    .map((line) => line.replace(/^[-•]\s*/, "").trim())
+    .filter(Boolean);
+  return (
+    <section className="mb-6">
+      <div className="flex items-center justify-between mb-1">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-fg-muted">
+          How I work with them
+        </h2>
+        {!editing && (
+          <div className="flex gap-3 text-xs">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                setDraft(style.rules.map((r) => r.text).join("\n"));
+                setEditing(true);
+              }}
+              className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50"
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() =>
+                run(() => savePersonWorkingStyle(personId, null, !style.locked))
+              }
+              className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50"
+            >
+              {style.locked ? "Unlock" : "Lock"}
+            </button>
+            {style.rules.length > 0 && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() =>
+                  run(async () => {
+                    await resetPersonWorkingStyle(personId);
+                    return getPersonWorkingStyle(personId);
+                  })
+                }
+                className="text-fg-muted hover:text-fg disabled:opacity-50"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+      <p className="text-xs text-fg-muted mb-3">
+        How replies are written for them, learned from their own 👍/👎 and requests.
+        {style.locked
+          ? " Locked — kept as is."
+          : " Updated as they use it; rules you type are always kept. Lock it to stop learning."}
+      </p>
+      {error && <p className="text-xs text-rose-300 mb-2">{error}</p>}
+      {editing ? (
+        <div className="space-y-2">
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={STYLE_TEXTAREA_ROWS}
+            placeholder="One rule per line, e.g. Lead with the recommendation, then the numbers."
+            className="w-full px-3 py-2 rounded-lg border border-line bg-surface-elevated text-sm text-fg"
+          />
+          {rules.length > MAX_STYLE_RULES && (
+            <p className="text-xs text-amber-300">At most {MAX_STYLE_RULES} rules.</p>
+          )}
+          <div className="flex gap-3 text-xs">
+            <button
+              type="button"
+              disabled={busy || rules.length > MAX_STYLE_RULES}
+              onClick={() => run(() => savePersonWorkingStyle(personId, rules, style.locked))}
+              className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50"
+            >
+              {busy ? "Saving…" : "Save"}
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => setEditing(false)}
+              className="text-fg-muted hover:text-fg disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : style.rules.length === 0 ? (
+        <p className="text-sm text-fg-muted">Nothing learned yet.</p>
+      ) : (
+        <ul className="space-y-1.5">
+          {style.rules.map((r) => (
+            <li
+              key={r.text}
+              className="px-4 py-2 rounded-lg border border-line bg-surface-elevated text-sm text-fg"
+            >
+              {r.text}
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
@@ -771,6 +916,7 @@ export default function PersonDetailPage() {
 
               {!person.archived && <OpenLoopsSection personId={personId} />}
               {!person.archived && <OutreachSection personId={personId} />}
+              {!person.archived && <WorkingStyleSection personId={personId} />}
 
               {/* Archive */}
               {!person.is_principal && !person.archived && (
