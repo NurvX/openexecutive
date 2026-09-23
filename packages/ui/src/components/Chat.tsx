@@ -18,6 +18,7 @@ import {
   DebugEvent,
   FALLBACK_ACTIVITY_LABEL,
   getSuggestedPrompts,
+  setMessageFeedback,
   streamChat,
 } from "@/lib/api";
 import { isAbortError, useStoppableTurn } from "@/lib/use-stoppable-turn";
@@ -197,6 +198,9 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
     // message without depending on the async setState applying first.
     const turnActions: ActionTaken[] = [];
     let wasStopped = false;
+    // Row id of the persisted reply, from `done`; it is what makes the reply
+    // rateable with 👍/👎.
+    let replyId: number | undefined;
 
     try {
       for await (const item of streamChat(message, sessionId, {
@@ -243,6 +247,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
           serverAcknowledgedStop();
           if (item.session_id) adoptSessionId(item.session_id);
         } else if (item.type === "done") {
+          if (item.message_id) replyId = item.message_id;
           if (item.session_id) {
             adoptSessionId(item.session_id);
             onTurnComplete?.(item.session_id);
@@ -276,6 +281,7 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
             content: accumulated,
             actions: turnActions.length > 0 ? turnActions : undefined,
             stopped: wasStopped || undefined,
+            id: replyId,
           },
         ]);
       }
@@ -317,6 +323,18 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
       setCommitteePhase(null);
       textareaRef.current?.focus();
     }
+  }
+
+  // 👍/👎 on a persisted reply, applied optimistically and rolled back if
+  // the save fails. Clicking the active rating again clears it.
+  function handleFeedback(index: number, value: "up" | "down" | null) {
+    const target = messages[index];
+    if (!sessionId || target?.role !== "assistant" || !target.id) return;
+    const previous = target.feedback ?? null;
+    const apply = (v: "up" | "down" | null) =>
+      setMessages((prev) => prev.map((m, i) => (i === index ? { ...m, feedback: v } : m)));
+    apply(value);
+    setMessageFeedback(sessionId, target.id, value).catch(() => apply(previous));
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -409,6 +427,12 @@ export default function Chat({ onDebugEvent, initialMessages, initialSessionId, 
                   content={msg.content}
                   actions={msg.role === "assistant" ? msg.actions : undefined}
                   stopped={msg.role === "assistant" ? msg.stopped : undefined}
+                  feedback={msg.role === "assistant" ? msg.feedback : undefined}
+                  onFeedback={
+                    msg.role === "assistant" && msg.id && sessionId
+                      ? (v) => handleFeedback(i, v)
+                      : undefined
+                  }
                 />
               ))}
 

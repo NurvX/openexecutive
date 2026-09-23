@@ -815,6 +815,11 @@ export interface ChatMessage {
   // `chat_messages.stopped`, so the marker survives a reload rather than
   // letting a truncated reply read as a complete one.
   stopped?: boolean;
+  // Assistant rows only: the persisted row id (from the stream's `done`
+  // event, or from a reloaded session) and any 👍/👎 on it. The id is what
+  // lets the reply be rated.
+  id?: number;
+  feedback?: "up" | "down" | null;
 }
 
 export interface Decision {
