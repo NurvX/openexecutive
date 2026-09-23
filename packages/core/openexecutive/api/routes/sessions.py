@@ -102,9 +102,11 @@ def post_message_feedback(
     )
     if body.feedback == "down":
         # A thumbs-down is the clearest style signal there is: re-learn the
-        # rater's working style now rather than after the next N messages
-        # (still paced and budgeted inside).
-        from openexecutive.attunement.style import schedule_style_pass
+        # speaker's working style now rather than after the next N messages
+        # (still paced and budgeted inside) — but only when they rated a reply
+        # to their own message; anyone else's rating is not evidence about them.
+        from openexecutive.attunement.style import rated_reply_speaker, schedule_style_pass
 
-        schedule_style_pass(caller, force=True, session_id=session_id)
+        if caller is not None and rated_reply_speaker(session_id, message_id) == caller:
+            schedule_style_pass(caller, force=True, session_id=session_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

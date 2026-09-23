@@ -2534,9 +2534,10 @@ export async function getPersonWorkingStyle(id: number): Promise<WorkingStyle> {
   return res.json();
 }
 
+// `rules` null keeps the current rules and only sets the lock.
 export async function savePersonWorkingStyle(
   id: number,
-  rules: string[],
+  rules: string[] | null,
   locked: boolean,
 ): Promise<WorkingStyle> {
   const res = await fetch(`${API_BASE}/people/${id}/attunement`, {

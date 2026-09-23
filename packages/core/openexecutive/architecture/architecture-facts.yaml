@@ -1647,14 +1647,26 @@ attunement:
       older than MIN_INTERVAL_HOURS (2), passes_today < MAX_PER_DAY (4)).
       Then consume_call_budget (shared ATTUNEMENT_MAX_CALLS_PER_DAY). Write
       is optimistic: only when updated_at is unchanged and still unlocked;
-      the watermark advances regardless. Empty model answer keeps rules.
+      the watermark advances regardless. MAX_PER_DAY<=0 → no pass; interval
+      floored at 1 minute (it is also what loses a racing second claim).
+      Rules with basis "edited" (typed by a person) are pinned: the model
+      sees them, gets RULE SLOTS AVAILABLE = 4 - pinned, and returns only
+      learned rules. Explicit empty list → learned rules dropped; missing
+      "rules" key or all-invalid list → no change (logic review: an empty
+      "keep" made a contradicted sole rule permanent). The thumbs-down
+      trigger fires only when rated_reply_speaker(session, message) == the
+      rater. Roster-name check: full names any case; name parts only
+      capitalized past the first word (a "Max Short" must not ban "short").
     applying: |
       Executive computes build_style_block(person_id) once per turn and passes
       it to _build_messages (<working_style> after <current_speaker>, user
       turn, never cached) and _emit_memory_snapshot (working_style_chars +
       full text). person_id is the resolved speaker; archived / unrostered →
       no block.
-    api: GET/PUT/DELETE /people/{id}/attunement — principal or that person; UI "How I work with them" card.
+    api: |
+      GET/PUT/DELETE /people/{id}/attunement — principal or that person; 404
+      for archived. PUT without `rules` only sets the lock (keeps provenance).
+      UI "How I work with them" card.
     tables: attunement_profiles, attunement_profile_history (episodic DB); wiped by slots + reset_all_state; dropped on archive.
 
 departments:

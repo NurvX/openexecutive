@@ -288,7 +288,10 @@ class WorkingStyleOut(BaseModel):
 
 
 class WorkingStyleIn(BaseModel):
-    rules: list[str] = Field(default_factory=list, max_length=4)
+    """``rules`` omitted keeps the current rules (and their provenance) and
+    only sets the lock."""
+
+    rules: list[str] | None = Field(default=None, max_length=4)
     locked: bool = False
 
 
@@ -302,9 +305,11 @@ def _style_out(profile: StyleProfile) -> WorkingStyleOut:
 
 
 def _style_person(person_id: int, request: Request) -> int:
-    """Authorize (principal or that person), then 404 an unknown id."""
+    """Authorize (principal or that person), then 404 an unknown or archived
+    id — archiving drops the profile, and nothing may re-create it."""
     caller = _require_principal_or(person_id, request)
-    if people_store.get_person(person_id) is None:
+    person = people_store.get_person(person_id)
+    if person is None or person.archived:
         raise HTTPException(status_code=404, detail="Person not found")
     return caller
 
@@ -324,16 +329,21 @@ def put_person_working_style(
     person_id: int, body: WorkingStyleIn, request: Request
 ) -> WorkingStyleOut:
     """Replace the rules and set the lock. Rules pass the same style-only
-    checks as learned ones (they reach a tool-capable turn); a locked profile
-    is never rewritten by the learning pass."""
+    checks as learned ones (they reach a tool-capable turn). Rules typed here
+    are kept by the learning pass, which only fills the remaining slots; a
+    locked profile is never rewritten by it at all."""
     from openexecutive.attunement.style import (
         BASIS_EDITED,
         StyleRule,
+        get_profile,
         save_profile,
         validate_edited_rule,
     )
 
     caller = _style_person(person_id, request)
+    if body.rules is None:
+        return _style_out(save_profile(person_id, get_profile(person_id).rules,
+                                       locked=body.locked, updated_by=f"person:{caller}"))
     rules: list[StyleRule] = []
     for raw in body.rules:
         text, rejection = validate_edited_rule(raw)

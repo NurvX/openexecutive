@@ -144,13 +144,7 @@ function WorkingStyleSection({ personId }: { personId: number }) {
               type="button"
               disabled={busy}
               onClick={() =>
-                run(() =>
-                  savePersonWorkingStyle(
-                    personId,
-                    style.rules.map((r) => r.text),
-                    !style.locked,
-                  ),
-                )
+                run(() => savePersonWorkingStyle(personId, null, !style.locked))
               }
               className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50"
             >
@@ -176,7 +170,9 @@ function WorkingStyleSection({ personId }: { personId: number }) {
       </div>
       <p className="text-xs text-fg-muted mb-3">
         How replies are written for them, learned from their own 👍/👎 and requests.
-        {style.locked ? " Locked — kept as is." : " Updated as they use it; lock it to keep it as is."}
+        {style.locked
+          ? " Locked — kept as is."
+          : " Updated as they use it; rules you type are always kept. Lock it to stop learning."}
       </p>
       {error && <p className="text-xs text-rose-300 mb-2">{error}</p>}
       {editing ? (
