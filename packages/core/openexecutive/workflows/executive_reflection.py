@@ -150,6 +150,10 @@ def _build_reflection_system(configured: set[str], has_roster: bool = True) -> s
         "the nudge engine already chases overdue ones, so don't DM about a "
         "loop just because it's overdue — use them to connect signals or to "
         "flag a slipped promise that matters for the brief. "
+        "WHAT LANDS shows, per person, how often each kind of proactive DM "
+        "got an answer: prefer the kind of outreach that lands with that "
+        "person, and don't DM someone through a kind they reliably ignore — "
+        "raise it in the brief instead. "
         "Open alerts carry the review verdict of your alert-review job "
         "(relevant / changed / likely_stale) and its recommended move; you "
         "never close alerts here (that job does, with evidence).\n\n"
@@ -183,6 +187,7 @@ def _render_reflection_context(
     external_signals: list[dict[str, Any]],
     previous_reflection: str | None = None,
     open_loops: list[str] | None = None,
+    outreach: list[str] | None = None,
 ) -> str:
     """Pack /today + activity + open alerts + external signals into a
     single user-turn block for the LLM to reason over.
@@ -268,6 +273,13 @@ def _render_reflection_context(
         parts.extend(open_loops)
         parts.append("")
 
+    if outreach:
+        # Per-person answer rates by kind of outreach (attunement.outcomes),
+        # last 30 days: which DMs actually land with whom.
+        parts.append("WHAT LANDS (answered / resolved proactive DMs, last 30 days):")
+        parts.extend(outreach)
+        parts.append("")
+
     if previous_reflection:
         parts.append("YESTERDAY'S STANDUP (already handled — do not repeat):")
         parts.append(previous_reflection.strip()[:_PREVIOUS_REFLECTION_CHARS])
@@ -336,6 +348,17 @@ def _open_loop_lines() -> list[str]:
         return render_for_reflection(limit=10)
     except Exception:
         logger.debug("reflection: open loops lookup failed", exc_info=True)
+        return []
+
+
+def _outreach_lines() -> list[str]:
+    """How proactive DMs land per person; a lookup failure omits the block."""
+    try:
+        from openexecutive.attunement.outcomes import render_for_reflection
+
+        return render_for_reflection()
+    except Exception:
+        logger.debug("reflection: outreach stats lookup failed", exc_info=True)
         return []
 
 
@@ -508,6 +531,7 @@ class ExecutiveReflectionWorkflow(Workflow):
             external_signals=external_signals,
             previous_reflection=_previous_reflection_artifact(),
             open_loops=_open_loop_lines(),
+            outreach=_outreach_lines(),
         )
         roster = _render_team_roster(people)
         if roster:
@@ -593,7 +617,12 @@ class ExecutiveReflectionWorkflow(Workflow):
                     )
                     return
 
-                iter_summaries = await _execute_tool_calls(response, _ALL_SKILL_HANDLERS)
+                # Only the await sits inside the tag — this is an async
+                # generator, and a ContextVar set across a `yield` would leak.
+                from openexecutive.attunement.outcomes import SOURCE_REFLECTION, tag_proactive
+
+                with tag_proactive(SOURCE_REFLECTION):
+                    iter_summaries = await _execute_tool_calls(response, _ALL_SKILL_HANDLERS)
                 tool_call_summaries.extend(iter_summaries)
 
                 text = _extract_artifact_from_response(response)

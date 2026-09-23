@@ -359,6 +359,8 @@ async def test_one_malformed_kind_does_not_lose_the_others(db: Path) -> None:
         "status": "active",
         "summary": "Down to 400k",
         "db_path": db,
+        # No principal on this roster, so the update credits nobody.
+        "updated_by_person_id": None,
     }
     assert audit[0]["details"]["stored"]["initiatives"] == 1
     assert audit[0]["details"]["dropped"] == [

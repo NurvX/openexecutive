@@ -851,11 +851,16 @@ async def _executive_synthesis_loop(
 
             ok_so_far = _routing_ok(tool_calls)
             budget_remaining = max(0, _MAX_ROUTING_TOOLS_PER_RUN - ok_so_far)
-            iter_calls = await execute_tool_calls(
-                response, _ALL_SKILL_HANDLERS,
-                budget_remaining=budget_remaining,
-                free_tools=_NON_ROUTING_TOOLS,
-            )
+            # DMs the synthesis sends are proactive research outreach; the
+            # outcome ledger records whether they land.
+            from openexecutive.attunement.outcomes import SOURCE_RESEARCH, tag_proactive
+
+            with tag_proactive(SOURCE_RESEARCH):
+                iter_calls = await execute_tool_calls(
+                    response, _ALL_SKILL_HANDLERS,
+                    budget_remaining=budget_remaining,
+                    free_tools=_NON_ROUTING_TOOLS,
+                )
             tool_calls.extend(iter_calls)
 
             text = extract_artifact_from_response(response)

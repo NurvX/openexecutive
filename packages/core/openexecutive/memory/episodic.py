@@ -336,6 +336,36 @@ def initialize_db(db_path: Path = DB_PATH) -> None:
             ")"
         )
 
+        # Attunement outcome ledger: one row per proactive DM to a rostered
+        # person, resolved replied / acted / dismissed / ignored
+        # (attunement/outcomes.py).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS proactive_outcomes ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  created_at TEXT NOT NULL,"
+            "  person_id INTEGER NOT NULL,"
+            "  source TEXT NOT NULL,"
+            "  ref TEXT,"
+            "  channel TEXT NOT NULL,"
+            "  channel_ref TEXT NOT NULL,"
+            "  outbound_context_id INTEGER,"
+            "  outcome TEXT,"
+            "  resolved_at TEXT"
+            ")"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_outcomes_person "
+            "ON proactive_outcomes(person_id, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_outcomes_ref "
+            "ON proactive_outcomes(ref) WHERE ref IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_outcomes_ctx "
+            "ON proactive_outcomes(outbound_context_id) WHERE outbound_context_id IS NOT NULL"
+        )
+
         # Attunement open loops: at most one OPEN loop per scope_key. Closing a
         # loop clears awaiting_response_since, which takes it out of the index,
         # so the same ask can be reopened later. The insert path relies on this
@@ -526,16 +556,21 @@ def store_initiative(
     department: str = "",
     person_id: int | None = None,
     db_path: Path = DB_PATH,
+    updated_by_person_id: int | None = None,
 ) -> None:
     now = datetime.now(UTC).isoformat()
     is_insert = False
     is_status_change = False
+    is_real_update = False
     with _get_conn(db_path) as conn:
         existing = conn.execute(
-            "SELECT id, status FROM initiatives WHERE title = ?", (title,)
+            "SELECT id, status, summary FROM initiatives WHERE title = ?", (title,)
         ).fetchone()
         if existing:
             is_status_change = existing["status"] != status
+            is_real_update = is_status_change or (
+                bool(summary) and summary != (existing["summary"] or "")
+            )
             # Only overwrite an existing department when the caller actually
             # passed a non-empty value — preserves the original tag if the
             # update path is invoked without department context.
@@ -555,6 +590,10 @@ def store_initiative(
                 "INSERT INTO initiatives (title, status, created_at, updated_at, summary, department) VALUES (?, ?, ?, ?, ?, ?)",
                 (title, status, now, now, summary, department),
             )
+    if existing and is_real_update:
+        # Only a real change answers a check-in — a same-status re-mention
+        # during routine extraction does not.
+        _resolve_initiative_outreach(int(existing["id"]), updated_by_person_id, db_path)
     # Mirror only on a new initiative OR a real status transition.
     # Idempotent upserts (same title + same status) don't fire — that
     # would spam the dept peer with redundant notes on every routine
@@ -780,6 +819,7 @@ def update_initiative(
     status: str | None = None,
     summary: str | None = None,
     db_path: Path = DB_PATH,
+    updated_by_person_id: int | None = None,
 ) -> bool:
     fields: list[tuple[str, str]] = []
     if title is not None:
@@ -797,7 +837,40 @@ def update_initiative(
         cursor = conn.execute(
             f"UPDATE initiatives SET {set_clause} WHERE id = ?", values
         )
-        return cursor.rowcount > 0
+        updated = cursor.rowcount > 0
+    if updated:
+        _resolve_initiative_outreach(initiative_id, updated_by_person_id, db_path)
+    return updated
+
+
+def _principal_person_id() -> int | None:
+    """The principal's roster id, or None when there is none. Never raises."""
+    try:
+        from openexecutive.people.store import find_principal_person
+
+        principal = find_principal_person()
+    except Exception:
+        logger.debug("principal lookup failed", exc_info=True)
+        return None
+    return principal.id if principal is not None else None
+
+
+def _resolve_initiative_outreach(
+    initiative_id: int, updated_by_person_id: int | None, db_path: Path | None
+) -> None:
+    """The person a check-in nudge went to updated the initiative, so it landed.
+
+    Credit goes only to the updater's own pending check-ins. An update from
+    someone else (the principal editing the card, an unauthenticated API call)
+    says nothing about whether the department head answered."""
+    if updated_by_person_id is None:
+        return
+    from openexecutive.attunement.outcomes import OUTCOME_ACTED, resolve_by_ref
+
+    resolve_by_ref(
+        f"nudge:initiative:{initiative_id}", OUTCOME_ACTED,
+        person_ids={updated_by_person_id}, db_path=db_path,
+    )
 
 
 def update_advice(
@@ -1012,7 +1085,13 @@ def mark_outbound_context_consumed(
             "WHERE id = ? AND status = 'open'",
             (datetime.now(UTC).isoformat(), context_id),
         )
-        return cursor.rowcount > 0
+        consumed = cursor.rowcount > 0
+    if consumed:
+        # A matched reply is the clearest sign a proactive DM landed.
+        from openexecutive.attunement.outcomes import OUTCOME_REPLIED, resolve_by_outbound_context
+
+        resolve_by_outbound_context(context_id, OUTCOME_REPLIED, db_path=db_path)
+    return consumed
 
 
 def scope_key_in_use(scope_key: str, db_path: Path | None = None) -> bool:
@@ -2121,11 +2200,14 @@ def _store_item(
             db_path=db_path,
         )
     elif spec is _INITIATIVES:
+        # Extraction only runs on the principal's own words (should_extract),
+        # so the principal is the one updating it.
         store_initiative(
             title=item["title"],
             status=item.get("status", "active"),
             summary=item["summary"],
             db_path=db_path,
+            updated_by_person_id=_principal_person_id(),
         )
     else:
         store_advice(

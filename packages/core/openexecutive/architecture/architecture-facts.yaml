@@ -1562,6 +1562,54 @@ attunement:
       tests/conftest.py no-ops `schedule_open_loop_pass` for every test so
       Executive turns don't call a provider or write default-DB rows; tests
       of the pass call `run_open_loop_pass` directly.
+  outcomes:
+    module: openexecutive.attunement.outcomes
+    why: |
+      Nothing measured whether proactive outreach landed, so an always-ignored
+      nudge kept going and an always-answered one ranked no higher.
+    recording: |
+      `tag_proactive(source, ref)` ContextVar (wrap non-yielding code only —
+      never across an async-generator yield). `_record_outbound_context`
+      (schedule_tools) calls `record_send` after inserting the linkage: a row
+      only when tagged AND the recipient resolves to a Person. Tagged: runner
+      generic dispatch via `_outreach_source` (proactive_nudge → nudge_stalled /
+      nudge_commitment / nudge_initiative / open_loop [commitment target is an
+      open_loop], ref = scope_key; else followup, ref action:<id>); reflection
+      and research around their tool execution; alert review `_dm(alert_id=)`
+      → alert_review, ref alert:<id>. Untracked: briefs and dynamic-workflow
+      deliveries (no session → no linkage), broadcasts (no single recipient),
+      web-chat sends (no linkage by design).
+    resolution: |
+      replied — `mark_outbound_context_consumed`. acted — close_open_loop with
+      reason reported_done or done, only when closed_by_person_id is the owner
+      (principal tidy-up, or the principal saying someone else's loop is done,
+      credits nobody); `resumer.apply_resolution` resolves
+      nudge:stalled:<run_id> for resolution.person_id only;
+      store_initiative/update_initiative resolve nudge:initiative:<id> only on
+      a real change (new status or summary) and only for
+      `updated_by_person_id` — the extractor passes the principal (it runs on
+      principal turns only), PATCH /memories/initiatives/{id} passes nothing
+      (no caller identity, no auth) so it credits nobody; alert ack or resolved
+      (`alerts.lifecycle.resolve_alert_outreach`, also called by alert review
+      when it closes an alert) — scoped to routed_to_person_id + principal.
+      void — alert dismissed / stale / expired (expiry sweep): excluded from
+      every rate, so a dismissal (POST /alerts/{id}/ack has no per-caller
+      authz, pre-existing) can never push someone toward demotion. acted and
+      void override an earlier ignored (done after the sweep is the truer
+      verdict); replied does not. ignored — `sweep_ignored` at the start of
+      each nudge scan AND lazily in acceptance()/muted_pairs() (rates stay
+      honest with NUDGE_SCAN_ENABLED=false). Recording skips email cc's (only
+      the first rostered `to` address) and principal self follow-ups.
+    use: |
+      `acceptance()` per (person, source), 30 days, voids excluded.
+      nudge_engine `_apply_outcome_feedback` uses `muted_pairs(min_sends)`:
+      demoted when the person's LAST ATTUNEMENT_MUTE_MIN_SENDS (5) resolved
+      sends of that source (ordered by created_at) were all unanswered → cooldown x
+      MUTE_COOLDOWN_MULTIPLIER (3), ranked last in `_apply_caps`; never
+      dropped; one answer lifts it (a 30-day share would not — review
+      finding). Reflection WHAT LANDS block (sources with >=3 resolved).
+      GET /people/{id}/outreach (auth before 404) → "How they respond" card.
+    table: proactive_outcomes (episodic DB); wiped by slots + reset_all_state.
 
 departments:
   module: openexecutive.departments

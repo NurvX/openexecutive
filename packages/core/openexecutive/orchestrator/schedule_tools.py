@@ -191,9 +191,14 @@ def _record_outbound_context(
     channel_ref: str,
     text: str,
     outbound_message_id: str | None = None,
+    record_outcome: bool = True,
 ) -> None:
     """Persist an outbound→inbound DM linkage so the recipient's reply can be
     hydrated with the originating conversation's context.
+
+    ``record_outcome`` False keeps a secondary recipient (an email cc) out of
+    the Attunement outcome ledger: the outreach was not addressed to them, and
+    counting it would mark them as ignoring someone else's nudges.
 
     Only writes when a live session is active (``current_session`` is set), and
     not for browser turns. Best-effort — any failure here must never break the
@@ -232,7 +237,7 @@ def _record_outbound_context(
         recipient_person_id = _resolve_recipient_person_id(channel, channel_ref)
         from openexecutive.memory.episodic import insert_outbound_context
 
-        insert_outbound_context(
+        context_id = insert_outbound_context(
             channel=channel,
             channel_ref=channel_ref,
             outbound_text=text,
@@ -240,6 +245,17 @@ def _record_outbound_context(
             recipient_person_id=recipient_person_id,
             outbound_message_id=outbound_message_id,
         )
+        # Proactive outreach (tagged by whoever started it) also opens an
+        # outcome row; the reply that consumes this linkage resolves it.
+        from openexecutive.attunement.outcomes import record_send
+
+        if record_outcome:
+            record_send(
+                person_id=recipient_person_id,
+                channel=channel,
+                channel_ref=channel_ref,
+                outbound_context_id=context_id,
+            )
     except Exception:
         logger.exception("record_outbound_context: persist failed (non-fatal)")
 

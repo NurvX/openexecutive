@@ -727,6 +727,16 @@ class Settings(BaseSettings):
     )
     # Ceiling on open-loop extraction model calls per UTC day, across everyone.
     attunement_max_calls_per_day: int = Field(200, alias="ATTUNEMENT_MAX_CALLS_PER_DAY")
+    # Outcome ledger: a proactive DM with no reply / action after this long is
+    # counted as ignored.
+    attunement_ignore_after_hours: int = Field(72, alias="ATTUNEMENT_IGNORE_AFTER_HOURS")
+    # A person whose last ATTUNEMENT_MUTE_MIN_SENDS resolved sends from one
+    # nudge source all went unanswered is chased less for that source: ranked
+    # last and on a longer cooldown. A single answer lifts it.
+    attunement_mute_min_sends: int = Field(5, alias="ATTUNEMENT_MUTE_MIN_SENDS")
+    attunement_mute_cooldown_multiplier: int = Field(
+        3, alias="ATTUNEMENT_MUTE_COOLDOWN_MULTIPLIER"
+    )
 
     # External-condition monitoring — heartbeat that polls source adapters
     # (vendor_status in PR-A; RSS + stock in PR-B) and emits external_signals

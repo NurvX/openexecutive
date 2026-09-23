@@ -2500,6 +2500,24 @@ export async function closeOpenLoop(
   if (!res.ok) throw new Error(`Failed to close open loop: ${res.statusText}`);
 }
 
+// Attunement outcome ledger: how a person responded to proactive outreach
+// over the last 30 days, per kind of outreach.
+export interface OutreachStat {
+  source: string;
+  label: string;
+  sent: number;
+  replied: number;
+  acted: number;
+  ignored: number;
+  pending: number;
+}
+
+export async function getPersonOutreach(id: number): Promise<OutreachStat[]> {
+  const res = await fetch(`${API_BASE}/people/${id}/outreach`);
+  if (!res.ok) throw new Error(`Failed to load outreach: ${res.statusText}`);
+  return res.json();
+}
+
 // Explicit 👍/👎 on one assistant reply (null clears it).
 export async function setMessageFeedback(
   sessionId: string,

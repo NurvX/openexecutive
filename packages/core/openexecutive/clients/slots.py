@@ -122,6 +122,7 @@ _BLANK_WIPE_TABLES = (
     # Attunement's daily model-call counter (open loops themselves live in
     # scheduled_actions, and sender/feedback columns in chat_messages).
     "attunement_usage",
+    "proactive_outcomes",
     # Legacy talent / staff-onboarding tables. Both features are gone and
     # nothing writes these any more, but the rows may still exist on upgraded
     # installs and they carry candidate PII (names, employers, screening
