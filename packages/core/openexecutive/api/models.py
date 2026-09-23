@@ -124,7 +124,7 @@ class HealthResponse(BaseModel):
     company_name: str | None = None
     builtin_skills: int = 0
     company_skills: int = 0
-    version: str = "0.2.2"
+    version: str = "0.3.0"
 
 
 class SkillMeta(BaseModel):

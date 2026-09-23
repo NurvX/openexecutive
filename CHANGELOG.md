@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-23
+
+### Added
+- **Attunement: the Executive follows up on what people owe** (#175). When
+  anyone on the roster commits to something in chat ("I'll send the vendor
+  quote Thursday"), asks for something, or the principal says a teammate will
+  do something, it becomes an open loop. Loops come due, get chased by the
+  nudge engine through the usual routing and outbound checks, and close when
+  their owner says it's done. The Executive can list them ("what is Sara
+  waiting on?") and close one on request. Each person's page lists their open
+  loops with Mark done. Every chat message now records who actually sent it,
+  so nothing an outsider writes is read as someone on the roster.
+- **👍/👎 on replies** (#175), in the main chat and the Ask OE panel.
+- **Attunement: learning which proactive messages land** (#176). Every
+  proactive DM (nudges, follow-ups, reflection, research and alert-review
+  messages) is resolved as replied, acted on, ignored after 72 hours, or void
+  when it stopped mattering. Credit only goes to the person who acted. A kind
+  of nudge a person's last five resolved sends all went unanswered on ranks
+  last for them on a longer cooldown until they answer one. The morning
+  reflection gets a "What lands" summary, and each person's page a "How they
+  respond" card.
+- **Attunement: per-person working style** (#177). Up to four short rules on
+  how to write replies for each person ("lead with the recommendation, then
+  the numbers"), learned only from their own messages and 👍/👎 and pinned
+  into their own conversations. Rules are checked before they are stored and
+  every time they are used, and must be about how replies read, never an
+  action. A "How I work with them" card lets the principal or the person
+  edit, lock or reset them.
+- New settings, all with defaults: `ATTUNEMENT_*` in `.env.example`.
+  `ATTUNEMENT_ENABLED=false` turns off open-loop tracking and style learning;
+  the outcome ledger has no switch and always records. None of it needs
+  Honcho.
+
 ## [0.2.2] - 2026-09-22
 
 ### Changed
@@ -409,7 +442,8 @@ Initial public release.
 - Open-source project setup: Apache-2.0 license, contribution guide, code of
   conduct, security policy, issue/PR templates, and CI.
 
-[Unreleased]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/SenteLabsAI/OpenExecutive/compare/v0.1.0...v0.2.0
