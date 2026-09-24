@@ -46,17 +46,64 @@ _SEARCH_TOP_K = 8
 _MAX_READ_FILE_BYTES = 25 * 1024 * 1024
 _READABLE_SUFFIXES = frozenset({".pdf", ".docx", ".doc", ".xlsx", ".xlsm", ".csv", ".md", ".txt"})
 
-# Verbs that mark a tool as read-only for the review card's "writes" badge.
-# The gateway reports no read-only hints, so this is a LABEL for the human,
-# never a security control — the allowlist and the gateway's own gates are.
+# Verbs that mark a tool as read-only. The gateway reports no read-only
+# hints, so this is a name heuristic. It drives the review card's "may change
+# things" badge AND which calls the first-write target check skips, so it
+# errs toward "may change": a name that also carries a write verb anywhere
+# (`find_and_replace_doc`, `get_or_create_folder`) is never read-only.
 _READ_VERBS = (
     "get_", "list_", "search_", "read_", "query_", "find_",
     "check_", "describe_", "inspect_", "debug_",
 )
+_WRITE_WORDS = frozenset({
+    "add", "append", "apply", "approve", "archive", "assign", "book", "cancel",
+    "clear", "close", "comment", "commit", "copy", "create", "delete", "deploy",
+    "draft", "edit", "execute", "forward", "grant", "import", "insert", "invite",
+    "join", "label", "leave", "mark", "merge", "modify", "move", "notify",
+    "patch", "pay", "post", "publish", "push", "put", "remove", "rename",
+    "reopen", "replace", "reply", "restore", "revoke", "run", "save", "schedule",
+    "send", "set", "share", "submit", "subscribe", "sync", "transfer", "trash",
+    "update", "upload", "upsert", "write",
+})
+_NAME_WORD_RE = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+# Tools whose result can name something the run itself made. Only their
+# structured results can vouch for a new target (see action_step.TargetPolicy).
+_CREATE_WORDS = frozenset({"create", "insert", "upload", "add", "copy", "new", "make", "duplicate"})
+
+
+def _name_words(name: str) -> set[str]:
+    bare = name.split("__", 1)[-1]
+    return {w.lower() for part in re.split(r"[_\-\s]+", bare) for w in _NAME_WORD_RE.findall(part)}
+
+
+def _has_word(words: set[str], vocabulary: frozenset[str]) -> bool:
+    """A word from ``vocabulary``, alone or glued to the front of a longer
+    token (`createfolder`). Short words only match alone, so `settings` is not
+    `set`. For write words a false match only means a stricter check."""
+    return any(
+        w in vocabulary or any(len(v) >= 4 and w.startswith(v) for v in vocabulary)
+        for w in words
+    )
+
+
+def creates(info: ToolInfo) -> bool:
+    """Whether a tool's name says it creates something (create/insert/upload…).
+
+    Stricter than the write check, since here a false match would TRUST a
+    result: whole words only (`list_uploads` is not `upload`), and never a
+    name that starts with a read verb (`get_copyright_info`).
+    """
+    bare = info.name.split("__", 1)[-1].lower()
+    if bare.startswith(_READ_VERBS):
+        return False
+    return bool(_name_words(info.name) & _CREATE_WORDS)
 # A tool that takes a URL can carry data OUT (the URL itself, or a request
 # body), whatever its name says — e.g. `fetch__fetch`. Never label one as
 # reads-only: the review card must show the user it can reach the outside.
-_EGRESS_PARAM_HINTS = ("url", "uri", "endpoint", "webhook")
+_EGRESS_PARAM_HINTS = (
+    "url", "uri", "endpoint", "webhook", "host", "link", "href", "domain", "site",
+    "server", "remote",
+)
 
 
 @dataclass(frozen=True)
@@ -115,6 +162,19 @@ def _schema_property_names(schema: Any, depth: int = 0) -> set[str]:
     return names
 
 
+def takes_url(info: ToolInfo) -> bool:
+    """Whether a tool has a URL-shaped parameter anywhere (it can reach out,
+    and what comes back is whatever that URL served). An unknown schema is
+    assumed to — the same fail-safe as the read-only label."""
+    if not info.input_schema:
+        return True
+    return any(
+        hint in key
+        for key in _schema_property_names(info.input_schema or {})
+        for hint in _EGRESS_PARAM_HINTS
+    )
+
+
 def _read_only_label(name: str, input_schema: dict[str, Any] | None = None) -> bool | None:
     if input_schema is None:
         return None  # schema unknown: can't rule out egress, so never "reads only"
@@ -122,8 +182,9 @@ def _read_only_label(name: str, input_schema: dict[str, Any] | None = None) -> b
         hint in key for key in _schema_property_names(input_schema) for hint in _EGRESS_PARAM_HINTS
     ):
         return None
-    bare = name.split("__", 1)[-1].lower()
-    return True if bare.startswith(_READ_VERBS) else None
+    if _has_word(_name_words(name), _WRITE_WORDS):
+        return None
+    return True if name.split("__", 1)[-1].lower().startswith(_READ_VERBS) else None
 
 
 # ── MCP: parse the gateway's search_tools output ────────────────────────────

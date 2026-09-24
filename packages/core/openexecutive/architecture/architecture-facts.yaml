@@ -3466,11 +3466,81 @@ workflows:
     run()/resume() pre-flight all action tools; running out of turns fails the
     step; resumes heartbeat their claim (persistence.touch_resume_claim, <=1/min)
     and stop when superseded, so a live run is never requeued and replayed.
-    Known residual risk: an approved write tool's TARGET (spreadsheet/doc id) is
-    chosen by the model, so injected content could redirect a write — only the
-    prompt rule, the allowlist and the audit bound it today. For detection,
-    workflow_tool_call audit rows of non-read-only tools carry a bounded
-    `targets` digest (keys like *_id/to/url/path/spreadsheet; never content).
+    Targets are chosen at run time BY DESIGN: approval covers the tools, not
+    which spreadsheet/doc/recipient/URL each call hits (tab per month, reply to
+    the sender, doc per client). Bounds: the allowlist, the gateway recipient
+    gates, the audit (workflow_tool_call rows of non-read-only tools carry a
+    bounded `targets` digest — keys like *_id/to/url/path/spreadsheet; never
+    content) and FIRST-WRITE CONFIRMATION:
+    - action_step.TargetPolicy (one per run) checks every call whose tool is
+      not labelled read-only; tool_catalog._read_only_label never labels a
+      name carrying a write verb anywhere (find_and_replace_doc,
+      check_and_merge_pr, get_or_create_folder …). resource_targets() walks
+      arguments recursively; a resource key (snake/camel ids, to/cc/bcc,
+      recipient, email, address, attendee, member, user, owner, parent,
+      url/uri/href/link, path, channel, space, room, phone, host, bucket,
+      table, spreadsheet, document, folder, calendar, file) marks its whole
+      subtree, names included. Outside one, exact name/title/subject/
+      file_name/display_name keys, message/thread/draft/label ids, range/sheet
+      and user_google_email are skipped; any bare email/URL/+phone-shaped
+      value is a target whatever its key, except under content keys (rows,
+      values, data, body, content, text, html, markdown, description, notes,
+      comment, summary, headline). Floats that are integers compare as ints.
+      Too deep (>8), too many (>100) or over-long (>2000 chars) FAILS CLOSED.
+      Key names are a heuristic: this is best-effort, layered on the tool
+      allowlist, gateway recipient gates and the audit.
+    - Trusted: values in workflow_approved_targets for this workflow (by
+      normalized value — emails lowercased — not by tool), and ids a write in
+      this run created: TOP-LEVEL id/link keys (id, *_id, *Id, *link, *url)
+      of the JSON-object result of a tool whose name says it creates
+      (tool_catalog.creates: create/insert/upload/add/copy/new/make/duplicate)
+      and that takes no URL (tool_catalog.takes_url; an unknown schema counts
+      as taking one) — never free text, nested records, or a reader's or
+      updater's result (a page, an echoed title, a shared doc's links or a
+      stranger in ccRecipients could plant one). Approvals are cleared when
+      the workflow's action-tool set changes (dynamic_store upsert /
+      save_if_unchanged), so a newly added tool never inherits them. Carried across pauses in
+      WorkflowResumeState.run_created (both gate and held-writes pauses).
+      Values in the workflow's own text are NOT trusted (anyone who can PUT
+      the workflow could change them without review) — asked once.
+    - The owner's question JSON-quotes each target (no injected lines) and
+      always shows a URL's scheme+host in full, saying how much is hidden.
+    - Anything else is HELD: not run, no budget spent, the model gets a
+      "held for approval, don't retry" result, audited "held for approval";
+      <= 10 per step, <= 16 KB args each, else refused; an identical repeat
+      is held once. Every exit that won't settle them (step error or crash,
+      resume refused for a changed definition / stale specialist / missing
+      later tool) audits them as "dropped (reason)" and says in the error
+      that N held writes did not run.
+    - After the step, the engine yields WaitForHumanEvent to
+      approved_targets.approver_for(name): the workflow's owner
+      (dynamic_workflows.owner_person_id — set on insert only from the web
+      caller on POST /workflows/custom or the chat session caller on
+      save_workflow; never from a body/definition; kept by PUT, overwrite,
+      activate), else the principal if the owner is unknown/archived.
+      on_timeout=auto_proceed, 48 h. WorkflowResumeState gains
+      kind="held_writes", held=[HeldCall(tool, arguments, targets)] and
+      deliver_to_person_id; old payloads parse as kind="gate".
+    - DynamicWorkflow._resume_held_writes (fingerprint + ActionStepSpec id
+      checked like a gate): only decision "approve" runs the held calls, each
+      re-checked against the LIVE step allowlist and resolve(); targets are
+      remembered first. reject/auto_proceed/defer/unknown skip. Either way a
+      "Held for approval" section is appended to the step output and the run
+      continues at idx+1. No approver at all: held writes skipped and noted.
+    - The principal can override from the web: POST
+      /workflows/runs/{id}/decision (is_principal_or_self on
+      awaiting_person_id; approve_reject gates only) -> apply_resolution. A
+      chat reply only matches the person asked (inbound_resolver filters on
+      awaiting_person_id).
+    - Scheduler: _run_dynamic_workflow checkpoints a held_writes pause
+      (checkpoint_gate) instead of raising, stamps deliver_to_person_id with
+      the cadence recipient, marks the row done and re-chains; the resumer
+      DMs the artifact after finish_resumed_run (and carries
+      deliver_to_person_id onto any later pause). Every other gate still
+      raises in the scheduler.
+    - Known limit: a daily cadence can raise a second question about the
+      same target while the first is unanswered; answering either remembers
+      the target for later runs.
     Egress labelling walks the whole schema (nested/items/anyOf/$defs) and an
     unparsed schema is never "reads only". requeue_run_for_resume takes
     stale_before so a heartbeat between the sweep's SELECT and UPDATE wins.
