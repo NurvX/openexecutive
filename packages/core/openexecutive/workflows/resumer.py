@@ -70,6 +70,10 @@ _RESUME_STALE_AFTER = timedelta(minutes=90)
 # Bound on those requeues, so a run that reliably kills its worker stops
 # rather than looping forever.
 _MAX_RESUME_ATTEMPTS = 3
+# A live resume refreshes its claim (``touch_resume_claim``) at most this
+# often while events flow — each action-step tool call emits one — so a long
+# but healthy run never ages past _RESUME_STALE_AFTER and is never replayed.
+_RESUME_HEARTBEAT_EVERY = timedelta(minutes=1)
 
 logger = logging.getLogger(__name__)
 
@@ -287,7 +291,9 @@ async def _process_resumable(now: datetime, db_path: Path | None = None) -> int:
     for stale_id in _wf_persistence.list_stale_resuming_runs(
         cutoff, _MAX_RESUME_ATTEMPTS, db_path=db_path
     ):
-        if _wf_persistence.requeue_run_for_resume(stale_id, db_path=db_path):
+        if _wf_persistence.requeue_run_for_resume(
+            stale_id, db_path=db_path, stale_before=cutoff
+        ):
             logger.warning(
                 "resumer: run %s was claimed for resume but never finished — requeued",
                 stale_id,
@@ -347,6 +353,7 @@ async def _execute_resume(
     "executed N" count means completions, not merely claims.
     """
     import contextlib
+    import sqlite3
 
     from openexecutive.audit import log_event as audit_log
     from openexecutive.config import get_settings
@@ -408,6 +415,7 @@ async def _execute_resume(
     store = ChromaDBStore(persist_directory=get_settings().vector_store_path)
     artifact = ""
     last_error = ""
+    last_heartbeat = datetime.now(UTC)
     # No handler here: a crash propagates to the caller, which routes it
     # through `_abandon_resume` — the one failure path both entry points share.
     async for event in workflow.resume(
@@ -447,6 +455,25 @@ async def _execute_resume(
                 },
             )
             return False
+        now = datetime.now(UTC)
+        if now - last_heartbeat >= _RESUME_HEARTBEAT_EVERY:
+            last_heartbeat = now
+            try:
+                still_ours = _wf_persistence.touch_resume_claim(run_id, claim, db_path=db_path)
+            except sqlite3.OperationalError:
+                # A busy shared DB is not a lost claim — keep working; the next
+                # heartbeat (one interval later) retries. Only a definite
+                # False means superseded.
+                logger.warning("resumer: database busy on heartbeat for run %s", run_id)
+                still_ours = True
+            if not still_ours:
+                # Superseded: another worker owns this run now. Stop before the
+                # next step acts again (action steps have external effects).
+                logger.warning(
+                    "resumer: run %s lost its claim mid-resume — stopping this worker",
+                    run_id,
+                )
+                return False
         if event.type == "artifact" and event.content:
             artifact = event.content
         elif event.type == "error" and event.message:

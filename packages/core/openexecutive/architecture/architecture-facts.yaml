@@ -3372,6 +3372,35 @@ workflows:
     rejected, so the saved workflow is exactly what the user saw). Both tool
     schemas are fixed, so the cached tool list stays stable. The step-by-step
     advanced editor drives the `/workflows/custom` CRUD endpoints directly.
+    A definition with action (tool) steps saved from chat is stored
+    is_active=False (applied after the token check), its cadence is not
+    scheduled, and
+    save_workflow returns status `saved_pending_review` + the /jobs/{name}
+    link. The chat token is model-held, so it is not a human seeing the tools:
+    the approval is **Turn on workflow** on the review card that /jobs/{name}
+    shows for an inactive custom workflow (POST /workflows/custom/{name}/
+    activate, which re-runs validate_definition_and_tools when turning on).
+    Chat may keep revising a switched-off one, but draft/save REFUSE to
+    replace a switched-on workflow with action steps (any replacement, even
+    analysis-only): an inbound email steering the Executive could otherwise
+    switch off an approved job and stage new tools under its familiar name.
+    Those edits go through /jobs/new?edit=<name>. The refusal is decided from
+    a read, so the save itself is conditional on that row
+    (dynamic_store.save_if_unchanged: INSERT only if still absent, else
+    UPDATE ... WHERE updated_at = the read one) — an activation landing in
+    between, from any process, makes the save a no-op with an error.
+    get_definition reports updated_at from the column (not the JSON body),
+    which is the key both conditional writes match on.
+    Activation is bound to what was reviewed: for a definition with action
+    steps the body must carry the reviewed `definition`; it must equal the
+    stored one (model_dump minus is_active/created_at/updated_at) or 409, and
+    the switch is one conditional UPDATE keyed on the validated revision's
+    updated_at (dynamic_store.activate_if_unchanged), so a save landing during
+    the awaited tool check — from any process, e.g. a standalone chat bot on
+    the same DB — is a 409, never switched on.
+    The Workflows catalog (/jobs) lists inactive custom workflows in a "Waiting for your
+    approval" strip; the advanced editor preserves is_active on save, so
+    "Save changes" never switches one on.
 
     New workflow wizard (`/jobs/new`, the UI default): a conversational
     designer modelled on the onboarding interview. `workflows.designer.advance`
@@ -3401,6 +3430,50 @@ workflows:
     own user turn by identity), and NEVER write — the UI saves through
     `POST /workflows/custom`, which re-validates. "Edit details" hands the
     draft to the advanced editor via `/jobs/new?designer=<id>`.
+
+    Action steps (workflows that act): `ActionStepSpec` {goal, tools,
+    max_tool_calls 1-50, default 20} in dynamic_models. `tools` is an allowlist
+    of exact names — MCP gateway tools (`server__tool`) and built-ins
+    `oe__read_file`, `oe__message_person`, `oe__create_alert` — and the user's
+    click on Create IS the approval (the review card lists every tool, flags
+    ones that may change things, and names them in a "can use these without
+    asking again" notice). Gateway meta-tools (search_tools / call_tool /
+    load_mcp_server) are forbidden as step tools. `workflows/tool_catalog.py`
+    parses extensible-mcp's Markdown `search_tools` output, resolves exact names
+    (which doubles as the per-session discovery `call_tool` requires), and
+    `validate_tools_available` runs on every save path (custom POST/PUT, chat
+    draft/save, designer drafts). `workflows/action_step.py` runs the
+    `workflow_actor` Council agent: constant cached system block, only the
+    allowlisted tools (sorted), per-run goal/inputs/earlier results in the user
+    turn; every tool_use re-checked against the allowlist; MCP calls go through
+    `MCPGateway.call_tool` (deny-list + Gmail/Calendar/Drive recipient gates);
+    budget enforced, then a tools-off (`tool_choice: none`) final turn; tool
+    errors return as is_error; each call emits a `progress` WorkflowEvent and a
+    `workflow_tool_call` audit row (tool + outcome, never arguments). Output =
+    the agent's report + an "Actions taken" list. `oe__read_file` reads only
+    under WORKFLOW_FILE_DIRS (default workspace-mcp's attachment dir), resolving
+    symlinks/`..` first. Action steps are allowed in cadence workflows. The
+    designer gained a third constant tool, `search_available_tools`, answered
+    inside the same `advance` call (≤4 per turn; tool_use/tool_result pairs are
+    never stored in the transcript; found names are kept on the session as
+    `discovered_tools` and replayed into later turns so forced drafts and
+    repair turns can use them). Endpoints: GET /workflows/tools/search?q= and
+    GET /workflows/tools/describe?names= (names regex-checked and deduped).
+    Hardening from review: tools taking a url/uri/endpoint/webhook param are
+    never labelled read-only (egress); chat draft_workflow/save_workflow save
+    action-step workflows switched OFF until turned on from the review card
+    (the review card is the approval, not a model-held token);
+    run()/resume() pre-flight all action tools; running out of turns fails the
+    step; resumes heartbeat their claim (persistence.touch_resume_claim, <=1/min)
+    and stop when superseded, so a live run is never requeued and replayed.
+    Known residual risk: an approved write tool's TARGET (spreadsheet/doc id) is
+    chosen by the model, so injected content could redirect a write — only the
+    prompt rule, the allowlist and the audit bound it today. For detection,
+    workflow_tool_call audit rows of non-read-only tools carry a bounded
+    `targets` digest (keys like *_id/to/url/path/spreadsheet; never content).
+    Egress labelling walks the whole schema (nested/items/anyOf/$defs) and an
+    unparsed schema is never "reads only". requeue_run_for_resume takes
+    stale_before so a heartbeat between the sweep's SELECT and UPDATE wins.
 
     Catalog: `Workflow.background` / `WorkflowMeta.background` is True for
     the system-run built-ins (morning_brief, end_of_day_digest,

@@ -16,6 +16,9 @@ Step interpretation:
                     step (see "Pause and resume" below).
 - ``synthesis``   → assemble prior outputs into the final Markdown artifact,
                     either by concatenation or via one synthesis consult.
+- ``action``      → run the ``workflow_actor`` agent with ONLY the step's
+                    approved tools (``workflows/action_step.py``); its report
+                    of what it did becomes the step's output.
 
 Pause and resume
 ----------------
@@ -51,11 +54,13 @@ from openexecutive.workflows.base import (
     WorkflowStepDef,
 )
 from openexecutive.workflows.dynamic_models import (
+    ActionStepSpec,
     ApprovalGateStepSpec,
     DynamicWorkflowDef,
     SpecialistStepSpec,
     SynthesisStepSpec,
 )
+from openexecutive.workflows.tool_catalog import unavailable_step_tools
 from openexecutive.workflows.wait_for_human import (
     CONTINUE_DECISIONS,
     DECISION_VERBS,
@@ -181,6 +186,13 @@ class DynamicWorkflow(Workflow):
         if stale:
             yield _stale_error(stale)
             return
+        # Same promise for action steps: a tool that vanished (server removed,
+        # deny-listed, gateway down) fails the run BEFORE any step acts, not
+        # after earlier steps already sent or changed something.
+        missing_tools = await unavailable_step_tools(self._defn)
+        if missing_tools:
+            yield _missing_tools_error(missing_tools)
+            return
 
         # --- context ---
         yield WorkflowEvent(
@@ -280,6 +292,16 @@ class DynamicWorkflow(Workflow):
                     + (f": {note}" if note else "")
                 ),
             )
+            return
+
+        # Only the steps still to run matter — the ones before the gate already
+        # acted. Checked after the gate and the decision, so a rejection is
+        # reported as a rejection, but before any remaining step acts.
+        missing_tools = await unavailable_step_tools(
+            self._defn, start_index=state.gate_step_index + 1
+        )
+        if missing_tools:
+            yield _missing_tools_error(missing_tools, resuming=True)
             return
 
         # Give the synthesis step the decision as a readable section, and
@@ -429,6 +451,42 @@ class DynamicWorkflow(Workflow):
                 yield gate  # type: ignore[misc]
                 return
 
+            elif isinstance(step, ActionStepSpec):
+                from openexecutive.workflows.action_step import run_action_step
+
+                yield WorkflowEvent(
+                    type="step_start", step_id=step.id, step_title=step.title
+                )
+                try:
+                    goal = _render(step.goal, values)
+                except (KeyError, IndexError) as exc:
+                    yield WorkflowEvent(
+                        type="error",
+                        message=f"step {step.id!r} placeholder error: {exc}",
+                    )
+                    return
+                async for kind, payload in run_action_step(
+                    step,
+                    workflow_name=self.name,
+                    workflow_title=self.title,
+                    goal=goal,
+                    values=values,
+                    company_block=company_block,
+                    prior_outputs=dict(outputs),
+                ):
+                    if kind == "progress":
+                        yield WorkflowEvent(
+                            type="progress", step_id=step.id, summary=payload
+                        )
+                    elif kind == "error":
+                        yield WorkflowEvent(type="error", message=payload)
+                        return
+                    else:
+                        outputs[step.id] = (step.title, payload)
+                        yield WorkflowEvent(
+                            type="step_done", step_id=step.id, summary=_first_line(payload)
+                        )
+
             elif isinstance(step, SynthesisStepSpec):
                 yield WorkflowEvent(
                     type="step_start", step_id=step.id, step_title=step.title
@@ -553,13 +611,25 @@ def _format_resolution(
     return f"## {step.title}\n\n{body}\n"
 
 
+def _missing_tools_error(missing: list[str], *, resuming: bool = False) -> WorkflowEvent:
+    outcome = (
+        "the steps after the approval did not run"
+        if resuming
+        else "the workflow did not start"
+    )
+    return WorkflowEvent(
+        type="error",
+        message=f"these tools are not available right now, so {outcome}: {', '.join(missing)}",
+    )
+
+
 def _stale_specialist_steps(defn: DynamicWorkflowDef) -> list[tuple[str, str]]:
     """(step_id, specialist) for every step that would consult a specialist
     missing from the live registry. A synthesis step only consults one when it
     has `instructions`."""
     stale: list[tuple[str, str]] = []
     for step in defn.steps:
-        if isinstance(step, ApprovalGateStepSpec):
+        if isinstance(step, ApprovalGateStepSpec | ActionStepSpec):
             continue
         if isinstance(step, SynthesisStepSpec) and not step.instructions:
             continue

@@ -25,10 +25,12 @@ from openexecutive.workflows import (
     list_workflows,
 )
 from openexecutive.workflows.dynamic_models import (
+    TOOL_NAME_RE,
+    ActionStepSpec,
     DynamicWorkflowDef,
-    validate_definition,
 )
 from openexecutive.workflows.dynamic_store import (
+    activate_if_unchanged,
     delete_definition,
     get_definition,
     list_definitions,
@@ -45,6 +47,9 @@ from openexecutive.workflows.persistence import (
     initialize_runs_db,
     list_runs,
 )
+from openexecutive.workflows.tool_catalog import resolve as resolve_tools_catalog
+from openexecutive.workflows.tool_catalog import search as search_tools_catalog
+from openexecutive.workflows.tool_catalog import validate_definition_and_tools
 from openexecutive.workflows.wait_for_human import WaitForHumanEvent
 
 router = APIRouter()
@@ -94,6 +99,44 @@ async def delete_workflow_run(run_id: str) -> dict[str, str]:
 # -----------------------------------------------------------------------------
 
 
+_TOOL_SEARCH_MAX_QUERY = 200
+
+
+@router.get("/workflows/tools/search")
+async def search_workflow_tools(q: str = "") -> dict[str, Any]:
+    """Tools an action step can use that match ``q`` (built-ins + MCP gateway).
+
+    Backs the advanced editor's tool picker. Literal path, declared before
+    ``/workflows/{name}``.
+    """
+    query = q.strip()[:_TOOL_SEARCH_MAX_QUERY]
+    if not query:
+        return {"tools": []}
+    return {"tools": [t.as_dict() for t in await search_tools_catalog(query)]}
+
+
+_TOOL_DESCRIBE_MAX_NAMES = 32
+
+
+@router.get("/workflows/tools/describe")
+async def describe_workflow_tools(names: str = "") -> dict[str, Any]:
+    """Exact-name lookup for a comma-separated list of tool names.
+
+    Lets the review card and the advanced editor label each approved tool
+    (description, reads-only) — the definition itself only stores names.
+    Unknown names are simply absent from the result.
+    """
+    # Only well-formed, distinct names: each non-built-in one costs a gateway
+    # search, so junk must not fan out into the shared MCP session.
+    wanted = list(
+        dict.fromkeys(n.strip() for n in names.split(",") if TOOL_NAME_RE.match(n.strip()))
+    )[:_TOOL_DESCRIBE_MAX_NAMES]
+    if not wanted:
+        return {"tools": []}
+    found = await resolve_tools_catalog(wanted)
+    return {"tools": [found[n].as_dict() for n in wanted if n in found]}
+
+
 @router.get("/workflows/custom")
 async def list_custom_workflows() -> dict[str, Any]:
     """All dynamic definitions (active and inactive) for the builder UI."""
@@ -108,7 +151,7 @@ async def create_custom_workflow(request: Request) -> dict[str, Any]:
         raise HTTPException(
             status_code=409, detail=f"A custom workflow named {defn.name!r} already exists"
         )
-    errors = validate_definition(defn)
+    errors = await validate_definition_and_tools(defn)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
     stored = upsert_definition(defn)
@@ -133,7 +176,7 @@ async def update_custom_workflow(name: str, request: Request) -> dict[str, Any]:
         raise HTTPException(
             status_code=422, detail="definition name does not match the path name"
         )
-    errors = validate_definition(defn)
+    errors = await validate_definition_and_tools(defn)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
     stored = upsert_definition(defn)
@@ -151,14 +194,57 @@ async def delete_custom_workflow(name: str) -> dict[str, str]:
     return {"status": "deleted", "name": name}
 
 
+# Fields a reviewer can't see or that the server manages; the rest is what the
+# review card shows, and what an activation must match.
+_REVIEW_EXCLUDE = {"is_active", "created_at", "updated_at"}
+
+
+def _reviewed_matches(stored: DynamicWorkflowDef, reviewed: Any) -> bool:
+    """True when ``reviewed`` (the definition the user looked at) is ``stored``."""
+    try:
+        seen = DynamicWorkflowDef.model_validate(reviewed)
+    except ValidationError:
+        return False
+    return seen.model_dump(exclude=_REVIEW_EXCLUDE) == stored.model_dump(exclude=_REVIEW_EXCLUDE)
+
+
 @router.post("/workflows/custom/{name}/activate")
 async def activate_custom_workflow(name: str, request: Request) -> dict[str, Any]:
+    """Turn a custom workflow on or off.
+
+    Turning one on is the approval for a tool workflow chat saved switched off,
+    so the body must carry the ``definition`` the user reviewed when the stored
+    one has action steps: a mismatch (e.g. chat overwrote it while the card was
+    open) is a 409, so the click can only switch on what was shown.
+    """
     try:
         body = await request.json()
     except json.JSONDecodeError:
         body = {}
+    if not isinstance(body, dict):
+        body = {}
     is_active = bool(body.get("is_active", True))
-    if not set_active(name, is_active):
+    current = get_definition(name)
+    if current is None:
+        raise HTTPException(status_code=404, detail=f"Custom workflow {name!r} not found")
+    if is_active:
+        reviewed = body.get("definition")
+        needs_review = any(isinstance(s, ActionStepSpec) for s in current.steps)
+        changed = "This workflow changed since you opened it — reload to review the current version."
+        if (needs_review or reviewed is not None) and not _reviewed_matches(current, reviewed):
+            raise HTTPException(status_code=409, detail=changed)
+        # Its tools must still resolve — same check as create/update.
+        errors = await validate_definition_and_tools(current)
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+        # The check above may await the gateway, and chat may run in another
+        # process: switch on only if the row is still the revision validated.
+        switched = activate_if_unchanged(current)
+        if switched is None:
+            raise HTTPException(status_code=404, detail=f"Custom workflow {name!r} not found")
+        if not switched:
+            raise HTTPException(status_code=409, detail=changed)
+    elif not set_active(name, is_active):
         raise HTTPException(status_code=404, detail=f"Custom workflow {name!r} not found")
     defn = get_definition(name)
     assert defn is not None
