@@ -107,15 +107,23 @@ openexecutive/
 git clone https://github.com/SenteLabsAI/OpenExecutive.git
 cd OpenExecutive
 
+# Install the backend and web app dependencies
+make install
+
 # Set your Anthropic API key
 cp .env.example .env
 # Edit .env and add ANTHROPIC_API_KEY=sk-ant-...
-# For the web UI's Google sign-in, also fill in the AUTH_* block
-# (see docs/auth.md for the Google Cloud Console steps).
 
 # Start everything
 make dev
 ```
+
+**Trying it on your own computer needs no sign-in setup.** While
+`AUTH_GOOGLE_ID` is blank, `make dev` uses local login: the web app
+only accepts connections from this computer, you click **Open**, and you are
+the owner. To invite your team, or to run it on a server or with `make docker`,
+set up Google sign-in by filling in the `AUTH_*` block (see
+[docs/auth.md](docs/auth.md) for the Google Cloud Console steps).
 
 All configuration lives in that repo-root `.env` — `make dev` and `make docker`
 both load it for the API *and* the UI (Auth.js needs `AUTH_SECRET` /
@@ -125,7 +133,7 @@ in both files the root `.env` takes precedence.
 
 Open http://localhost:3000 to start chatting with your executive. The API runs on port 8000 and the UI on 3000.
 
-> **First run:** requires Python 3.11+ and Node 22+. The initial `uv sync` pulls heavy
+> **First run:** requires Python 3.11+ and Node 22.6+. The initial `uv sync` pulls heavy
 > ML dependencies (ChromaDB + sentence-transformers/PyTorch), and the first boot
 > downloads a small embedding model (~90 MB) to build the local vector index — so the
 > first `make dev` takes a few minutes before the app is ready. Subsequent starts are fast.

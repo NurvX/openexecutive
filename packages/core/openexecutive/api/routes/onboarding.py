@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import sqlite3
 import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from openexecutive.api.intake_uploads import (
     _INTAKE_GEN_CHARS_PER_FILE,
@@ -530,7 +531,7 @@ async def get_interview(session_id: str) -> OnboardSessionResponse:
 
 
 @router.post("/onboard/interview/commit", response_model=CompanyProfileResponse)
-async def commit_interview(body: OnboardCommitRequest) -> CompanyProfileResponse:
+async def commit_interview(body: OnboardCommitRequest, request: Request) -> CompanyProfileResponse:
     """Save the reviewed draft. The single write in this whole flow.
 
     Ordering matters and is load-bearing — see the section header above.
@@ -538,7 +539,11 @@ async def commit_interview(body: OnboardCommitRequest) -> CompanyProfileResponse
     rejection leaves the session untouched and the user can edit and retry.
     """
     from openexecutive.onboarding.commit import (
+        OwnerEmailError,
+        check_owner_email,
         derive_org_structure,
+        link_owner_email,
+        owner_change_blocked,
         reconcile_onboarding_departments,
         save_onboarding_people,
     )
@@ -593,6 +598,33 @@ async def commit_interview(body: OnboardCommitRequest) -> CompanyProfileResponse
         logger.info("onboarding commit: rejected draft (%d error(s))", len(errors))
         raise HTTPException(status_code=422, detail=errors[0].safe)
 
+    # validate_draft guarantees exactly one principal. Their sign-in email is
+    # checked now, while a rejection still leaves the draft editable.
+    principal_name = next(p.full_name.strip() for p in people if p.is_principal)
+    # Setup demotes the current owner when it drafts someone else, so only the
+    # owner may do that (owner_change_blocked explains the rule).
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+
+    try:
+        blocked = owner_change_blocked(principal_name, _resolve_caller_person_id(request))
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("onboarding commit: owner lookup failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=503, detail="Could not check who owns this workspace. Try again."
+        ) from exc
+    if blocked:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only the current owner can make someone else the owner. Mark the current "
+                'owner as "This is me", or ask them to run setup.'
+            ),
+        )
+    try:
+        owner_email = check_owner_email(body.owner_email, principal_name)
+    except OwnerEmailError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     profile = derive_org_structure(profile, people, departments)
 
     # 2. is_empty() keys off the name — a nameless profile is invisible to
@@ -616,6 +648,9 @@ async def commit_interview(body: OnboardCommitRequest) -> CompanyProfileResponse
     # 5-6. Best-effort seeding. Departments are reconciled additively — see
     #      onboarding/commit.py for why this must not mirror the fixture loader.
     person_ids = save_onboarding_people(people)
+    principal_id = person_ids.get(principal_name)
+    if owner_email and principal_id is not None:
+        link_owner_email(principal_id, owner_email)
     reconcile_onboarding_departments(departments, person_ids)
 
     # 7. Same post-onboarding research fire the wizard does, same dedup set.

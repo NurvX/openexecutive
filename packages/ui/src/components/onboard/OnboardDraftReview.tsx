@@ -1,12 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useSession } from "next-auth/react";
 import { ProfileSections } from "@/components/company-profile/ProfileSections";
 import OnboardDepartmentsDraft from "@/components/onboard/OnboardDepartmentsDraft";
 import OnboardPeopleDraft from "@/components/onboard/OnboardPeopleDraft";
 import {
   commitOnboardDraft,
   listDepartments,
+  listPeople,
   type CompanyProfile,
   type OnboardDepartmentDraft,
   type OnboardPersonDraft,
@@ -34,11 +36,26 @@ export default function OnboardDraftReview({
   const [existingTitles, setExistingTitles] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The owner's sign-in email. Pre-filled with the owner's current one when
+  // setup is re-run — so whoever re-runs it doesn't silently take over the
+  // owner's login — otherwise with the login doing the setup. Null until
+  // edited, so the field follows both as they load.
+  // Save waits for both: the commit runs once per setup session, so saving
+  // before they load would send no email with no way to add it afterwards.
+  const { data: session, status: sessionStatus } = useSession();
+  const [currentOwnerEmail, setCurrentOwnerEmail] = useState<string | null>(null);
+  const [ownerLookupDone, setOwnerLookupDone] = useState(false);
+  const [ownerEmailEdit, setOwnerEmailEdit] = useState<string | null>(null);
+  const ownerEmail = ownerEmailEdit ?? currentOwnerEmail ?? session?.user?.email ?? "";
 
   useEffect(() => {
     listDepartments()
       .then((ds) => setExistingTitles(ds.map((d) => d.config.title)))
       .catch(() => setExistingTitles([]));
+    listPeople()
+      .then((ps) => setCurrentOwnerEmail(ps.find((p) => p.is_principal && p.email)?.email ?? null))
+      .catch(() => setCurrentOwnerEmail(null))
+      .finally(() => setOwnerLookupDone(true));
   }, []);
 
   // The seam that lets the /company-profile section editors work here: they
@@ -60,6 +77,8 @@ export default function OnboardDraftReview({
     new Set(namedDepartments.map((d) => d.title.trim().toLowerCase())).size !==
     namedDepartments.length;
 
+  // The owner email is checked only by the server (check_owner_email): a
+  // rejection comes back as the error below and leaves the draft editable.
   const blocker = !profile.name.trim()
     ? "Your company needs a name."
     : namedPeople.length === 0
@@ -70,14 +89,16 @@ export default function OnboardDraftReview({
           ? "Two people have the same name — give them distinct names."
           : duplicateDepartments
             ? "Two departments have the same name."
-            : null;
+            : sessionStatus === "loading" || !ownerLookupDone
+              ? "Loading your sign-in details…"
+              : null;
 
   async function save() {
     if (blocker || saving) return;
     setSaving(true);
     setError(null);
     try {
-      await commitOnboardDraft(turn.session_id, profile, namedPeople, namedDepartments);
+      await commitOnboardDraft(turn.session_id, profile, namedPeople, namedDepartments, ownerEmail);
       onSaved();
     } catch (err) {
       setError((err as Error).message);
@@ -149,6 +170,27 @@ export default function OnboardDraftReview({
           setPeople(next);
         }}
       />
+      <div className="bg-surface-elevated border border-line rounded-xl p-5">
+        <label htmlFor="owner-email" className="text-sm font-semibold text-fg">
+          Your sign-in email
+        </label>
+        <p className="text-xs text-fg-muted mt-1 mb-3">
+          Links the person marked &ldquo;This is me&rdquo; to this login, so your chats and
+          owner rights work straight away. Setting this up for someone else? Enter the
+          Google email they will sign in with.
+          {session?.localLogin &&
+            " Optional on this computer — add one if you set up Google sign-in later."}
+        </p>
+        <input
+          id="owner-email"
+          type="email"
+          value={ownerEmail}
+          onChange={(e) => setOwnerEmailEdit(e.target.value)}
+          placeholder="you@company.com"
+          autoComplete="email"
+          className="w-full rounded-lg border border-line-strong bg-surface-overlay px-3 py-2 text-sm text-fg placeholder-fg-subtle focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition-colors"
+        />
+      </div>
       <OnboardDepartmentsDraft
         departments={departments}
         people={people}

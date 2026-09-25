@@ -5,6 +5,7 @@ import contextlib
 import hmac
 import logging
 import os
+import re
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -764,6 +765,38 @@ def _is_public_deployment() -> bool:
     return os.environ.get("OE_PUBLIC_DEPLOYMENT", "").strip().lower() not in _FALSEY_ENV
 
 
+def _is_local_login() -> bool:
+    """Whether `make dev` started this API for local login (no sign-in; see
+    packages/ui/src/lib/localLogin.ts). Never on a public deployment."""
+    return os.environ.get("OE_LOCAL_LOGIN", "").strip() == "1" and not _is_public_deployment()
+
+
+# A raw Host header naming this machine, with an optional port — the same rule
+# as isLoopbackHost in packages/ui/src/lib/localLogin.ts, and
+# packages/ui/scripts/localLogin.test.mjs fails if the two ever disagree.
+_LOOPBACK_HOST_RE = re.compile(r"(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?", re.IGNORECASE)
+
+# Sec-Fetch-Site values a browser sends when the page's own origin (or a typed
+# URL) made the request — the same set as OWN_PAGE_FETCH_SITES in
+# packages/ui/src/lib/crossSite.ts, and packages/ui/scripts/crossSite.test.mjs
+# fails if the two ever disagree.
+_OWN_PAGE_FETCH_SITES = frozenset({"same-origin", "none"})
+_READ_ONLY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _webhook_verifies_its_caller(path: str) -> bool:
+    """Whether this webhook authenticates its caller by itself. Google Chat
+    always checks the signed JWT; Telegram only when TELEGRAM_WEBHOOK_SECRET is
+    set — without it, it accepts anyone's update."""
+    if path == "/webhook/google-chat":
+        return True
+    if path == "/webhook/telegram":
+        from openexecutive.config import get_settings
+
+        return bool(get_settings().telegram_webhook_secret)
+    return False
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Open Executive API",
@@ -814,6 +847,36 @@ def create_app() -> FastAPI:
             "dev only; set this secret in any environment reachable from the "
             "public internet."
         )
+
+    # Local login: the UI admits the owner with no password, guarded by where
+    # requests come from, and this API needs the same guard — it usually has
+    # no shared secret, and a request with no x-caller-email runs as the
+    # principal. Two ways a web page could otherwise drive it from the
+    # owner's browser:
+    #   - DNS rebinding: a page re-points its own hostname at 127.0.0.1 and
+    #     calls this API same-origin. A browser always sends the page's real
+    #     hostname as Host, and scripts cannot change it. A webhook that
+    #     verifies its caller may arrive via a tunnel under another name.
+    #   - A plain form POST from any other site or localhost port: no cookie
+    #     or preflight is needed. Browsers stamp Sec-Fetch-Site on it; the UI
+    #     proxy, the CLI and the webhook senders don't send it at all.
+    if _is_local_login():
+        @app.middleware("http")
+        async def _local_login_gate(request: Request, call_next):  # type: ignore[no-untyped-def]
+            addressed_here = _LOOPBACK_HOST_RE.fullmatch(request.headers.get("host", "").strip())
+            if not addressed_here and not _webhook_verifies_its_caller(request.url.path):
+                return JSONResponse(
+                    {"error": "local login only accepts requests addressed to this computer"},
+                    status_code=403,
+                )
+            fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+            if (
+                request.method not in _READ_ONLY_METHODS
+                and fetch_site
+                and fetch_site not in _OWN_PAGE_FETCH_SITES
+            ):
+                return JSONResponse({"error": "cross-site request refused"}, status_code=403)
+            return await call_next(request)
 
     app.include_router(auth_route.router, tags=["auth"])
     app.include_router(fixtures.router, tags=["fixtures"])
