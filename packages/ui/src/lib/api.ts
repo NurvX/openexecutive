@@ -2152,13 +2152,19 @@ export async function* runWorkflow(
 
   if (!response.ok) {
     let detail = response.statusText;
+    let refusal: string | null = null;
     try {
       const body = await response.json();
       detail = JSON.stringify(body.detail ?? body);
+      // A 403 ("Only the principal can run this workflow.") is a sentence
+      // for the person, so show it as is rather than as a request failure.
+      if (response.status === 403 && typeof body.detail === "string") {
+        refusal = body.detail;
+      }
     } catch {
       // body wasn't JSON
     }
-    throw new Error(`Workflow request failed: ${detail}`);
+    throw new Error(refusal ?? `Workflow request failed: ${detail}`);
   }
 
   const reader = response.body?.getReader();
@@ -3372,6 +3378,48 @@ export interface BriefDeliveryNotice {
 export async function getBriefDelivery(signal?: AbortSignal): Promise<BriefDeliveryNotice | null> {
   const res = await fetch(`${API_BASE}/today/brief-delivery`, { signal });
   if (!res.ok) throw new Error(`Failed to load brief delivery: ${res.statusText}`);
+  return res.json();
+}
+
+// Solo only: today's top three, as the morning brief picks them. Null in
+// team mode and for anyone but the owner. Loaded apart from /today because
+// it may read the calendar (up to 4 s).
+export interface TopThreeItem {
+  key: string;
+  kind: "commitment" | "goal" | "project";
+  text: string;
+  why: string;
+  // "10:00–11:00" (local) when a calendar was read on a business day; ""
+  // when no free block is left for it; null when no calendar was read.
+  slot: string | null;
+}
+
+export interface TopThreeToday {
+  items: TopThreeItem[];
+}
+
+export async function getTopThree(signal?: AbortSignal): Promise<TopThreeToday | null> {
+  const res = await fetch(`${API_BASE}/today/top-three`, { signal });
+  if (!res.ok) throw new Error(`Failed to load the top three: ${res.statusText}`);
+  return res.json();
+}
+
+// Solo only: the latest completed weekly review. Null when none has run, in
+// team mode and for anyone but the owner. The full review is its run page
+// (/jobs/runs/{run_id}).
+export interface WeeklyReviewSummary {
+  run_id: string;
+  completed_at: string;
+  period: string;
+  // Next week's top three, plain text.
+  top_three: string[];
+  // Shown when top_three is empty: the review's own note, or its first lines.
+  excerpt: string;
+}
+
+export async function getWeeklyReview(signal?: AbortSignal): Promise<WeeklyReviewSummary | null> {
+  const res = await fetch(`${API_BASE}/today/weekly-review`, { signal });
+  if (!res.ok) throw new Error(`Failed to load the weekly review: ${res.statusText}`);
   return res.json();
 }
 

@@ -7,7 +7,8 @@ One row (``id = 1``) in the ``workspace_settings`` table of the episodic DB:
   department check-ins do not run — see ``set_workspace_mode``).
 - ``timezone`` — the user's IANA zone, or NULL to fall back to the
   ``USER_TIMEZONE`` setting (and then UTC). It drives the default times of
-  the morning brief, end-of-day digest and reflection, the zone the Executive
+  the morning brief, end-of-day digest, reflection and (solo) weekly
+  review, the zone the Executive
   resolves "tomorrow at 9" in, open-loop due dates, and the alert quiet
   hours when no zone was stored for them.
 - The principal's role (``PrincipalRole``), all nullable: ``role_kind``
@@ -262,6 +263,48 @@ def _stored_zone(raw: object) -> str | None:
         return None
 
 
+def _read_row(db_path: Path | None) -> sqlite3.Row | None:
+    """The stored row, or None when there is none to read (no file, no
+    table, no row). Raises on a real read failure (a locked or corrupt DB)."""
+    path = _resolve_db_path(db_path)
+    if not path.exists():
+        return None
+    try:
+        conn = _connect(path)
+        try:
+            # SELECT *: a table created before the role columns existed has
+            # none of them, and a read never migrates (_stored_role).
+            row: sqlite3.Row | None = conn.execute(
+                f"SELECT * FROM {TABLE} WHERE id = 1"  # noqa: S608 — constant table name
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return None
+        raise
+    return row
+
+
+def read_stored_mode(db_path: Path | None = None) -> WorkspaceMode | None:
+    """The mode as stored — the default (team) when nothing is stored — or
+    None when it could not be read: a read error, or a stored value that is
+    not a mode. Unlike ``get_workspace`` this does not turn a failure into
+    team, for callers that must not act on a mode they could not read (the
+    scheduler retiring the solo-only weekly review). Never raises."""
+    try:
+        row = _read_row(db_path)
+    except Exception as exc:
+        logger.warning(
+            "workspace: could not read the stored mode (%s: %s) — reporting it unknown",
+            type(exc).__name__, exc,
+        )
+        return None
+    if row is None:
+        return DEFAULT_MODE
+    return _valid_mode(row["mode"])
+
+
 def get_workspace(db_path: Path | None = None) -> WorkspaceSettings:
     """The stored settings, or the defaults when nothing is stored.
 
@@ -270,25 +313,10 @@ def get_workspace(db_path: Path | None = None) -> WorkspaceSettings:
     locked or corrupt DB, say) also reads as the defaults but is logged as
     a warning so it can be diagnosed; and a stored value that no longer
     validates (a hand-edited mode, a zone this Python cannot load) is
-    ignored field by field.
+    ignored field by field. ``read_stored_mode`` tells a failed read apart.
     """
     try:
-        path = _resolve_db_path(db_path)
-        if not path.exists():
-            return WorkspaceSettings()
-        conn = _connect(path)
-        try:
-            # SELECT *: a table created before the role columns existed has
-            # none of them, and a read never migrates (_stored_role).
-            row = conn.execute(
-                f"SELECT * FROM {TABLE} WHERE id = 1"  # noqa: S608 — constant table name
-            ).fetchone()
-        finally:
-            conn.close()
-    except sqlite3.OperationalError as exc:
-        if "no such table" not in str(exc):
-            _log_read_failure(exc)
-        return WorkspaceSettings()
+        row = _read_row(db_path)
     except Exception as exc:
         _log_read_failure(exc)
         return WorkspaceSettings()
@@ -440,10 +468,11 @@ def set_timezone(tz: str | None) -> WorkspaceSettings:
     for an unknown zone.
 
     When the zone in effect changes, the pending morning brief, end-of-day
-    digest and reflection rows are re-timed to the new zone in place
-    (``scheduler.runner.reschedule_principal_rhythm``: nothing inserted,
-    never two runs of a kind within 12h, never a skipped day); a brief that
-    is running right now finishes and chains its successor in the new zone.
+    digest, reflection and weekly review rows are re-timed to the new zone in
+    place (``scheduler.runner.reschedule_principal_rhythm``: nothing
+    inserted, never two runs of a kind within 12h — 3.5 days for the weekly
+    review — never a skipped run); a brief that is running right now
+    finishes and chains its successor in the new zone.
     The re-time is best-effort: if it fails, it is logged and each brief
     moves to the new zone after it next fires (every link reads the zone
     fresh), so the stored setting is never rolled back.
@@ -466,11 +495,13 @@ def set_timezone(tz: str | None) -> WorkspaceSettings:
 def set_workspace_mode(mode: str) -> WorkspaceSettings:
     """Switch between ``"solo"`` and ``"team"``. Raises ``ValueError`` otherwise.
 
-    Solo cancels every pending department check-in (``dept_cadence``); team
-    re-bootstraps them. Department rows themselves are left in place, so
-    switching back is instant. Both are idempotent and best-effort: a
-    failure is logged, and the backstops hold — the scheduler retires a
-    check-in that fires in solo, and boot re-bootstraps them in team.
+    Solo cancels every pending department check-in (``dept_cadence``) and
+    schedules the weekly review; team re-bootstraps the check-ins and
+    cancels the pending weekly review. Department rows themselves are left
+    in place, so switching back is instant. All of it is idempotent and
+    best-effort: a failure is logged, and the backstops hold — the scheduler
+    retires a check-in that fires in solo and a weekly review that fires in
+    team, and boot re-seeds what the mode is missing.
     """
     if mode not in WORKSPACE_MODES:
         raise ValueError(f"mode must be one of {', '.join(WORKSPACE_MODES)}")
@@ -479,6 +510,7 @@ def set_workspace_mode(mode: str) -> WorkspaceSettings:
         bootstrap_cadences,
         cancel_pending_cadences,
     )
+    from openexecutive.scheduler.runner import cancel_weekly_reviews, seed_weekly_review
 
     try:
         if mode == "solo":
@@ -489,6 +521,11 @@ def set_workspace_mode(mode: str) -> WorkspaceSettings:
             logger.info("workspace: team mode — scheduled %d department check-in(s)", inserted)
     except Exception:
         logger.exception("workspace: updating department check-ins for %s mode failed", mode)
+    # Both never raise.
+    if mode == "solo":
+        seed_weekly_review()
+    else:
+        cancel_weekly_reviews()
     return get_workspace()
 
 

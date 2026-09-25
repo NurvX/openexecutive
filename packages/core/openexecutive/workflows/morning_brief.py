@@ -5,6 +5,9 @@ Renders a one-screen Markdown summary covering:
   • Proposals awaiting the principal's decision
   • Anything OE acted on since the last brief
   • The top decision the principal needs to make today
+  • In solo mode: what is due this week, and the top three to focus on today
+    (``briefing.top_three`` — with a free slot for each when a calendar can
+    be read)
 
 The scheduler fires a `principal_brief_morning` action once per day at
 the configured time (default 08:00 UTC) which runs this workflow and
@@ -22,7 +25,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -77,6 +80,9 @@ class MorningBriefWorkflow(Workflow):
     section = WorkflowSection.OPERATING
     estimated_minutes = 1
     background = True
+    # Solo reads the principal's commitments and calendar (top three today),
+    # so only they may run it from chat there. Team is unchanged.
+    principal_only_modes: ClassVar[frozenset[str]] = frozenset({"solo"})
 
     def input_model(self) -> type[BaseModel]:
         return MorningBriefInput
@@ -142,8 +148,18 @@ class MorningBriefWorkflow(Workflow):
             # dated commitments. It lands here even when no channel reaches
             # them for a nudge. Never raises (reads as empty on failure).
             from openexecutive.attunement.open_loops import principal_due_soon
+            from openexecutive.briefing.top_three import build_top_three
 
             today_data["due_soon"] = principal_due_soon()
+            # Top three today: picked from goals at risk, commitments due and
+            # active projects, each with a free slot when a calendar can be
+            # read (one short call). Never raises; without a calendar there
+            # are no slots and no calendar block.
+            top_three, calendar = await build_top_three(today_data["due_soon"])
+            if top_three:
+                today_data["top_three"] = top_three
+            if calendar is not None:
+                today_data["today_calendar"] = calendar
 
         try:
             activity_response = today_route._build_activity(20, since=since)

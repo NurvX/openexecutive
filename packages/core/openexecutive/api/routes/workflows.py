@@ -4,6 +4,7 @@ Endpoints:
 - GET    /workflows                       List available workflows with metadata
 - GET    /workflows/{name}                Get one workflow's metadata + input schema
 - POST   /workflows/{name}/runs           Start a run; streams progress as SSE
+                                          (403 for a principal-only one unless the principal)
 - GET    /workflows/runs                  List recent runs across all workflows
 - GET    /workflows/runs/{run_id}         Get a specific past run (with artifact)
 - DELETE /workflows/runs/{run_id}         Delete a past run
@@ -382,12 +383,18 @@ async def start_workflow_run(name: str, request: Request) -> StreamingResponse:
     """Start a workflow run. Streams progress events as Server-Sent Events.
 
     Each SSE event is a JSON-encoded `WorkflowEvent`. The final event in
-    a successful run is `{"type": "done", "run_id": "..."}`.
+    a successful run is `{"type": "done", "run_id": "..."}`. A workflow that
+    is the principal's alone in the workspace's mode is a 403 for anyone
+    else (`refuse_principal_only_run`), before any run row is created.
     """
     try:
         workflow = get_workflow(name)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+
+    from openexecutive.memory.workspace_settings import read_stored_mode
+
+    refuse_principal_only_run(request, workflow, read_stored_mode(), surface="jobs")
 
     try:
         payload = await request.json()
@@ -512,6 +519,91 @@ async def start_workflow_run(name: str, request: Request) -> StreamingResponse:
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
+
+PRINCIPAL_ONLY_DETAIL = "Only the principal can run this workflow."
+
+
+def refuse_principal_only_run(
+    request: Request,
+    workflow: Any,
+    mode: str | None,
+    *,
+    surface: str,
+    detail: str = PRINCIPAL_ONLY_DETAIL,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Raise 403 unless this web caller may start ``workflow`` in ``mode``.
+
+    This decides who may start (or, from an eval, trigger) a run, not who
+    may read one: a stored run and its artifact are read under the
+    ``/workflows/runs`` rules like any other run. A workflow whose
+    ``principal_only_modes`` holds the mode it would run in (the weekly
+    review in both modes, the morning brief in solo) may be started over
+    HTTP only by the principal (``_caller_is_the_principal``), as
+    ``run_workflow`` allows in chat. ``mode`` None (unreadable) counts as
+    principal-only. The refusal is audited like the chat tool's, and
+    ``detail`` does not spell out the rule.
+    """
+    from openexecutive.workflows.base import principal_only_in
+
+    if not principal_only_in(workflow, mode):
+        return
+    if _caller_is_the_principal(request):
+        return
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+    from openexecutive.audit import log_event as audit_log
+
+    name = str(getattr(workflow, "name", "") or "")
+    try:
+        # For the audit row only; the refusal stands whatever this reads.
+        caller_person_id = _resolve_caller_person_id(request)
+    except Exception:
+        caller_person_id = None
+    audit_log(
+        "tool_invocation",
+        f"run_workflow {name} refused over HTTP ({surface}): not the principal",
+        actor=(request.headers.get("x-caller-email") or "").strip()[:200] or "api",
+        details={
+            "tool": "run_workflow",
+            "kind": "write",
+            "ok": False,
+            "workflow": name,
+            "refused": True,
+            "workspace_mode": mode or "unknown",
+            "caller_person_id": caller_person_id,
+            "surface": surface,
+            **(extra or {}),
+        },
+    )
+    raise HTTPException(status_code=403, detail=detail)
+
+
+def _caller_is_the_principal(request: Request) -> bool:
+    """Whether this web caller is the principal, for starting a principal-only
+    run.
+
+    Stricter than ``chat._caller_is_principal_or_unclaimed`` (the
+    ``PUT /workspace`` rule, which is unchanged): nobody gets in because no
+    principal is on the roster. That happens after the old principal is
+    archived to re-run onboarding, or when the roster was filled in before
+    anyone was flagged, and teammates can be signed in then. A request with
+    no ``x-caller-email`` is the principal (the CLI, local login, a direct
+    call behind the shared secret; the UI proxy stamps every other session's
+    email), so it passes without a roster read. Otherwise the email must be
+    the principal's own, on an entry that is not archived. Fails closed: a
+    roster that cannot be read answers no.
+    """
+    if not (request.headers.get("x-caller-email") or "").strip():
+        return True
+    from openexecutive.api.routes.chat import _resolve_caller_person_id
+    from openexecutive.people.store import is_principal_or_self
+
+    try:
+        return is_principal_or_self(_resolve_caller_person_id(request), None)
+    except Exception:
+        logger.exception("principal check failed — refusing the principal-only run")
+        return False
 
 
 def _resume_progress(resume_state_json: str | None) -> dict[str, Any] | None:

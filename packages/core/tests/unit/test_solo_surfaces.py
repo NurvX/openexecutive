@@ -1282,6 +1282,7 @@ def _solo_prompt_texts() -> dict[str, str]:
     from openexecutive.workflows.end_of_day_digest import _EOD_DIGEST_SOLO_SYSTEM
     from openexecutive.workflows.executive_reflection import _build_reflection_system_solo
     from openexecutive.workflows.executive_research import _build_synthesis_system
+    from openexecutive.workflows.weekly_review import WEEKLY_TOP_THREE_SYSTEM
 
     return {
         "persona": EXECUTIVE_PERSONA_SOLO_PROMPT,
@@ -1292,6 +1293,7 @@ def _solo_prompt_texts() -> dict[str, str]:
         "research_dm": _build_synthesis_system({"telegram"}, True, mode="solo"),
         "research_no_dm": _build_synthesis_system(set(), True, mode="solo"),
         "withheld_tool_error": withheld_tool_error("send_company_broadcast", "solo"),
+        "weekly_review_top_three": WEEKLY_TOP_THREE_SYSTEM,
     }
 
 
@@ -1303,7 +1305,10 @@ def test_solo_prompts_are_role_neutral(name: str) -> None:
     assert "founder" not in text.lower()
     for assumption in ("runs this business", "on their own:", "no team to route to"):
         assert assumption not in text
-    if name in {"persona", "standalone_brief", "today_header", "eod_digest", "reflection"}:
+    if name in {
+        "persona", "standalone_brief", "today_header", "eod_digest", "reflection",
+        "weekly_review_top_three",
+    }:
         assert "lead a function inside a larger organisation" in text
 
 

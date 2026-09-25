@@ -4,7 +4,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from enum import StrEnum
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -116,6 +116,15 @@ class Workflow(ABC):
     # See WorkflowMeta.playbooks. Declare every playbook `run` loads via
     # workflows.playbooks.load_playbook (a test holds the two in sync).
     playbooks: tuple[str, ...] = ()
+    # Workspace modes in which only the principal may start this workflow:
+    # it is built from the principal's own data (their decisions,
+    # commitments, goals, calendar) or it writes to them. Chat
+    # (`run_workflow`) also wants a surface that verified it is them; the
+    # Jobs page (`POST /workflows/{name}/runs`) and an eval run
+    # (`POST /evals/runs`) want a web caller who is the principal. It
+    # controls who starts a run, not who reads one: stored runs follow the
+    # `/workflows/runs` rules. Empty = anyone. See `principal_only_in`.
+    principal_only_modes: ClassVar[frozenset[str]] = frozenset()
 
     @abstractmethod
     def input_model(self) -> type[BaseModel]:
@@ -176,3 +185,16 @@ class Workflow(ABC):
     def followed_playbooks(self) -> list[str]:
         """Names of the playbooks this workflow's steps follow."""
         return list(self.playbooks)
+
+
+def principal_only_in(workflow: object, mode: str | None) -> bool:
+    """Whether only the principal may start ``workflow`` when it would run in
+    workspace ``mode`` — the mode is in its ``principal_only_modes``.
+
+    ``mode`` None means the mode could not be read, and counts as yes for a
+    workflow that is principal-only in any mode, so an unreadable mode
+    refuses instead of letting the run through. Duck-typed: an object with
+    no ``principal_only_modes`` is never principal-only.
+    """
+    modes: frozenset[str] = getattr(workflow, "principal_only_modes", frozenset())
+    return bool(modes) and (mode is None or mode in modes)
