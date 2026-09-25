@@ -90,6 +90,8 @@ The same rejection is recorded in the audit log as an `integration_inbound` even
 
 Send the bot a direct message. It should reply within a few seconds. `/start`, `/help` and `/ask` prefixes are stripped before the text reaches the Executive; photos and documents are passed along as attachments.
 
+If it doesn't reply, open **Settings → Setup status** in the web app. The Telegram light says whether the token works, whether the webhook is registered at this app's address, what went wrong with Telegram's last delivery, and whether anyone on the team list has a Telegram chat ID.
+
 ---
 
 ## Troubleshooting
@@ -97,6 +99,7 @@ Send the bot a direct message. It should reply within a few seconds. `/start`, `
 | Symptom | Cause | Fix |
 |---|---|---|
 | `getWebhookInfo` shows `401 Unauthorized` | `secret_token` missing from `setWebhook`, or it differs from `TELEGRAM_WEBHOOK_SECRET` | Re-run Step 5 with the current secret |
+| Every update gets `401` and the API log says `TELEGRAM_WEBHOOK_SECRET is not a value Telegram can send` | The secret has characters `setWebhook` won't accept, such as a note left after the `=` | Use only letters, digits, `_` and `-` (Step 2), restart, then re-run Step 5 |
 | `503 Telegram integration not configured` | `TELEGRAM_BOT_TOKEN` unset or API not restarted | Set the var and restart |
 | No reply, `rejected message from chat_id=…` in logs | Chat not on the People roster | Add the chat ID to a Person in /people (Step 6) |
 | No reply, nothing in logs | Webhook URL unreachable | Check `getWebhookInfo`; for local dev, confirm ngrok is still running and re-register if its URL changed |
