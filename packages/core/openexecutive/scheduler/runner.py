@@ -231,7 +231,11 @@ async def _execute_action(
     # Authority gate — only applies to department-scoped actions.
     # ------------------------------------------------------------------
     if action.department:
-        from openexecutive.departments.authority import gate_action, propose_via_alert
+        from openexecutive.departments.authority import (
+            escalate_via_alert,
+            gate_action,
+            propose_via_alert,
+        )
         from openexecutive.people.models import AuthorityScope
         from openexecutive.people.registry import get_person
         from openexecutive.scheduler.action_phrasing import describe_executive_action
@@ -303,22 +307,54 @@ async def _execute_action(
             return
 
         if decision.action == "escalate":
-            # Create alert AND fall through to dispatch.
-            if decision.assignee_person_id is not None:
-                propose_via_alert(
-                    department_slug=action.department,
-                    person_id=decision.assignee_person_id,
+            # Hold for a human, flagged urgent; do NOT dispatch. The setting
+            # promises "the specialist will not act — it forwards everything
+            # to a human", and the card's "If you approve: … right away" line
+            # is what sends it — dispatching here as well acted before anyone
+            # agreed, then acted again on approval. Unlike `propose`, an
+            # escalation is never deferred to the approver's window. The card
+            # is the action's only trace (see `escalate_via_alert` for how it
+            # is kept from being lost); if it cannot be written the row is
+            # retried with backoff and finally marked failed — never done.
+            try:
+                escalate_via_alert(
+                    action.department,
+                    decision.assignee_person_id,
                     summary=f"[ESCALATION] {action.intent_text[:140]}",
                     body=action.intent_text,
                     suggested_action=_proposed_action_phrase(urgent=True),
+                    action_key="|".join((
+                        action.kind, action.channel, action.channel_ref,
+                        str(action.assigned_to_person_id), action.intent_text,
+                    )),
+                    occurrence_id=str(action.id),
                 )
-            else:
+            except Exception as exc:
+                logger.exception(
+                    "scheduler: escalation card for action %d could not be filed",
+                    action.id,
+                )
+                if mark_action_failed_or_retry(
+                    action.id, f"escalation card could not be filed: {exc}"
+                ) == "failed":
+                    logger.error(
+                        "scheduler: escalated action %d dept=%r gave up — no "
+                        "card was filed and nothing was sent",
+                        action.id, action.department,
+                    )
+                return
+            if decision.assignee_person_id is None:
                 logger.warning(
-                    "scheduler: escalate for dept=%r has no assignee — "
-                    "alert skipped, dispatch continues",
-                    action.department,
+                    "scheduler: escalate for dept=%r has no approver — "
+                    "action %d filed as an unrouted card",
+                    action.department, action.id,
                 )
-            # fall through → dispatch proceeds below
+            mark_action_done(action.id)
+            logger.info(
+                "scheduler: action %d escalated to person %s — not dispatched",
+                action.id, decision.assignee_person_id,
+            )
+            return
 
     # ------------------------------------------------------------------
     # Department cadence — run the check-in workflow, then chain the next
