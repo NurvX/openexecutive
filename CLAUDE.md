@@ -148,7 +148,7 @@ and deploy configuration for a specific environment are kept outside this repo.
 
 ## Environment Variables
 
-See `.env.example`. Required: `ANTHROPIC_API_KEY`, `EXEC_EMAIL_ADDRESS` (no default). Optional integrations: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `TELEGRAM_BOT_TOKEN` + `TELEGRAM_WEBHOOK_SECRET` (`docs/telegram_setup.md`), `DISCORD_BOT_TOKEN` + `DISCORD_APP_ID`, `GOOGLE_CHAT_PROJECT_NUMBER` + one of `GOOGLE_CHAT_SERVICE_ACCOUNT_FILE` / `_EMAIL` (`docs/google_chat_setup.md`). Email has no IMAP/SMTP settings: the poller (`integrations/email_poller.py`) reads and sends through the Gmail tools of the Google Workspace MCP (`GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET`), signed in as `EXEC_EMAIL_ADDRESS`.
+See `.env.example`. Required: `ANTHROPIC_API_KEY`, `EXEC_EMAIL_ADDRESS` (no default). Optional integrations: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `TELEGRAM_BOT_TOKEN` + `TELEGRAM_WEBHOOK_SECRET` (`docs/telegram_setup.md`), `DISCORD_BOT_TOKEN` + `DISCORD_APP_ID`, `GOOGLE_CHAT_PROJECT_NUMBER` + one of `GOOGLE_CHAT_SERVICE_ACCOUNT_FILE` / `_EMAIL` (`docs/google_chat_setup.md`). Email has no IMAP/SMTP settings: the poller (`integrations/email_poller.py`) reads and sends through the Gmail tools of the Google Workspace MCP (`GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET`), signed in as `EXEC_EMAIL_ADDRESS`. Act as me (optional) reads the owner's *own* Gmail directly (`delegation/gmail.py`, never the MCP gateway) from a per-person credential in `DELEGATION_GOOGLE_CREDENTIALS_DIR`, minted by `scripts/connect-own-gmail.py`; `DELEGATION_COMPOSER_MODEL` / `DELEGATION_MAX_DRAFTS_PER_DAY` tune the drafts.
 
 ## Testing
 
@@ -176,7 +176,11 @@ See `.env.example`. Required: `ANTHROPIC_API_KEY`, `EXEC_EMAIL_ADDRESS` (no defa
 
 > **UI lint:** `packages/ui` has no ESLint config — `npm run lint` opens an
 > interactive setup prompt. `npm run build` (`next build`) is the UI's
-> lint/type gate.
+> lint/type gate. CI's UI job also runs `npx tsc --noEmit` and `npm test`,
+> and some of those `scripts/*.test.mjs` parity tests parse Python source
+> (`api/main.py`'s `_LOOPBACK_HOST_RE` / `_OWN_PAGE_FETCH_SITES`,
+> `utils/deployment.py`'s `FALSEY_ENV`) — moving or renaming one of those
+> breaks the UI job, so run `npm test` too when you touch them.
 
 > **Audit-log test pollution:** `audit.log_event` writes to the default
 > `./episodic_memory.db` unless the test isolates it. A test module that
